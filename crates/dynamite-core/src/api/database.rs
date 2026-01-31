@@ -146,6 +146,14 @@ impl DynaMite {
         catalog::ops::list_tables(&store, state.header.catalog_root_page)
     }
 
+    /// Describe a table's schema (partition key, sort key, types).
+    pub fn describe_table(&self, name: &str) -> Result<crate::types::TableSchema, Error> {
+        let state = self.inner.state.read();
+        let store = self.read_store(&state)?;
+        let entry = catalog::ops::get_table(&store, state.header.catalog_root_page, name)?;
+        Ok(entry.schema)
+    }
+
     /// Put an item into a table.
     pub fn put_item(&self, table: &str, document: Value) -> Result<(), Error> {
         let table = table.to_string();

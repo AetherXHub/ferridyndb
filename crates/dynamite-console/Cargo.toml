@@ -1,0 +1,9 @@
+[package]
+name = "dynamite-console"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dynamite-core = { path = "../dynamite-core" }
+serde_json = "1"
+rustyline = "15"
