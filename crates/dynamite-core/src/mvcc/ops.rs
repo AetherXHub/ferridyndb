@@ -116,6 +116,33 @@ pub fn mvcc_delete(
     btree_ops::insert(store, data_root, key, &serialized)
 }
 
+/// A key-value pair with raw byte vectors.
+pub type RawKvPair = (Vec<u8>, Vec<u8>);
+
+/// Range scan with snapshot isolation.
+///
+/// Scans the B+Tree for keys in [start_key, end_key) and applies MVCC
+/// visibility filtering. Returns key-value pairs where the value is the
+/// raw `data` from the visible VersionedDocument.
+pub fn mvcc_range_scan(
+    store: &impl PageStore,
+    data_root: PageId,
+    start_key: Option<&[u8]>,
+    end_key: Option<&[u8]>,
+    snapshot_txn: TxnId,
+) -> Result<Vec<RawKvPair>, StorageError> {
+    let raw_pairs = btree_ops::range_scan(store, data_root, start_key, end_key)?;
+    let mut results = Vec::new();
+    for (key, value_bytes) in raw_pairs {
+        let latest = VersionedDocument::deserialize(&value_bytes)?;
+        let visible = visibility::find_visible_version(store, &latest, snapshot_txn)?;
+        if let Some(doc) = visible {
+            results.push((key, doc.data));
+        }
+    }
+    Ok(results)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,5 +271,69 @@ mod tests {
         // Deleting a non-existent key should be a no-op.
         let new_root = mvcc_delete(&mut store, root, b"nope", 1).unwrap();
         assert_eq!(new_root, root);
+    }
+
+    #[test]
+    fn test_mvcc_range_scan_basic() {
+        let (mut store, mut root) = setup();
+        root = mvcc_put(&mut store, root, b"a", b"val_a", 1).unwrap();
+        root = mvcc_put(&mut store, root, b"b", b"val_b", 2).unwrap();
+        root = mvcc_put(&mut store, root, b"c", b"val_c", 3).unwrap();
+
+        // Snapshot at txn 5: all visible.
+        let results = mvcc_range_scan(&store, root, None, None, 5).unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0], (b"a".to_vec(), b"val_a".to_vec()));
+        assert_eq!(results[1], (b"b".to_vec(), b"val_b".to_vec()));
+        assert_eq!(results[2], (b"c".to_vec(), b"val_c".to_vec()));
+    }
+
+    #[test]
+    fn test_mvcc_range_scan_visibility() {
+        let (mut store, mut root) = setup();
+        root = mvcc_put(&mut store, root, b"a", b"val_a", 1).unwrap();
+        root = mvcc_put(&mut store, root, b"b", b"val_b", 5).unwrap();
+        root = mvcc_put(&mut store, root, b"c", b"val_c", 10).unwrap();
+
+        // Snapshot at txn 3: only "a" visible.
+        let results = mvcc_range_scan(&store, root, None, None, 3).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], (b"a".to_vec(), b"val_a".to_vec()));
+
+        // Snapshot at txn 7: "a" and "b" visible.
+        let results = mvcc_range_scan(&store, root, None, None, 7).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_mvcc_range_scan_with_bounds() {
+        let (mut store, mut root) = setup();
+        root = mvcc_put(&mut store, root, b"a", b"va", 1).unwrap();
+        root = mvcc_put(&mut store, root, b"b", b"vb", 1).unwrap();
+        root = mvcc_put(&mut store, root, b"c", b"vc", 1).unwrap();
+        root = mvcc_put(&mut store, root, b"d", b"vd", 1).unwrap();
+
+        // Range [b, d) should return b and c.
+        let results = mvcc_range_scan(&store, root, Some(b"b"), Some(b"d"), 5).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, b"b".to_vec());
+        assert_eq!(results[1].0, b"c".to_vec());
+    }
+
+    #[test]
+    fn test_mvcc_range_scan_deleted() {
+        let (mut store, mut root) = setup();
+        root = mvcc_put(&mut store, root, b"a", b"val_a", 1).unwrap();
+        root = mvcc_put(&mut store, root, b"b", b"val_b", 1).unwrap();
+        root = mvcc_delete(&mut store, root, b"a", 5).unwrap();
+
+        // Snapshot at txn 10: "a" deleted, only "b" visible.
+        let results = mvcc_range_scan(&store, root, None, None, 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], (b"b".to_vec(), b"val_b".to_vec()));
+
+        // Snapshot at txn 3: "a" still visible (deleted at 5 > 3).
+        let results = mvcc_range_scan(&store, root, None, None, 3).unwrap();
+        assert_eq!(results.len(), 2);
     }
 }

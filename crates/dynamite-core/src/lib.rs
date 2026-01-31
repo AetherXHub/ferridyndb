@@ -1,3 +1,4 @@
+pub mod api;
 pub mod btree;
 pub mod catalog;
 pub mod encoding;

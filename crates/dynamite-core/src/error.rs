@@ -79,12 +79,21 @@ pub enum SchemaError {
         expected: crate::types::KeyType,
         actual: crate::types::KeyType,
     },
+
+    #[error("missing key attribute: {0}")]
+    MissingKeyAttribute(String),
 }
 
 #[derive(Debug, Error)]
 pub enum QueryError {
     #[error("invalid sort key condition: {0}")]
     InvalidCondition(String),
+
+    #[error("partition key is required")]
+    PartitionKeyRequired,
+
+    #[error("sort key not supported on this table")]
+    SortKeyNotSupported,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
