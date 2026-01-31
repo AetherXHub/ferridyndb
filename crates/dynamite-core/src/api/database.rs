@@ -697,3 +697,328 @@ mod tests {
         assert_eq!(result.items[4]["sk"], 0.0);
     }
 }
+
+#[cfg(test)]
+mod crash_recovery_tests {
+    use super::*;
+    use crate::storage::header::FileHeader;
+    use crate::types::{KeyType, PAGE_SIZE};
+    use serde_json::json;
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::FileExt;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_crash_mid_commit_preserves_old_data() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("crash_test.db");
+
+        // Create DB and insert data via a normal commit.
+        {
+            let db = DynaMite::create(&db_path).unwrap();
+            db.create_table("items")
+                .partition_key("id", KeyType::String)
+                .execute()
+                .unwrap();
+            db.put_item("items", json!({"id": "key1", "value": "committed"}))
+                .unwrap();
+        }
+
+        // Simulate a crash by writing garbage to the ALTERNATE header slot.
+        // After the create + create_table + put_item sequence, the active slot
+        // has been alternating. We corrupt whichever slot would be written next.
+        {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&db_path)
+                .unwrap();
+
+            // Read both headers to find the current active slot.
+            let mut buf_a = [0u8; PAGE_SIZE];
+            let mut buf_b = [0u8; PAGE_SIZE];
+            file.read_exact_at(&mut buf_a, 0).unwrap();
+            file.read_exact_at(&mut buf_b, PAGE_SIZE as u64).unwrap();
+            let (_header, active_slot) = FileHeader::select_current(&buf_a, &buf_b).unwrap();
+
+            // Write garbage to the alternate (non-active) slot.
+            let alternate_slot = FileHeader::alternate_slot(active_slot);
+            let garbage = [0xDE; PAGE_SIZE];
+            file.write_all_at(&garbage, alternate_slot as u64 * PAGE_SIZE as u64)
+                .unwrap();
+            file.sync_all().unwrap();
+        }
+
+        // Reopen the database -- it should recover from the valid header.
+        {
+            let db = DynaMite::open(&db_path).unwrap();
+            let item = db
+                .get_item("items")
+                .partition_key("key1")
+                .execute()
+                .unwrap();
+            assert!(item.is_some());
+            assert_eq!(item.unwrap()["value"], "committed");
+        }
+    }
+
+    #[test]
+    fn test_both_headers_valid_picks_higher_txn() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("txn_test.db");
+
+        // Create DB and do several operations to bump txn_counter.
+        {
+            let db = DynaMite::create(&db_path).unwrap();
+            db.create_table("items")
+                .partition_key("id", KeyType::String)
+                .execute()
+                .unwrap();
+
+            // Each put_item is a transaction, bumping the counter.
+            for i in 0..5 {
+                db.put_item(
+                    "items",
+                    json!({"id": format!("key{i}"), "value": format!("val{i}")}),
+                )
+                .unwrap();
+            }
+        }
+
+        // Reopen and verify the header with the higher txn_counter is selected
+        // and all data is accessible.
+        {
+            let db = DynaMite::open(&db_path).unwrap();
+
+            // Verify all 5 items are readable.
+            for i in 0..5 {
+                let key = format!("key{i}");
+                let item = db
+                    .get_item("items")
+                    .partition_key(key.as_str())
+                    .execute()
+                    .unwrap();
+                assert!(item.is_some(), "key{i} should be present after reopen");
+                assert_eq!(item.unwrap()["value"], format!("val{i}"));
+            }
+
+            // Verify we can still write after reopen.
+            db.put_item("items", json!({"id": "key5", "value": "val5"}))
+                .unwrap();
+            let item = db
+                .get_item("items")
+                .partition_key("key5")
+                .execute()
+                .unwrap();
+            assert!(item.is_some());
+        }
+    }
+
+    #[test]
+    fn test_corrupted_header_falls_back() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("corrupt_test.db");
+
+        // Create DB and insert data.
+        {
+            let db = DynaMite::create(&db_path).unwrap();
+            db.create_table("data")
+                .partition_key("id", KeyType::String)
+                .execute()
+                .unwrap();
+            db.put_item("data", json!({"id": "hello", "msg": "world"}))
+                .unwrap();
+        }
+
+        // Corrupt the NON-active header page's checksum bytes.
+        // This tests that select_current correctly ignores the corrupted header
+        // and uses the valid one.
+        {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&db_path)
+                .unwrap();
+
+            // Read both headers to find the active slot.
+            let mut buf_a = [0u8; PAGE_SIZE];
+            let mut buf_b = [0u8; PAGE_SIZE];
+            file.read_exact_at(&mut buf_a, 0).unwrap();
+            file.read_exact_at(&mut buf_b, PAGE_SIZE as u64).unwrap();
+            let (_header, active_slot) = FileHeader::select_current(&buf_a, &buf_b).unwrap();
+
+            // Corrupt the non-active slot's checksum (bytes 44..52).
+            let corrupt_slot = FileHeader::alternate_slot(active_slot);
+            let offset = corrupt_slot as u64 * PAGE_SIZE as u64;
+            let mut buf = [0u8; PAGE_SIZE];
+            file.read_exact_at(&mut buf, offset).unwrap();
+            for byte in &mut buf[44..52] {
+                *byte ^= 0xFF;
+            }
+            file.write_all_at(&buf, offset).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        // Reopen -- should use the valid (active) header and ignore the
+        // corrupted alternate.
+        {
+            let db = DynaMite::open(&db_path).unwrap();
+            let item = db
+                .get_item("data")
+                .partition_key("hello")
+                .execute()
+                .unwrap();
+            assert!(item.is_some());
+            assert_eq!(item.unwrap()["msg"], "world");
+
+            // Verify continued operation works (the next commit writes to
+            // the corrupted slot, overwriting it with valid data).
+            db.put_item("data", json!({"id": "new", "msg": "item"}))
+                .unwrap();
+            let new_item = db.get_item("data").partition_key("new").execute().unwrap();
+            assert!(new_item.is_some());
+        }
+    }
+}
+
+#[cfg(test)]
+mod concurrency_stress_tests {
+    use super::*;
+    use crate::types::KeyType;
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_concurrent_readers_and_writer() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("concurrent.db");
+        let db = DynaMite::create(&db_path).unwrap();
+
+        db.create_table("items")
+            .partition_key("id", KeyType::String)
+            .execute()
+            .unwrap();
+
+        // Prepopulate a known key so readers always have something to read.
+        db.put_item("items", json!({"id": "seed", "value": 0}))
+            .unwrap();
+
+        let running = Arc::new(AtomicBool::new(true));
+
+        // Spawn 4 reader threads.
+        let reader_handles: Vec<_> = (0..4)
+            .map(|reader_id| {
+                let db_clone = db.clone();
+                let running_clone = running.clone();
+                thread::spawn(move || {
+                    let mut reads = 0u64;
+                    while running_clone.load(Ordering::Relaxed) {
+                        // Read the seed key -- should always be consistent.
+                        let result = db_clone.get_item("items").partition_key("seed").execute();
+                        match result {
+                            Ok(Some(item)) => {
+                                // Value must be a number (no partial writes).
+                                assert!(
+                                    item["value"].is_number(),
+                                    "reader {reader_id}: seed value should be a number, got {:?}",
+                                    item["value"]
+                                );
+                            }
+                            Ok(None) => {
+                                // Seed was written before readers started; this
+                                // should not happen.
+                                panic!("reader {reader_id}: seed key missing");
+                            }
+                            Err(e) => {
+                                panic!("reader {reader_id}: read error: {e}");
+                            }
+                        }
+                        reads += 1;
+                    }
+                    reads
+                })
+            })
+            .collect();
+
+        // Writer thread: insert 100 items sequentially.
+        let db_writer = db.clone();
+        let writer_handle = thread::spawn(move || {
+            for i in 0..100 {
+                db_writer
+                    .put_item("items", json!({"id": format!("item_{i:04}"), "value": i}))
+                    .unwrap();
+
+                // Also update the seed key so readers see changing data.
+                db_writer
+                    .put_item("items", json!({"id": "seed", "value": i + 1}))
+                    .unwrap();
+            }
+        });
+
+        // Wait for writer to finish.
+        writer_handle.join().unwrap();
+
+        // Signal readers to stop.
+        running.store(false, Ordering::Relaxed);
+
+        // Collect reader results.
+        for handle in reader_handles {
+            let reads = handle.join().unwrap();
+            assert!(
+                reads > 0,
+                "each reader should have completed at least one read"
+            );
+        }
+
+        // Verify all 100 items are present.
+        for i in 0..100 {
+            let key = format!("item_{i:04}");
+            let item = db
+                .get_item("items")
+                .partition_key(key.as_str())
+                .execute()
+                .unwrap();
+            assert!(item.is_some(), "item_{i:04} should exist");
+        }
+    }
+
+    #[test]
+    fn test_stress_many_operations() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("stress.db");
+        let db = DynaMite::create(&db_path).unwrap();
+
+        db.create_table("stress")
+            .partition_key("id", KeyType::String)
+            .execute()
+            .unwrap();
+
+        // Perform 500 sequential put + get pairs.
+        for i in 0..500 {
+            let key = format!("stress_{i:04}");
+            let doc = json!({"id": key, "iteration": i, "payload": "x".repeat(100)});
+
+            db.put_item("stress", doc.clone()).unwrap();
+
+            let retrieved = db
+                .get_item("stress")
+                .partition_key(key.as_str())
+                .execute()
+                .unwrap();
+            assert!(
+                retrieved.is_some(),
+                "key {key} should be readable immediately after write"
+            );
+            let retrieved = retrieved.unwrap();
+            assert_eq!(retrieved["iteration"], i);
+            assert_eq!(retrieved["id"], key);
+        }
+
+        // Final verification: scan to confirm total count.
+        let result = db.scan("stress").execute().unwrap();
+        assert_eq!(result.items.len(), 500);
+    }
+}

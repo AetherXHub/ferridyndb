@@ -1,3 +1,5 @@
+//! Error types for all DynaMite operations.
+
 use std::io;
 use thiserror::Error;
 

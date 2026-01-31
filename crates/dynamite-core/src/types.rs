@@ -1,3 +1,5 @@
+//! Core types: page IDs, transaction IDs, key definitions, table schemas.
+
 use serde::{Deserialize, Serialize};
 
 /// Page identifier (offset in units of PAGE_SIZE).

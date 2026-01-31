@@ -1,3 +1,5 @@
+//! B+Tree index with copy-on-write pages, overflow chains, and range scans.
+
 pub mod node;
 pub mod ops;
 pub mod overflow;

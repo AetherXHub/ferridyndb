@@ -25,6 +25,8 @@ impl FileLock {
             .truncate(false)
             .open(path)?;
 
+        // SAFETY: `flock` is safe to call with a valid file descriptor obtained
+        // from `AsRawFd`. The fd remains valid for the lifetime of `file`.
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
         if rc != 0 {
             return Err(StorageError::FileLocked);
@@ -44,6 +46,8 @@ impl FileLock {
             .truncate(false)
             .open(path)?;
 
+        // SAFETY: `flock` is safe to call with a valid file descriptor obtained
+        // from `AsRawFd`. The fd remains valid for the lifetime of `file`.
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) };
         if rc != 0 {
             return Err(StorageError::FileLocked);
@@ -62,6 +66,8 @@ impl FileLock {
             .truncate(false)
             .open(path)?;
 
+        // SAFETY: `flock` is safe to call with a valid file descriptor obtained
+        // from `AsRawFd`. The fd remains valid for the lifetime of `file`.
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
             return Err(StorageError::FileLocked);

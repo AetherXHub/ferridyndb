@@ -1,3 +1,5 @@
+//! Key encoding: order-preserving transformations for strings, numbers, binary, and composite keys.
+
 pub mod binary;
 pub mod composite;
 pub mod number;

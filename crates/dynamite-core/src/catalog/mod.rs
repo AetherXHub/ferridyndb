@@ -1,3 +1,5 @@
+//! Table catalog: schema storage, create/drop/list operations.
+
 pub mod ops;
 
 use serde::{Deserialize, Serialize};

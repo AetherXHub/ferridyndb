@@ -1,3 +1,5 @@
+//! Public API: database handle, builder-pattern CRUD, query/scan, and transactions.
+
 pub mod builders;
 pub mod database;
 pub mod key_utils;
