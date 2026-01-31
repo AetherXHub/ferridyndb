@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/dynamite-core"]
+resolver = "3"
