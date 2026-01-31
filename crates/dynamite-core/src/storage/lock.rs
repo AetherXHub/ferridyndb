@@ -1,10 +1,11 @@
 use std::fs::{File, OpenOptions};
-use std::os::unix::io::AsRawFd;
 use std::path::Path;
+
+use fs2::FileExt;
 
 use crate::error::StorageError;
 
-/// A file-based lock using `flock(2)`.
+/// A file-based lock using advisory locking (`flock(2)` on Unix).
 ///
 /// The lock is released automatically when this struct is dropped (the
 /// underlying file descriptor is closed).
@@ -25,12 +26,8 @@ impl FileLock {
             .truncate(false)
             .open(path)?;
 
-        // SAFETY: `flock` is safe to call with a valid file descriptor obtained
-        // from `AsRawFd`. The fd remains valid for the lifetime of `file`.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-        if rc != 0 {
-            return Err(StorageError::FileLocked);
-        }
+        file.lock_exclusive()
+            .map_err(|_| StorageError::FileLocked)?;
 
         Ok(Self { _file: file })
     }
@@ -46,12 +43,7 @@ impl FileLock {
             .truncate(false)
             .open(path)?;
 
-        // SAFETY: `flock` is safe to call with a valid file descriptor obtained
-        // from `AsRawFd`. The fd remains valid for the lifetime of `file`.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) };
-        if rc != 0 {
-            return Err(StorageError::FileLocked);
-        }
+        file.lock_shared().map_err(|_| StorageError::FileLocked)?;
 
         Ok(Self { _file: file })
     }
@@ -66,12 +58,8 @@ impl FileLock {
             .truncate(false)
             .open(path)?;
 
-        // SAFETY: `flock` is safe to call with a valid file descriptor obtained
-        // from `AsRawFd`. The fd remains valid for the lifetime of `file`.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc != 0 {
-            return Err(StorageError::FileLocked);
-        }
+        file.try_lock_exclusive()
+            .map_err(|_| StorageError::FileLocked)?;
 
         Ok(Self { _file: file })
     }
