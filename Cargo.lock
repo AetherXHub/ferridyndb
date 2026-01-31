@@ -25,6 +25,7 @@ name = "dynamite-core"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "libc",
  "memmap2",
  "parking_lot",
  "serde",
