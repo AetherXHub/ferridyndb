@@ -97,7 +97,7 @@ impl Transaction {
 
         match data {
             Some(bytes) => {
-                let val: Value = serde_json::from_slice(&bytes).map_err(|e| {
+                let val: Value = rmp_serde::from_slice(&bytes).map_err(|e| {
                     StorageError::CorruptedPage(format!("failed to deserialize document: {e}"))
                 })?;
                 Ok(Some(val))
@@ -224,7 +224,7 @@ mod tests {
 
         // Simulate what Transaction::put_item does.
         let doc = json!({"pk": "alice", "name": "Alice"});
-        let doc_bytes = serde_json::to_vec(&doc).unwrap();
+        let doc_bytes = rmp_serde::to_vec(&doc).unwrap();
         let pk = key_utils::extract_key_from_doc(&doc, &entry.schema.partition_key).unwrap();
         let composite_key = composite::encode_composite(&pk, None).unwrap();
 
@@ -240,7 +240,7 @@ mod tests {
         // Read back.
         let data = mvcc_ops::mvcc_get(&store, new_data_root, &composite_key, 1).unwrap();
         assert!(data.is_some());
-        let retrieved: Value = serde_json::from_slice(&data.unwrap()).unwrap();
+        let retrieved: Value = rmp_serde::from_slice(&data.unwrap()).unwrap();
         assert_eq!(retrieved["name"], "Alice");
 
         // Verify catalog lookup still works.
@@ -253,7 +253,7 @@ mod tests {
         let (_catalog_root, entry) = setup_catalog_with_table(&mut store, "items", false);
 
         let doc = json!({"pk": "item1", "val": 42});
-        let doc_bytes = serde_json::to_vec(&doc).unwrap();
+        let doc_bytes = rmp_serde::to_vec(&doc).unwrap();
         let pk = key_utils::extract_key_from_doc(&doc, &entry.schema.partition_key).unwrap();
         let composite_key = composite::encode_composite(&pk, None).unwrap();
 
@@ -280,7 +280,7 @@ mod tests {
         let (_catalog_root, entry) = setup_catalog_with_table(&mut store, "events", true);
 
         let doc = json!({"pk": "user1", "sk": 100.0, "data": "event1"});
-        let doc_bytes = serde_json::to_vec(&doc).unwrap();
+        let doc_bytes = rmp_serde::to_vec(&doc).unwrap();
         let pk = key_utils::extract_key_from_doc(&doc, &entry.schema.partition_key).unwrap();
         let sk =
             key_utils::extract_key_from_doc(&doc, entry.schema.sort_key.as_ref().unwrap()).unwrap();
@@ -297,7 +297,7 @@ mod tests {
 
         let data = mvcc_ops::mvcc_get(&store, data_root, &composite_key, 1).unwrap();
         assert!(data.is_some());
-        let retrieved: Value = serde_json::from_slice(&data.unwrap()).unwrap();
+        let retrieved: Value = rmp_serde::from_slice(&data.unwrap()).unwrap();
         assert_eq!(retrieved["data"], "event1");
     }
 }

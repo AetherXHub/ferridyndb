@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use parking_lot::RwLock;
 use serde_json::Value;
@@ -14,6 +15,7 @@ use crate::storage::pending_free::PendingFreeList;
 use crate::storage::snapshot::SnapshotTracker;
 use crate::types::{PAGE_SIZE, PageId};
 
+use super::batch::{SyncMode, WriteBatch};
 use super::builders::{DeleteItemBuilder, GetItemBuilder, QueryBuilder, ScanBuilder, TableBuilder};
 use super::page_store::{BufferedPageStore, FilePageStore};
 use super::transaction::Transaction;
@@ -33,6 +35,7 @@ struct DatabaseInner {
     _file_lock: FileLock,
     #[allow(dead_code)]
     path: PathBuf,
+    sync_mode: AtomicU8,
 }
 
 /// The main database handle.
@@ -96,6 +99,7 @@ impl DynaMite {
                 snapshot_tracker: SnapshotTracker::new(),
                 _file_lock: file_lock,
                 path: path.to_path_buf(),
+                sync_mode: AtomicU8::new(SyncMode::Full as u8),
             }),
         })
     }
@@ -120,6 +124,7 @@ impl DynaMite {
                 snapshot_tracker: SnapshotTracker::new(),
                 _file_lock: file_lock,
                 path: path.to_path_buf(),
+                sync_mode: AtomicU8::new(SyncMode::Full as u8),
             }),
         })
     }
@@ -178,6 +183,24 @@ impl DynaMite {
     /// Scan all items in a table.
     pub fn scan(&self, table: &str) -> ScanBuilder<'_> {
         ScanBuilder::new(self, table.to_string())
+    }
+
+    /// Create a new write batch for batching multiple operations.
+    ///
+    /// All queued operations are committed in a single transaction
+    /// (one fsync instead of N).
+    pub fn write_batch(&self) -> WriteBatch<'_> {
+        WriteBatch::new(self)
+    }
+
+    /// Set the sync mode (durability level).
+    pub fn set_sync_mode(&self, mode: SyncMode) {
+        self.inner.sync_mode.store(mode as u8, Ordering::Release);
+    }
+
+    /// Get the current sync mode.
+    pub fn sync_mode(&self) -> SyncMode {
+        SyncMode::from_u8(self.inner.sync_mode.load(Ordering::Acquire))
     }
 
     /// Execute a write transaction.
@@ -258,8 +281,10 @@ impl DynaMite {
             .file_manager
             .write_page(new_slot as u64, &header_buf)?;
 
-        // Sync.
-        state.file_manager.sync()?;
+        // Sync (conditional on SyncMode).
+        if self.inner.sync_mode.load(Ordering::Acquire) == SyncMode::Full as u8 {
+            state.file_manager.sync()?;
+        }
         state.header_slot = new_slot;
 
         Ok(())

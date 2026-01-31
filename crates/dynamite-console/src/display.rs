@@ -1,6 +1,96 @@
 use dynamite_core::api::QueryResult;
 use dynamite_core::types::{KeyType, TableSchema};
-use serde_json::Value;
+use serde_json::{Value, json};
+
+use crate::executor::CommandResult;
+
+/// Output mode for rendering command results.
+pub enum OutputMode {
+    /// Human-readable pretty-printed output.
+    Pretty,
+    /// Machine-parseable JSON (one JSON object per result on stdout).
+    Json,
+}
+
+/// Render a command result to stdout in the given mode.
+///
+/// Returns `true` to continue execution, `false` to signal exit.
+pub fn render(result: &CommandResult, mode: &OutputMode) -> bool {
+    match result {
+        CommandResult::Ok(msg) => match mode {
+            OutputMode::Pretty => print_ok(msg),
+            OutputMode::Json => println!("{}", json!({"ok": true, "message": msg})),
+        },
+        CommandResult::Item(item) => match mode {
+            OutputMode::Pretty => match item {
+                Some(v) => print_item(v),
+                None => print_not_found(),
+            },
+            OutputMode::Json => match item {
+                Some(v) => println!("{}", json!({"found": true, "item": v})),
+                None => println!("{}", json!({"found": false})),
+            },
+        },
+        CommandResult::QueryResult(result) => match mode {
+            OutputMode::Pretty => print_query_result(result),
+            OutputMode::Json => {
+                let has_more = result.last_evaluated_key.is_some();
+                println!(
+                    "{}",
+                    json!({
+                        "items": result.items,
+                        "count": result.items.len(),
+                        "has_more": has_more,
+                    })
+                );
+            }
+        },
+        CommandResult::TableList(tables) => match mode {
+            OutputMode::Pretty => print_table_list(tables),
+            OutputMode::Json => println!("{}", json!({"tables": tables})),
+        },
+        CommandResult::TableSchema(schema) => match mode {
+            OutputMode::Pretty => print_table_schema(schema),
+            OutputMode::Json => {
+                let sk = schema.sort_key.as_ref().map(|sk| {
+                    json!({
+                        "name": sk.name,
+                        "type": format_key_type(sk.key_type),
+                    })
+                });
+                println!(
+                    "{}",
+                    json!({
+                        "name": schema.name,
+                        "partition_key": {
+                            "name": schema.partition_key.name,
+                            "type": format_key_type(schema.partition_key.key_type),
+                        },
+                        "sort_key": sk,
+                    })
+                );
+            }
+        },
+        CommandResult::Help => match mode {
+            OutputMode::Pretty => print_help(),
+            OutputMode::Json => println!("{}", json!({"help": HELP_TEXT})),
+        },
+        CommandResult::Exit => return false,
+    }
+    true
+}
+
+/// Render an error in the given mode (always to stderr).
+pub fn render_error(err: &dyn std::fmt::Display, mode: &OutputMode) {
+    match mode {
+        OutputMode::Pretty => print_error(err),
+        OutputMode::Json => {
+            eprintln!("{}", json!({"error": err.to_string()}));
+        }
+    }
+}
+
+// ---- Pretty-print helpers (unchanged from original) ----
 
 /// Pretty-print a single item with 2-space indentation.
 pub fn print_item(item: &Value) {
@@ -16,9 +106,6 @@ pub fn print_not_found() {
 }
 
 /// Print the result of a QUERY or SCAN operation.
-///
-/// Each item is pretty-printed, followed by a summary line showing the count.
-/// If there are more results available (pagination), an additional note is printed.
 pub fn print_query_result(result: &QueryResult) {
     for item in &result.items {
         print_item(item);
@@ -73,10 +160,7 @@ pub fn print_error(err: &dyn std::fmt::Display) {
     eprintln!("Error: {err}");
 }
 
-/// Print the full command reference.
-pub fn print_help() {
-    println!(
-        "\
+const HELP_TEXT: &str = "\
 DynaMite Console - Command Reference
 =====================================
 
@@ -87,7 +171,7 @@ Table Management:
   DESCRIBE TABLE <name>
 
 Data Operations:
-  PUT <table> {{json}}
+  PUT <table> {json}
   GET <table> pk=<value> [sk=<value>]
   DELETE <table> pk=<value> [sk=<value>]
 
@@ -105,8 +189,11 @@ Other:
 Values:
   Numbers:   42, 3.14
   Strings:   alice, \"hello world\"  (use quotes for spaces)
-  JSON:      {{\"key\": \"value\", \"num\": 42}}"
-    );
+  JSON:      {\"key\": \"value\", \"num\": 42}";
+
+/// Print the full command reference.
+pub fn print_help() {
+    println!("{HELP_TEXT}");
 }
 
 /// Format a key type as a human-readable string.

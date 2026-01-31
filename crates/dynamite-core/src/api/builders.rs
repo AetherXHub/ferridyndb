@@ -133,7 +133,7 @@ impl<'a> GetItemBuilder<'a> {
 
             match data {
                 Some(bytes) => {
-                    let val: Value = serde_json::from_slice(&bytes).map_err(|e| {
+                    let val: Value = rmp_serde::from_slice(&bytes).map_err(|e| {
                         StorageError::CorruptedPage(format!("failed to deserialize document: {e}"))
                     })?;
                     Ok(Some(val))
@@ -323,7 +323,7 @@ impl<'a> QueryBuilder<'a> {
                     continue;
                 }
 
-                let val: Value = serde_json::from_slice(&value_bytes).map_err(|e| {
+                let val: Value = rmp_serde::from_slice(&value_bytes).map_err(|e| {
                     StorageError::CorruptedPage(format!("failed to deserialize document: {e}"))
                 })?;
                 items.push((key_bytes, val));
@@ -418,7 +418,7 @@ impl<'a> ScanBuilder<'a> {
                     continue;
                 }
 
-                let val: Value = serde_json::from_slice(&value_bytes).map_err(|e| {
+                let val: Value = rmp_serde::from_slice(&value_bytes).map_err(|e| {
                     StorageError::CorruptedPage(format!("failed to deserialize document: {e}"))
                 })?;
                 items.push((key_bytes, val));

@@ -69,10 +69,10 @@ pub fn extract_key_from_doc(doc: &Value, key_def: &KeyDefinition) -> Result<KeyV
     json_to_key_value(val, key_def.key_type, &key_def.name)
 }
 
-/// Validate document size and return the serialized bytes.
+/// Validate document size and return the serialized bytes (MessagePack).
 pub fn validate_document_size(doc: &Value) -> Result<Vec<u8>, Error> {
-    let bytes = serde_json::to_vec(doc).map_err(|e| {
-        crate::error::StorageError::CorruptedPage(format!("JSON serialization error: {e}"))
+    let bytes = rmp_serde::to_vec(doc).map_err(|e| {
+        crate::error::StorageError::CorruptedPage(format!("MessagePack serialization error: {e}"))
     })?;
     if bytes.len() > MAX_DOCUMENT_SIZE {
         return Err(EncodingError::DocumentTooLarge {

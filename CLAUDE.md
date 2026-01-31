@@ -17,7 +17,8 @@ This is a Cargo workspace. Build/test from the repository root:
 - `cargo clippy --workspace` - lint all crates
 - `cargo fmt --all` - format all crates
 - `cargo fmt --all --check` - check formatting without modifying files
-- `cargo bench -p dynamite-core` - run benchmarks (criterion)
+- `cargo bench -p dynamite-core` - run benchmarks (criterion, uses tmpfs by default)
+- `BENCH_DIR=/var/home/travis/development/dyna_mite/target/bench_real cargo bench --bench dynamite_file_bench` - run file-backed benchmarks on real NVMe (only after major refactors)
 
 ## Architecture
 
@@ -69,6 +70,15 @@ Work proceeds incrementally. Every change must leave the project in a fully work
 4. **Format**: `cargo fmt --all --check` must pass.
 5. **No dead code**: Don't stub out modules or leave `todo!()` / `unimplemented!()` in committed code. Each step should produce working, tested code — not scaffolding for the future.
 6. **One layer at a time**: Build bottom-up through the architecture. Do not start a higher layer until the layer beneath it compiles, passes tests, and is lint-clean.
+
+## Benchmarks
+
+Two benchmark suites exist in `dynamite-core`:
+
+- `dynamite_bench` — in-memory (tmpfs) microbenchmarks. Run these routinely.
+- `dynamite_file_bench` — file-backed benchmarks with real I/O. Uses tmpfs by default; set `BENCH_DIR` to point at real storage.
+
+**Default workflow**: run benchmarks on tmpfs (`cargo bench`). Only run on real NVMe disk after major refactors where all in-memory benchmarks have improved or not regressed. NVMe results are dominated by fsync latency (~5ms per commit) which masks algorithmic changes.
 
 ## Core Dependencies
 
