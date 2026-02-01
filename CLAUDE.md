@@ -76,29 +76,8 @@ crates/
 - **4KB pages** — Matches OS page size
 - **Single writer, unlimited readers** — LMDB concurrency model
 - **Slotted pages** — Slot array grows forward, cell data grows backward
-- **Magic bytes `b"DYNA"`** — File format identifier in header; do not change
 - **No secondary indexes in v1**
 - **No B+Tree rebalancing in v1** — Mark-as-dead delete, reclaim fully empty pages
-
-## Development Process
-
-Work proceeds incrementally. Every change must leave the project in a fully working state:
-
-1. **Compile first** — `cargo build` must pass with zero errors before moving on
-2. **Test everything** — Write tests for each new feature before considering it done
-3. **Lint clean** — `cargo clippy --workspace -- -D warnings` must pass
-4. **Format** — `cargo fmt --all --check` must pass
-5. **No dead code** — No `todo!()` or `unimplemented!()` in committed code
-6. **One layer at a time** — Build bottom-up through the architecture stack
-
-## Benchmarks
-
-Two benchmark suites in `ferridyn-core`:
-
-- `ferridyn_bench` — In-memory (tmpfs) microbenchmarks. Run routinely.
-- `ferridyn_file_bench` — File-backed benchmarks with real I/O. Uses tmpfs by default; set `BENCH_DIR` to point at real storage.
-
-Default: run on tmpfs (`cargo bench`). Only run on real NVMe after major refactors. NVMe results are dominated by fsync latency (~5ms per commit) which masks algorithmic changes.
 
 ## Dependencies
 
