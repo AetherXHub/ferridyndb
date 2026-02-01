@@ -11,7 +11,6 @@ A local, embedded, DynamoDB-style document database written in Rust with single-
 - **Byte-ordered key encoding** — Enables fast `memcmp`-based comparisons for partition and sort keys
 - **Version-aware API** — Optimistic concurrency control with versioned reads and conditional writes
 - **Unix socket server** — Multi-process access with async client library
-- **Claude Code memory plugin** — Agentic memory system with automatic context retrieval
 
 ## Quick Start
 
@@ -142,45 +141,12 @@ loop {
 }
 ```
 
-## Claude Code Memory Plugin
-
-DynaMite includes a Claude Code plugin that provides agentic memory — automatically retrieving relevant context and persisting learnings across sessions.
-
-### Install
-
-```bash
-# Install the plugin from GitHub
-/plugin marketplace add AetherXHub/dynamite
-
-# Run first-time setup (builds binaries, starts server, verifies tools)
-/dynamite-memory:setup
-```
-
-### What It Does
-
-- **MCP tools** — `remember`, `recall`, `discover`, `forget` available directly in Claude conversations
-- **Auto-retrieval** (UserPromptSubmit hook) — injects relevant memories into context before each prompt
-- **Auto-save** (PreCompact hook) — extracts key learnings before conversation compaction
-
-### Architecture
-
-```
-dynamite-server (background, owns DB file)
-    ^ Unix socket (~/.local/share/dynamite/server.sock)
-    |
-    +-- dynamite-memory (MCP server, provides tools to Claude)
-    +-- dynamite-memory-cli (used by hooks for read/write)
-```
-
-See [`plugin-README.md`](plugin-README.md) for detailed plugin documentation.
-
 ## Workspace Layout
 
 | Crate | Description |
 |-------|-------------|
 | `dynamite-core` | Core database engine (storage, B+Tree, MVCC, public API) |
 | `dynamite-server` | Unix socket server + async client library for multi-process access |
-| `dynamite-memory` | Claude Code MCP server + CLI for agentic memory system |
 | `dynamite-console` | Interactive REPL for exploring and manipulating DynaMite databases |
 
 ## Development
