@@ -9,6 +9,7 @@ pub enum Command {
         pk_name: String,
         pk_type: KeyType,
         sk: Option<(String, KeyType)>,
+        ttl: Option<String>,
     },
     DropTable {
         name: String,
@@ -42,7 +43,16 @@ pub enum Command {
         table: String,
         limit: Option<usize>,
     },
-    Help,
+    ListKeys {
+        table: String,
+        limit: Option<usize>,
+    },
+    ListPrefixes {
+        table: String,
+        pk: Value,
+        limit: Option<usize>,
+    },
+    Help(Option<String>),
     Exit,
 }
 

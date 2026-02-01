@@ -134,6 +134,7 @@ mod tests {
                 key_type: KeyType::String,
             },
             sort_key: None,
+            ttl_attribute: None,
         }
     }
 
@@ -149,6 +150,7 @@ mod tests {
                 name: "sk".to_string(),
                 key_type: KeyType::Number,
             }),
+            ttl_attribute: None,
         }
     }
 
@@ -279,6 +281,7 @@ mod tests {
                 key_type: KeyType::String,
             },
             sort_key: None,
+            ttl_attribute: None,
         };
         let schema_orders = TableSchema {
             name: "orders".to_string(),
@@ -287,6 +290,7 @@ mod tests {
                 key_type: KeyType::Number,
             },
             sort_key: None,
+            ttl_attribute: None,
         };
 
         let (new_root, entry_users) = create_table(&mut store, root, schema_users).unwrap();

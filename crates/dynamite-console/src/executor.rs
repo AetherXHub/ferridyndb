@@ -17,8 +17,12 @@ pub enum CommandResult {
     TableList(Vec<String>),
     /// Table schema (DESCRIBE TABLE).
     TableSchema(TableSchema),
-    /// Help text.
-    Help,
+    /// Distinct partition keys (LIST KEYS).
+    PartitionKeys(Vec<Value>),
+    /// Distinct sort key prefixes (LIST PREFIXES).
+    SortKeyPrefixes(Vec<Value>),
+    /// Help text (optional topic for per-command help).
+    Help(Option<String>),
     /// Exit signal.
     Exit,
 }
@@ -31,7 +35,8 @@ pub fn execute(db: &DynaMite, cmd: Command) -> Result<CommandResult, Error> {
             pk_name,
             pk_type,
             sk,
-        } => exec_create_table(db, &name, &pk_name, pk_type, sk),
+            ttl,
+        } => exec_create_table(db, &name, &pk_name, pk_type, sk, ttl.as_deref()),
         Command::DropTable { name } => exec_drop_table(db, &name),
         Command::ListTables => exec_list_tables(db),
         Command::DescribeTable { name } => exec_describe_table(db, &name),
@@ -46,7 +51,9 @@ pub fn execute(db: &DynaMite, cmd: Command) -> Result<CommandResult, Error> {
             desc,
         } => exec_query(db, &table, pk, sort_condition, limit, desc),
         Command::Scan { table, limit } => exec_scan(db, &table, limit),
-        Command::Help => Ok(CommandResult::Help),
+        Command::ListKeys { table, limit } => exec_list_keys(db, &table, limit),
+        Command::ListPrefixes { table, pk, limit } => exec_list_prefixes(db, &table, pk, limit),
+        Command::Help(topic) => Ok(CommandResult::Help(topic)),
         Command::Exit => Ok(CommandResult::Exit),
     }
 }
@@ -57,10 +64,14 @@ fn exec_create_table(
     pk_name: &str,
     pk_type: dynamite_core::types::KeyType,
     sk: Option<(String, dynamite_core::types::KeyType)>,
+    ttl: Option<&str>,
 ) -> Result<CommandResult, Error> {
     let mut builder = db.create_table(name).partition_key(pk_name, pk_type);
     if let Some((sk_name, sk_type)) = sk {
         builder = builder.sort_key(&sk_name, sk_type);
+    }
+    if let Some(ttl_attr) = ttl {
+        builder = builder.ttl_attribute(ttl_attr);
     }
     builder.execute()?;
     Ok(CommandResult::Ok(format!("Table '{name}' created.")))
@@ -155,4 +166,31 @@ fn exec_scan(db: &DynaMite, table: &str, limit: Option<usize>) -> Result<Command
     }
     let result = builder.execute()?;
     Ok(CommandResult::QueryResult(result))
+}
+
+fn exec_list_keys(
+    db: &DynaMite,
+    table: &str,
+    limit: Option<usize>,
+) -> Result<CommandResult, Error> {
+    let mut builder = db.list_partition_keys(table);
+    if let Some(n) = limit {
+        builder = builder.limit(n);
+    }
+    let keys = builder.execute()?;
+    Ok(CommandResult::PartitionKeys(keys))
+}
+
+fn exec_list_prefixes(
+    db: &DynaMite,
+    table: &str,
+    pk: Value,
+    limit: Option<usize>,
+) -> Result<CommandResult, Error> {
+    let mut builder = db.list_sort_key_prefixes(table).partition_key(pk);
+    if let Some(n) = limit {
+        builder = builder.limit(n);
+    }
+    let prefixes = builder.execute()?;
+    Ok(CommandResult::SortKeyPrefixes(prefixes))
 }

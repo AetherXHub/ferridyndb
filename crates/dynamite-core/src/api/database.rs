@@ -1,13 +1,16 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
 
 use crate::btree::ops as btree_ops;
 use crate::catalog;
-use crate::error::{Error, StorageError};
+use crate::error::{Error, QueryError, StorageError};
+use crate::mvcc::ops as mvcc_ops;
 use crate::storage::file::FileManager;
 use crate::storage::header::FileHeader;
 use crate::storage::lock::FileLock;
@@ -16,7 +19,10 @@ use crate::storage::snapshot::SnapshotTracker;
 use crate::types::{PAGE_SIZE, PageId};
 
 use super::batch::{SyncMode, WriteBatch};
-use super::builders::{DeleteItemBuilder, GetItemBuilder, QueryBuilder, ScanBuilder, TableBuilder};
+use super::builders::{
+    DeleteItemBuilder, GetItemBuilder, GetItemVersionedBuilder, ListPartitionKeysBuilder,
+    ListSortKeyPrefixesBuilder, QueryBuilder, ScanBuilder, TableBuilder,
+};
 use super::page_store::{BufferedPageStore, FilePageStore};
 use super::transaction::Transaction;
 
@@ -36,6 +42,9 @@ struct DatabaseInner {
     #[allow(dead_code)]
     path: PathBuf,
     sync_mode: AtomicU8,
+    /// Cache of catalog entries by table name. Cleared on every write commit
+    /// since any put/delete may change a table's `data_root_page`.
+    catalog_cache: Mutex<HashMap<String, catalog::CatalogEntry>>,
 }
 
 /// The main database handle.
@@ -100,6 +109,7 @@ impl DynaMite {
                 _file_lock: file_lock,
                 path: path.to_path_buf(),
                 sync_mode: AtomicU8::new(SyncMode::Full as u8),
+                catalog_cache: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -125,6 +135,7 @@ impl DynaMite {
                 _file_lock: file_lock,
                 path: path.to_path_buf(),
                 sync_mode: AtomicU8::new(SyncMode::Full as u8),
+                catalog_cache: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -155,7 +166,7 @@ impl DynaMite {
     pub fn describe_table(&self, name: &str) -> Result<crate::types::TableSchema, Error> {
         let state = self.inner.state.read();
         let store = self.read_store(&state)?;
-        let entry = catalog::ops::get_table(&store, state.header.catalog_root_page, name)?;
+        let entry = self.cached_get_table(&store, state.header.catalog_root_page, name)?;
         Ok(entry.schema)
     }
 
@@ -168,6 +179,29 @@ impl DynaMite {
     /// Get an item from a table by key.
     pub fn get_item(&self, table: &str) -> GetItemBuilder<'_> {
         GetItemBuilder::new(self, table.to_string())
+    }
+
+    /// Get an item from a table by key, including its MVCC version.
+    ///
+    /// Returns a `VersionedItem` with the document and its version number.
+    /// Use the version with `put_item_conditional` for optimistic concurrency.
+    pub fn get_item_versioned(&self, table: &str) -> GetItemVersionedBuilder<'_> {
+        GetItemVersionedBuilder::new(self, table.to_string())
+    }
+
+    /// Put an item with optimistic concurrency control.
+    ///
+    /// Succeeds only if the item's current version matches `expected_version`.
+    /// Returns `TxnError::VersionMismatch` if another writer modified the item
+    /// since it was read.
+    pub fn put_item_conditional(
+        &self,
+        table: &str,
+        document: Value,
+        expected_version: u64,
+    ) -> Result<(), Error> {
+        let table = table.to_string();
+        self.transact(move |txn| txn.put_item_conditional(&table, document, expected_version))
     }
 
     /// Delete an item from a table by key.
@@ -183,6 +217,16 @@ impl DynaMite {
     /// Scan all items in a table.
     pub fn scan(&self, table: &str) -> ScanBuilder<'_> {
         ScanBuilder::new(self, table.to_string())
+    }
+
+    /// List distinct partition keys in a table.
+    pub fn list_partition_keys(&self, table: &str) -> ListPartitionKeysBuilder<'_> {
+        ListPartitionKeysBuilder::new(self, table.to_string())
+    }
+
+    /// List distinct sort key prefixes (split on `#`) for a given partition key.
+    pub fn list_sort_key_prefixes(&self, table: &str) -> ListSortKeyPrefixesBuilder<'_> {
+        ListSortKeyPrefixesBuilder::new(self, table.to_string())
     }
 
     /// Create a new write batch for batching multiple operations.
@@ -201,6 +245,83 @@ impl DynaMite {
     /// Get the current sync mode.
     pub fn sync_mode(&self) -> SyncMode {
         SyncMode::from_u8(self.inner.sync_mode.load(Ordering::Acquire))
+    }
+
+    /// Sweep expired TTL items from a table.
+    ///
+    /// Scans the table for items whose TTL has expired and deletes them
+    /// in a single transaction. Returns the number of items deleted.
+    ///
+    /// Batch-limited to 100 items per call; call repeatedly until 0 for
+    /// full cleanup.
+    pub fn sweep_expired_ttl(&self, table: &str) -> Result<usize, Error> {
+        // Phase 1: Read snapshot to find expired keys.
+        let expired_keys: Vec<(Value, Option<Value>)> =
+            self.read_snapshot(|store, catalog_root, snapshot_txn| {
+                let entry = self.cached_get_table(store, catalog_root, table)?;
+                let schema = &entry.schema;
+
+                let Some(ref ttl_attr) = schema.ttl_attribute else {
+                    return Ok(Vec::new());
+                };
+
+                let raw_results = mvcc_ops::mvcc_range_scan(
+                    store,
+                    entry.data_root_page,
+                    None,
+                    None,
+                    snapshot_txn,
+                )?;
+
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs_f64();
+
+                let mut expired = Vec::new();
+                for (_key_bytes, value_bytes) in raw_results {
+                    if expired.len() >= 100 {
+                        break;
+                    }
+                    let val: Value = rmp_serde::from_slice(&value_bytes).map_err(|e| {
+                        StorageError::CorruptedPage(format!("failed to deserialize document: {e}"))
+                    })?;
+
+                    if let Some(ttl_val) = val.get(ttl_attr)
+                        && let Some(epoch_secs) = ttl_val.as_f64()
+                        && epoch_secs != 0.0
+                        && epoch_secs <= now
+                    {
+                        let pk_val = val
+                            .get(&schema.partition_key.name)
+                            .cloned()
+                            .ok_or(QueryError::PartitionKeyRequired)?;
+                        let sk_val = schema
+                            .sort_key
+                            .as_ref()
+                            .and_then(|sk_def| val.get(&sk_def.name).cloned());
+                        expired.push((pk_val, sk_val));
+                    }
+                }
+
+                Ok(expired)
+            })?;
+
+        if expired_keys.is_empty() {
+            return Ok(0);
+        }
+
+        // Phase 2: Delete expired items in a write transaction.
+        let count = expired_keys.len();
+        let table_name = table.to_string();
+        self.transact(move |txn| {
+            for (pk_val, sk_val) in &expired_keys {
+                txn.delete_item(&table_name, pk_val, sk_val.as_ref())?;
+            }
+            Ok(())
+        })?;
+
+        Ok(count)
     }
 
     /// Execute a write transaction.
@@ -251,6 +372,27 @@ impl DynaMite {
         f(&store, catalog_root, snapshot_txn)
     }
 
+    /// Look up a table's catalog entry, returning a cached copy when available.
+    pub(crate) fn cached_get_table(
+        &self,
+        store: &impl crate::btree::PageStore,
+        catalog_root: PageId,
+        table_name: &str,
+    ) -> Result<catalog::CatalogEntry, Error> {
+        {
+            let cache = self.inner.catalog_cache.lock();
+            if let Some(entry) = cache.get(table_name) {
+                return Ok(entry.clone());
+            }
+        }
+        let entry = catalog::ops::get_table(store, catalog_root, table_name)?;
+        {
+            let mut cache = self.inner.catalog_cache.lock();
+            cache.insert(table_name.to_string(), entry.clone());
+        }
+        Ok(entry)
+    }
+
     fn commit_txn(&self, txn: Transaction, state: &mut DatabaseState) -> Result<(), Error> {
         let Transaction {
             store,
@@ -286,6 +428,9 @@ impl DynaMite {
             state.file_manager.sync()?;
         }
         state.header_slot = new_slot;
+
+        // Invalidate catalog cache — any write may have changed data_root_page.
+        self.inner.catalog_cache.lock().clear();
 
         Ok(())
     }
@@ -1053,5 +1198,562 @@ mod concurrency_stress_tests {
         // Final verification: scan to confirm total count.
         let result = db.scan("stress").execute().unwrap();
         assert_eq!(result.items.len(), 500);
+    }
+}
+
+#[cfg(test)]
+mod ttl_tests {
+    use super::*;
+    use crate::types::KeyType;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    fn create_test_db() -> (DynaMite, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = DynaMite::create(&db_path).unwrap();
+        (db, dir)
+    }
+
+    #[test]
+    fn test_get_expired_item_returns_none() {
+        let (db, _dir) = create_test_db();
+        db.create_table("cache")
+            .partition_key("key", KeyType::String)
+            .ttl_attribute("expires")
+            .execute()
+            .unwrap();
+
+        // TTL in the past (epoch 1000 is 1970).
+        db.put_item("cache", json!({"key": "a", "expires": 1000, "val": "old"}))
+            .unwrap();
+
+        let item = db.get_item("cache").partition_key("a").execute().unwrap();
+        assert!(item.is_none(), "expired item should be invisible to GET");
+    }
+
+    #[test]
+    fn test_get_non_expired_item_returns_some() {
+        let (db, _dir) = create_test_db();
+        db.create_table("cache")
+            .partition_key("key", KeyType::String)
+            .ttl_attribute("expires")
+            .execute()
+            .unwrap();
+
+        // TTL far in the future.
+        db.put_item(
+            "cache",
+            json!({"key": "b", "expires": 9999999999.0, "val": "fresh"}),
+        )
+        .unwrap();
+
+        let item = db.get_item("cache").partition_key("b").execute().unwrap();
+        assert!(item.is_some(), "non-expired item should be visible");
+        assert_eq!(item.unwrap()["val"], "fresh");
+    }
+
+    #[test]
+    fn test_get_no_ttl_attr_in_doc_returns_some() {
+        let (db, _dir) = create_test_db();
+        db.create_table("cache")
+            .partition_key("key", KeyType::String)
+            .ttl_attribute("expires")
+            .execute()
+            .unwrap();
+
+        // Doc does not contain the TTL attribute at all → never expires.
+        db.put_item("cache", json!({"key": "c", "val": "permanent"}))
+            .unwrap();
+
+        let item = db.get_item("cache").partition_key("c").execute().unwrap();
+        assert!(item.is_some(), "item without TTL attr should never expire");
+    }
+
+    #[test]
+    fn test_get_ttl_zero_never_expires() {
+        let (db, _dir) = create_test_db();
+        db.create_table("cache")
+            .partition_key("key", KeyType::String)
+            .ttl_attribute("expires")
+            .execute()
+            .unwrap();
+
+        // TTL = 0 means "never expires" per DynamoDB semantics.
+        db.put_item("cache", json!({"key": "d", "expires": 0, "val": "forever"}))
+            .unwrap();
+
+        let item = db.get_item("cache").partition_key("d").execute().unwrap();
+        assert!(item.is_some(), "TTL=0 should mean never expires");
+    }
+
+    #[test]
+    fn test_get_ttl_non_numeric_never_expires() {
+        let (db, _dir) = create_test_db();
+        db.create_table("cache")
+            .partition_key("key", KeyType::String)
+            .ttl_attribute("expires")
+            .execute()
+            .unwrap();
+
+        // Non-numeric TTL value → not parseable → never expires.
+        db.put_item(
+            "cache",
+            json!({"key": "e", "expires": "not-a-number", "val": "safe"}),
+        )
+        .unwrap();
+
+        let item = db.get_item("cache").partition_key("e").execute().unwrap();
+        assert!(item.is_some(), "non-numeric TTL should mean never expires");
+    }
+
+    #[test]
+    fn test_query_filters_expired() {
+        let (db, _dir) = create_test_db();
+        db.create_table("events")
+            .partition_key("pk", KeyType::String)
+            .sort_key("sk", KeyType::Number)
+            .ttl_attribute("ttl")
+            .execute()
+            .unwrap();
+
+        // Insert 3 items: 2 expired, 1 alive.
+        db.put_item(
+            "events",
+            json!({"pk": "user1", "sk": 1.0, "ttl": 1000, "data": "expired1"}),
+        )
+        .unwrap();
+        db.put_item(
+            "events",
+            json!({"pk": "user1", "sk": 2.0, "ttl": 2000, "data": "expired2"}),
+        )
+        .unwrap();
+        db.put_item(
+            "events",
+            json!({"pk": "user1", "sk": 3.0, "ttl": 9999999999.0, "data": "alive"}),
+        )
+        .unwrap();
+
+        let result = db.query("events").partition_key("user1").execute().unwrap();
+        assert_eq!(result.items.len(), 1, "only non-expired items in QUERY");
+        assert_eq!(result.items[0]["data"], "alive");
+    }
+
+    #[test]
+    fn test_scan_filters_expired() {
+        let (db, _dir) = create_test_db();
+        db.create_table("cache")
+            .partition_key("key", KeyType::String)
+            .ttl_attribute("expires")
+            .execute()
+            .unwrap();
+
+        db.put_item(
+            "cache",
+            json!({"key": "old", "expires": 1000, "val": "gone"}),
+        )
+        .unwrap();
+        db.put_item(
+            "cache",
+            json!({"key": "new", "expires": 9999999999.0, "val": "here"}),
+        )
+        .unwrap();
+        db.put_item("cache", json!({"key": "permanent", "val": "no_ttl"}))
+            .unwrap();
+
+        let result = db.scan("cache").execute().unwrap();
+        assert_eq!(result.items.len(), 2, "SCAN should filter expired items");
+    }
+
+    #[test]
+    fn test_table_without_ttl_unaffected() {
+        let (db, _dir) = create_test_db();
+        db.create_table("plain")
+            .partition_key("id", KeyType::String)
+            .execute()
+            .unwrap();
+
+        // Even if a doc has a field called "expires", it shouldn't be treated
+        // as TTL since the table has no ttl_attribute configured.
+        db.put_item(
+            "plain",
+            json!({"id": "x", "expires": 1000, "val": "visible"}),
+        )
+        .unwrap();
+
+        let item = db.get_item("plain").partition_key("x").execute().unwrap();
+        assert!(
+            item.is_some(),
+            "table without TTL should ignore expires field"
+        );
+    }
+
+    #[test]
+    fn test_describe_table_shows_ttl() {
+        let (db, _dir) = create_test_db();
+        db.create_table("cache")
+            .partition_key("key", KeyType::String)
+            .ttl_attribute("expires")
+            .execute()
+            .unwrap();
+
+        let schema = db.describe_table("cache").unwrap();
+        assert_eq!(schema.ttl_attribute, Some("expires".to_string()));
+    }
+
+    #[test]
+    fn test_describe_table_no_ttl() {
+        let (db, _dir) = create_test_db();
+        db.create_table("plain")
+            .partition_key("key", KeyType::String)
+            .execute()
+            .unwrap();
+
+        let schema = db.describe_table("plain").unwrap();
+        assert_eq!(schema.ttl_attribute, None);
+    }
+
+    #[test]
+    fn test_sweep_deletes_expired() {
+        let (db, _dir) = create_test_db();
+        db.create_table("cache")
+            .partition_key("key", KeyType::String)
+            .ttl_attribute("expires")
+            .execute()
+            .unwrap();
+
+        db.put_item("cache", json!({"key": "expired1", "expires": 1000}))
+            .unwrap();
+        db.put_item("cache", json!({"key": "expired2", "expires": 2000}))
+            .unwrap();
+        db.put_item("cache", json!({"key": "alive", "expires": 9999999999.0}))
+            .unwrap();
+
+        let deleted = db.sweep_expired_ttl("cache").unwrap();
+        assert_eq!(deleted, 2, "should delete 2 expired items");
+
+        // Second sweep should find nothing more.
+        let deleted2 = db.sweep_expired_ttl("cache").unwrap();
+        assert_eq!(deleted2, 0, "second sweep should find nothing");
+
+        // The alive item should still be there.
+        let item = db
+            .get_item("cache")
+            .partition_key("alive")
+            .execute()
+            .unwrap();
+        assert!(item.is_some(), "non-expired item should survive sweep");
+    }
+
+    #[test]
+    fn test_sweep_on_table_without_ttl() {
+        let (db, _dir) = create_test_db();
+        db.create_table("plain")
+            .partition_key("id", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put_item("plain", json!({"id": "x", "val": 1})).unwrap();
+
+        let deleted = db.sweep_expired_ttl("plain").unwrap();
+        assert_eq!(deleted, 0, "table without TTL should have nothing to sweep");
+
+        // Item should still be there.
+        let item = db.get_item("plain").partition_key("x").execute().unwrap();
+        assert!(item.is_some());
+    }
+
+    #[test]
+    fn test_sweep_with_sort_key() {
+        let (db, _dir) = create_test_db();
+        db.create_table("events")
+            .partition_key("pk", KeyType::String)
+            .sort_key("sk", KeyType::Number)
+            .ttl_attribute("ttl")
+            .execute()
+            .unwrap();
+
+        db.put_item("events", json!({"pk": "u1", "sk": 1.0, "ttl": 1000}))
+            .unwrap();
+        db.put_item(
+            "events",
+            json!({"pk": "u1", "sk": 2.0, "ttl": 9999999999.0}),
+        )
+        .unwrap();
+
+        let deleted = db.sweep_expired_ttl("events").unwrap();
+        assert_eq!(deleted, 1);
+
+        // Only the non-expired item should remain.
+        let result = db.query("events").partition_key("u1").execute().unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["sk"], 2.0);
+    }
+}
+
+#[cfg(test)]
+mod list_partition_keys_tests {
+    use super::*;
+    use crate::types::KeyType;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    fn create_test_db() -> (DynaMite, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = DynaMite::create(&db_path).unwrap();
+        (db, dir)
+    }
+
+    #[test]
+    fn test_list_keys_pk_only_table() {
+        let (db, _dir) = create_test_db();
+        db.create_table("users")
+            .partition_key("id", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put_item("users", json!({"id": "alice", "name": "Alice"}))
+            .unwrap();
+        db.put_item("users", json!({"id": "bob", "name": "Bob"}))
+            .unwrap();
+        db.put_item("users", json!({"id": "charlie", "name": "Charlie"}))
+            .unwrap();
+
+        let keys = db.list_partition_keys("users").execute().unwrap();
+        assert_eq!(keys.len(), 3);
+        // Keys are sorted (B+Tree order).
+        assert_eq!(keys[0], json!("alice"));
+        assert_eq!(keys[1], json!("bob"));
+        assert_eq!(keys[2], json!("charlie"));
+    }
+
+    #[test]
+    fn test_list_keys_dedup_across_sort_keys() {
+        let (db, _dir) = create_test_db();
+        db.create_table("events")
+            .partition_key("pk", KeyType::String)
+            .sort_key("sk", KeyType::Number)
+            .execute()
+            .unwrap();
+
+        // Two items under "user1", one under "user2".
+        db.put_item("events", json!({"pk": "user1", "sk": 1.0, "data": "a"}))
+            .unwrap();
+        db.put_item("events", json!({"pk": "user1", "sk": 2.0, "data": "b"}))
+            .unwrap();
+        db.put_item("events", json!({"pk": "user2", "sk": 1.0, "data": "c"}))
+            .unwrap();
+
+        let keys = db.list_partition_keys("events").execute().unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0], json!("user1"));
+        assert_eq!(keys[1], json!("user2"));
+    }
+
+    #[test]
+    fn test_list_keys_empty_table() {
+        let (db, _dir) = create_test_db();
+        db.create_table("empty")
+            .partition_key("id", KeyType::String)
+            .execute()
+            .unwrap();
+
+        let keys = db.list_partition_keys("empty").execute().unwrap();
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn test_list_keys_with_limit() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("id", KeyType::String)
+            .execute()
+            .unwrap();
+
+        for i in 0..10 {
+            db.put_item("items", json!({"id": format!("key{i:02}"), "val": i}))
+                .unwrap();
+        }
+
+        let keys = db.list_partition_keys("items").limit(3).execute().unwrap();
+        assert_eq!(keys.len(), 3);
+    }
+
+    #[test]
+    fn test_list_keys_table_not_found() {
+        let (db, _dir) = create_test_db();
+        let result = db.list_partition_keys("nonexistent").execute();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_list_keys_number_pk() {
+        let (db, _dir) = create_test_db();
+        db.create_table("nums")
+            .partition_key("id", KeyType::Number)
+            .execute()
+            .unwrap();
+
+        db.put_item("nums", json!({"id": 1.0, "val": "a"})).unwrap();
+        db.put_item("nums", json!({"id": 2.0, "val": "b"})).unwrap();
+
+        let keys = db.list_partition_keys("nums").execute().unwrap();
+        assert_eq!(keys.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod list_sort_key_prefixes_tests {
+    use super::*;
+    use crate::types::KeyType;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    fn create_test_db() -> (DynaMite, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = DynaMite::create(&db_path).unwrap();
+        (db, dir)
+    }
+
+    #[test]
+    fn test_list_prefixes_hash_delimited() {
+        let (db, _dir) = create_test_db();
+        db.create_table("memories")
+            .partition_key("category", KeyType::String)
+            .sort_key("entry", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put_item(
+            "memories",
+            json!({"category": "rust", "entry": "ownership#borrowing", "data": "..."}),
+        )
+        .unwrap();
+        db.put_item(
+            "memories",
+            json!({"category": "rust", "entry": "ownership#moves", "data": "..."}),
+        )
+        .unwrap();
+        db.put_item(
+            "memories",
+            json!({"category": "rust", "entry": "lifetimes#basics", "data": "..."}),
+        )
+        .unwrap();
+        db.put_item(
+            "memories",
+            json!({"category": "rust", "entry": "lifetimes#elision", "data": "..."}),
+        )
+        .unwrap();
+
+        let prefixes = db
+            .list_sort_key_prefixes("memories")
+            .partition_key("rust")
+            .execute()
+            .unwrap();
+
+        assert_eq!(prefixes.len(), 2);
+        assert_eq!(prefixes[0], json!("lifetimes"));
+        assert_eq!(prefixes[1], json!("ownership"));
+    }
+
+    #[test]
+    fn test_list_prefixes_no_hash_returns_full_sk() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", KeyType::String)
+            .sort_key("sk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put_item("items", json!({"pk": "a", "sk": "plain-key", "val": 1}))
+            .unwrap();
+        db.put_item("items", json!({"pk": "a", "sk": "another-key", "val": 2}))
+            .unwrap();
+
+        let prefixes = db
+            .list_sort_key_prefixes("items")
+            .partition_key("a")
+            .execute()
+            .unwrap();
+
+        assert_eq!(prefixes.len(), 2);
+        assert_eq!(prefixes[0], json!("another-key"));
+        assert_eq!(prefixes[1], json!("plain-key"));
+    }
+
+    #[test]
+    fn test_list_prefixes_with_limit() {
+        let (db, _dir) = create_test_db();
+        db.create_table("memories")
+            .partition_key("cat", KeyType::String)
+            .sort_key("entry", KeyType::String)
+            .execute()
+            .unwrap();
+
+        for i in 0..5 {
+            db.put_item(
+                "memories",
+                json!({"cat": "x", "entry": format!("prefix{i}#detail"), "val": i}),
+            )
+            .unwrap();
+        }
+
+        let prefixes = db
+            .list_sort_key_prefixes("memories")
+            .partition_key("x")
+            .limit(2)
+            .execute()
+            .unwrap();
+
+        assert_eq!(prefixes.len(), 2);
+    }
+
+    #[test]
+    fn test_list_prefixes_empty_partition() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", KeyType::String)
+            .sort_key("sk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        let prefixes = db
+            .list_sort_key_prefixes("items")
+            .partition_key("nonexistent")
+            .execute()
+            .unwrap();
+
+        assert!(prefixes.is_empty());
+    }
+
+    #[test]
+    fn test_list_prefixes_no_sort_key_table_errors() {
+        let (db, _dir) = create_test_db();
+        db.create_table("plain")
+            .partition_key("id", KeyType::String)
+            .execute()
+            .unwrap();
+
+        let result = db
+            .list_sort_key_prefixes("plain")
+            .partition_key("x")
+            .execute();
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_list_prefixes_missing_pk_errors() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", KeyType::String)
+            .sort_key("sk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        let result = db.list_sort_key_prefixes("items").execute();
+        assert!(result.is_err());
     }
 }

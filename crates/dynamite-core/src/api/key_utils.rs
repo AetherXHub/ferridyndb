@@ -1,8 +1,11 @@
 use serde_json::Value;
 
 use crate::encoding::KeyValue;
+use crate::encoding::{binary, string};
 use crate::error::{EncodingError, Error, SchemaError};
-use crate::types::{KeyDefinition, KeyType, MAX_DOCUMENT_SIZE};
+use crate::types::{
+    KeyDefinition, KeyType, MAX_DOCUMENT_SIZE, MAX_PARTITION_KEY_SIZE, MAX_SORT_KEY_SIZE,
+};
 
 /// Convert a [`serde_json::Value`] to a [`KeyValue`], given the expected [`KeyType`].
 pub fn json_to_key_value(
@@ -17,6 +20,7 @@ pub fn json_to_key_value(
                 expected: KeyType::String,
                 actual: infer_key_type(val),
             })?;
+            string::validate_string_key(s)?;
             Ok(KeyValue::String(s.to_string()))
         }
         KeyType::Number => {
@@ -45,6 +49,7 @@ pub fn json_to_key_value(
                         })
                 })
                 .collect::<Result<_, _>>()?;
+            binary::validate_binary_key(&bytes)?;
             Ok(KeyValue::Binary(bytes))
         }
     }
@@ -82,6 +87,41 @@ pub fn validate_document_size(doc: &Value) -> Result<Vec<u8>, Error> {
         .into());
     }
     Ok(bytes)
+}
+
+/// Size in bytes of a key value (for limit checks).
+fn key_value_byte_size(kv: &KeyValue) -> usize {
+    match kv {
+        KeyValue::String(s) => s.len(),
+        KeyValue::Number(_) => 8,
+        KeyValue::Binary(b) => b.len(),
+    }
+}
+
+/// Validate that a partition key does not exceed the DynamoDB limit (2048 bytes).
+pub fn validate_partition_key_size(kv: &KeyValue) -> Result<(), Error> {
+    let size = key_value_byte_size(kv);
+    if size > MAX_PARTITION_KEY_SIZE {
+        return Err(EncodingError::KeyTooLarge {
+            max: MAX_PARTITION_KEY_SIZE,
+            actual: size,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// Validate that a sort key does not exceed the DynamoDB limit (1024 bytes).
+pub fn validate_sort_key_size(kv: &KeyValue) -> Result<(), Error> {
+    let size = key_value_byte_size(kv);
+    if size > MAX_SORT_KEY_SIZE {
+        return Err(EncodingError::KeyTooLarge {
+            max: MAX_SORT_KEY_SIZE,
+            actual: size,
+        }
+        .into());
+    }
+    Ok(())
 }
 
 /// Convert a [`KeyValue`] back to a [`serde_json::Value`].

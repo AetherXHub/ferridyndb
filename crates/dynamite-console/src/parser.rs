@@ -187,14 +187,21 @@ pub fn parse(input: &str) -> Result<Command, String> {
     match first.as_str() {
         "CREATE" => parse_create_table(&tokens),
         "DROP" => parse_drop_table(&tokens),
-        "LIST" => parse_list_tables(&tokens),
+        "LIST" => parse_list(&tokens),
         "DESCRIBE" => parse_describe_table(&tokens),
         "PUT" => parse_put(&tokens),
         "GET" => parse_get(&tokens),
         "DELETE" => parse_delete(&tokens),
         "QUERY" => parse_query(&tokens),
         "SCAN" => parse_scan(&tokens),
-        "HELP" => Ok(Command::Help),
+        "HELP" => {
+            let topic = if tokens.len() > 1 {
+                Some(tokens[1..].join(" "))
+            } else {
+                None
+            };
+            Ok(Command::Help(topic))
+        }
         "EXIT" | "QUIT" => Ok(Command::Exit),
         _ => Err(format!("Unknown command '{}'", tokens[0])),
     }
@@ -204,7 +211,7 @@ pub fn parse(input: &str) -> Result<Command, String> {
 fn parse_create_table(tokens: &[String]) -> Result<Command, String> {
     if tokens.len() < 5 {
         return Err(
-            "Usage: CREATE TABLE <name> PK <attr> <STRING|NUMBER|BINARY> [SK <attr> <type>]"
+            "Usage: CREATE TABLE <name> PK <attr> <STRING|NUMBER|BINARY> [SK <attr> <type>] [TTL <attr>]  (Type HELP CREATE TABLE for details)"
                 .to_string(),
         );
     }
@@ -222,10 +229,7 @@ fn parse_create_table(tokens: &[String]) -> Result<Command, String> {
     let pk_name = tokens[4].clone();
     let pk_type = parse_key_type(&tokens[5])?;
 
-    let sk = if tokens.len() > 6 {
-        if tokens[6].to_uppercase() != "SK" {
-            return Err(format!("Expected SK, got '{}'", tokens[6]));
-        }
+    let sk = if tokens.len() > 6 && tokens[6].to_uppercase() == "SK" {
         if tokens.len() < 9 {
             return Err("Missing sort key attribute name or type".to_string());
         }
@@ -236,18 +240,32 @@ fn parse_create_table(tokens: &[String]) -> Result<Command, String> {
         None
     };
 
+    // Determine the start index for optional TTL clause.
+    let ttl_start = if sk.is_some() { 9 } else { 6 };
+    let ttl = if tokens.len() > ttl_start && tokens[ttl_start].to_uppercase() == "TTL" {
+        if tokens.len() < ttl_start + 2 {
+            return Err(
+                "TTL requires an attribute name  (Type HELP CREATE TABLE for details)".to_string(),
+            );
+        }
+        Some(tokens[ttl_start + 1].clone())
+    } else {
+        None
+    };
+
     Ok(Command::CreateTable {
         name,
         pk_name,
         pk_type,
         sk,
+        ttl,
     })
 }
 
 /// DROP TABLE <name>
 fn parse_drop_table(tokens: &[String]) -> Result<Command, String> {
     if tokens.len() < 3 {
-        return Err("Usage: DROP TABLE <name>".to_string());
+        return Err("Usage: DROP TABLE <name>  (Type HELP DROP TABLE for details)".to_string());
     }
     if tokens[1].to_uppercase() != "TABLE" {
         return Err(format!("Expected TABLE after DROP, got '{}'", tokens[1]));
@@ -257,18 +275,93 @@ fn parse_drop_table(tokens: &[String]) -> Result<Command, String> {
     })
 }
 
-/// LIST TABLES
-fn parse_list_tables(tokens: &[String]) -> Result<Command, String> {
-    if tokens.len() < 2 || tokens[1].to_uppercase() != "TABLES" {
-        return Err("Usage: LIST TABLES".to_string());
+/// LIST TABLES | LIST KEYS <table> [LIMIT <n>]
+fn parse_list(tokens: &[String]) -> Result<Command, String> {
+    if tokens.len() < 2 {
+        return Err(
+            "Usage: LIST TABLES | LIST KEYS <table> | LIST PREFIXES <table> pk=<val>  (Type HELP LIST for details)"
+                .to_string(),
+        );
     }
-    Ok(Command::ListTables)
+    match tokens[1].to_uppercase().as_str() {
+        "TABLES" => Ok(Command::ListTables),
+        "KEYS" => parse_list_keys(tokens),
+        "PREFIXES" => parse_list_prefixes(tokens),
+        _ => Err(format!(
+            "Expected TABLES, KEYS, or PREFIXES after LIST, got '{}'",
+            tokens[1]
+        )),
+    }
+}
+
+/// LIST KEYS <table> [LIMIT <n>]
+fn parse_list_keys(tokens: &[String]) -> Result<Command, String> {
+    if tokens.len() < 3 {
+        return Err(
+            "Usage: LIST KEYS <table> [LIMIT <n>]  (Type HELP LIST KEYS for details)".to_string(),
+        );
+    }
+    let table = tokens[2].clone();
+    let mut limit = None;
+
+    if tokens.len() > 3 {
+        if tokens[3].to_uppercase() == "LIMIT" {
+            if tokens.len() < 5 {
+                return Err("LIMIT requires a number".to_string());
+            }
+            limit = Some(
+                tokens[4]
+                    .parse::<usize>()
+                    .map_err(|_| format!("Invalid LIMIT value '{}'", tokens[4]))?,
+            );
+        } else {
+            return Err(format!("Unexpected token '{}' in LIST KEYS", tokens[3]));
+        }
+    }
+
+    Ok(Command::ListKeys { table, limit })
+}
+
+/// LIST PREFIXES <table> pk=<value> [LIMIT <n>]
+fn parse_list_prefixes(tokens: &[String]) -> Result<Command, String> {
+    if tokens.len() < 4 {
+        return Err(
+            "Usage: LIST PREFIXES <table> pk=<value> [LIMIT <n>]  (Type HELP LIST PREFIXES for details)"
+                .to_string(),
+        );
+    }
+    let table = tokens[2].clone();
+
+    let (key_name, pk) = parse_kv_pair(&tokens[3])?;
+    if key_name.to_uppercase() != "PK" {
+        return Err(format!("Expected pk=<value>, got '{}'", tokens[3]));
+    }
+
+    let mut limit = None;
+    if tokens.len() > 4 {
+        if tokens[4].to_uppercase() == "LIMIT" {
+            if tokens.len() < 6 {
+                return Err("LIMIT requires a number".to_string());
+            }
+            limit = Some(
+                tokens[5]
+                    .parse::<usize>()
+                    .map_err(|_| format!("Invalid LIMIT value '{}'", tokens[5]))?,
+            );
+        } else {
+            return Err(format!("Unexpected token '{}' in LIST PREFIXES", tokens[4]));
+        }
+    }
+
+    Ok(Command::ListPrefixes { table, pk, limit })
 }
 
 /// DESCRIBE TABLE <name>
 fn parse_describe_table(tokens: &[String]) -> Result<Command, String> {
     if tokens.len() < 3 {
-        return Err("Usage: DESCRIBE TABLE <name>".to_string());
+        return Err(
+            "Usage: DESCRIBE TABLE <name>  (Type HELP DESCRIBE TABLE for details)".to_string(),
+        );
     }
     if tokens[1].to_uppercase() != "TABLE" {
         return Err(format!(
@@ -284,7 +377,7 @@ fn parse_describe_table(tokens: &[String]) -> Result<Command, String> {
 /// PUT <table> {json}
 fn parse_put(tokens: &[String]) -> Result<Command, String> {
     if tokens.len() < 3 {
-        return Err("Usage: PUT <table> {json}".to_string());
+        return Err("Usage: PUT <table> {json}  (Type HELP PUT for details)".to_string());
     }
     let table = tokens[1].clone();
     let json_str = &tokens[2];
@@ -296,7 +389,9 @@ fn parse_put(tokens: &[String]) -> Result<Command, String> {
 /// GET <table> pk=<value> [sk=<value>]
 fn parse_get(tokens: &[String]) -> Result<Command, String> {
     if tokens.len() < 3 {
-        return Err("Usage: GET <table> pk=<value> [sk=<value>]".to_string());
+        return Err(
+            "Usage: GET <table> pk=<value> [sk=<value>]  (Type HELP GET for details)".to_string(),
+        );
     }
     let table = tokens[1].clone();
 
@@ -321,7 +416,10 @@ fn parse_get(tokens: &[String]) -> Result<Command, String> {
 /// DELETE <table> pk=<value> [sk=<value>]
 fn parse_delete(tokens: &[String]) -> Result<Command, String> {
     if tokens.len() < 3 {
-        return Err("Usage: DELETE <table> pk=<value> [sk=<value>]".to_string());
+        return Err(
+            "Usage: DELETE <table> pk=<value> [sk=<value>]  (Type HELP DELETE for details)"
+                .to_string(),
+        );
     }
     let table = tokens[1].clone();
 
@@ -348,7 +446,7 @@ fn parse_delete(tokens: &[String]) -> Result<Command, String> {
 fn parse_query(tokens: &[String]) -> Result<Command, String> {
     if tokens.len() < 3 {
         return Err(
-            "Usage: QUERY <table> pk=<value> [SK <op> <val>] [LIMIT <n>] [DESC]".to_string(),
+            "Usage: QUERY <table> pk=<value> [SK <op> <val>] [LIMIT <n>] [DESC]  (Type HELP QUERY for details)".to_string(),
         );
     }
     let table = tokens[1].clone();
@@ -439,7 +537,7 @@ fn parse_query(tokens: &[String]) -> Result<Command, String> {
 /// SCAN <table> [LIMIT <n>]
 fn parse_scan(tokens: &[String]) -> Result<Command, String> {
     if tokens.len() < 2 {
-        return Err("Usage: SCAN <table> [LIMIT <n>]".to_string());
+        return Err("Usage: SCAN <table> [LIMIT <n>]  (Type HELP SCAN for details)".to_string());
     }
     let table = tokens[1].clone();
     let mut limit = None;
@@ -489,11 +587,13 @@ mod tests {
                 pk_name,
                 pk_type,
                 sk,
+                ttl,
             } => {
                 assert_eq!(name, "users");
                 assert_eq!(pk_name, "user_id");
                 assert_eq!(pk_type, KeyType::String);
                 assert!(sk.is_none());
+                assert!(ttl.is_none());
             }
             _ => panic!("Expected CreateTable"),
         }
@@ -508,6 +608,7 @@ mod tests {
                 pk_name,
                 pk_type,
                 sk,
+                ttl,
             } => {
                 assert_eq!(name, "events");
                 assert_eq!(pk_name, "user_id");
@@ -515,6 +616,7 @@ mod tests {
                 let (sk_name, sk_type) = sk.unwrap();
                 assert_eq!(sk_name, "timestamp");
                 assert_eq!(sk_type, KeyType::Number);
+                assert!(ttl.is_none());
             }
             _ => panic!("Expected CreateTable"),
         }
@@ -524,9 +626,12 @@ mod tests {
     fn test_create_table_case_insensitive() {
         let cmd = parse("create table Items pk id string").unwrap();
         match cmd {
-            Command::CreateTable { name, pk_type, .. } => {
+            Command::CreateTable {
+                name, pk_type, ttl, ..
+            } => {
                 assert_eq!(name, "Items");
                 assert_eq!(pk_type, KeyType::String);
+                assert!(ttl.is_none());
             }
             _ => panic!("Expected CreateTable"),
         }
@@ -536,11 +641,44 @@ mod tests {
     fn test_create_table_binary_key() {
         let cmd = parse("CREATE TABLE blobs PK hash BINARY").unwrap();
         match cmd {
-            Command::CreateTable { pk_type, .. } => {
+            Command::CreateTable { pk_type, ttl, .. } => {
                 assert_eq!(pk_type, KeyType::Binary);
+                assert!(ttl.is_none());
             }
             _ => panic!("Expected CreateTable"),
         }
+    }
+
+    #[test]
+    fn test_create_table_with_ttl() {
+        let cmd = parse("CREATE TABLE cache PK key STRING TTL expires").unwrap();
+        match cmd {
+            Command::CreateTable { name, ttl, sk, .. } => {
+                assert_eq!(name, "cache");
+                assert!(sk.is_none());
+                assert_eq!(ttl, Some("expires".to_string()));
+            }
+            _ => panic!("Expected CreateTable"),
+        }
+    }
+
+    #[test]
+    fn test_create_table_with_sk_and_ttl() {
+        let cmd = parse("CREATE TABLE cache PK key STRING SK sort NUMBER TTL expires").unwrap();
+        match cmd {
+            Command::CreateTable { sk, ttl, .. } => {
+                assert!(sk.is_some());
+                assert_eq!(ttl, Some("expires".to_string()));
+            }
+            _ => panic!("Expected CreateTable"),
+        }
+    }
+
+    #[test]
+    fn test_create_table_ttl_missing_attr_name() {
+        let result = parse("CREATE TABLE cache PK key STRING TTL");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("TTL requires"));
     }
 
     // -----------------------------------------------------------------------
@@ -862,6 +1000,125 @@ mod tests {
     }
 
     #[test]
+    fn test_list_keys() {
+        let cmd = parse("LIST KEYS mytable").unwrap();
+        match cmd {
+            Command::ListKeys { table, limit } => {
+                assert_eq!(table, "mytable");
+                assert!(limit.is_none());
+            }
+            _ => panic!("Expected ListKeys"),
+        }
+    }
+
+    #[test]
+    fn test_list_keys_with_limit() {
+        let cmd = parse("LIST KEYS mytable LIMIT 10").unwrap();
+        match cmd {
+            Command::ListKeys { table, limit } => {
+                assert_eq!(table, "mytable");
+                assert_eq!(limit, Some(10));
+            }
+            _ => panic!("Expected ListKeys"),
+        }
+    }
+
+    #[test]
+    fn test_list_keys_case_insensitive() {
+        let cmd = parse("list keys mytable limit 5").unwrap();
+        match cmd {
+            Command::ListKeys { table, limit } => {
+                assert_eq!(table, "mytable");
+                assert_eq!(limit, Some(5));
+            }
+            _ => panic!("Expected ListKeys"),
+        }
+    }
+
+    #[test]
+    fn test_list_keys_missing_table() {
+        let result = parse("LIST KEYS");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_list_keys_invalid_limit() {
+        let result = parse("LIST KEYS mytable LIMIT abc");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid LIMIT"));
+    }
+
+    #[test]
+    fn test_list_keys_unexpected_token() {
+        let result = parse("LIST KEYS mytable BADTOKEN");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Unexpected token"));
+    }
+
+    // -----------------------------------------------------------------------
+    // LIST PREFIXES
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_list_prefixes() {
+        let cmd = parse("LIST PREFIXES mytable pk=alice").unwrap();
+        match cmd {
+            Command::ListPrefixes { table, pk, limit } => {
+                assert_eq!(table, "mytable");
+                assert_eq!(pk, json!("alice"));
+                assert!(limit.is_none());
+            }
+            _ => panic!("Expected ListPrefixes"),
+        }
+    }
+
+    #[test]
+    fn test_list_prefixes_with_limit() {
+        let cmd = parse("LIST PREFIXES mytable pk=alice LIMIT 5").unwrap();
+        match cmd {
+            Command::ListPrefixes { table, pk, limit } => {
+                assert_eq!(table, "mytable");
+                assert_eq!(pk, json!("alice"));
+                assert_eq!(limit, Some(5));
+            }
+            _ => panic!("Expected ListPrefixes"),
+        }
+    }
+
+    #[test]
+    fn test_list_prefixes_case_insensitive() {
+        let cmd = parse("list prefixes mytable pk=alice limit 3").unwrap();
+        match cmd {
+            Command::ListPrefixes { table, pk, limit } => {
+                assert_eq!(table, "mytable");
+                assert_eq!(pk, json!("alice"));
+                assert_eq!(limit, Some(3));
+            }
+            _ => panic!("Expected ListPrefixes"),
+        }
+    }
+
+    #[test]
+    fn test_list_prefixes_missing_pk() {
+        let result = parse("LIST PREFIXES mytable");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_list_prefixes_invalid_limit() {
+        let result = parse("LIST PREFIXES mytable pk=alice LIMIT abc");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid LIMIT"));
+    }
+
+    #[test]
+    fn test_list_prefixes_unexpected_token() {
+        let result = parse("LIST PREFIXES mytable pk=alice BADTOKEN");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Unexpected token"));
+    }
+
+    #[test]
     fn test_describe_table() {
         let cmd = parse("DESCRIBE TABLE users").unwrap();
         match cmd {
@@ -877,7 +1134,25 @@ mod tests {
     #[test]
     fn test_help() {
         let cmd = parse("HELP").unwrap();
-        assert!(matches!(cmd, Command::Help));
+        assert!(matches!(cmd, Command::Help(None)));
+    }
+
+    #[test]
+    fn test_help_with_topic() {
+        let cmd = parse("HELP QUERY").unwrap();
+        match cmd {
+            Command::Help(Some(topic)) => assert_eq!(topic, "QUERY"),
+            _ => panic!("Expected Help with topic"),
+        }
+    }
+
+    #[test]
+    fn test_help_with_multi_word_topic() {
+        let cmd = parse("HELP CREATE TABLE").unwrap();
+        match cmd {
+            Command::Help(Some(topic)) => assert_eq!(topic, "CREATE TABLE"),
+            _ => panic!("Expected Help with topic"),
+        }
     }
 
     #[test]
@@ -968,9 +1243,20 @@ mod tests {
     }
 
     #[test]
-    fn test_list_missing_tables_keyword() {
+    fn test_list_missing_subcommand() {
         let result = parse("LIST");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_list_invalid_subcommand() {
+        let result = parse("LIST FOOBAR");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("Expected TABLES, KEYS, or PREFIXES")
+        );
     }
 
     // -----------------------------------------------------------------------

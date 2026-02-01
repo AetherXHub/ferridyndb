@@ -4,7 +4,7 @@ use crate::catalog;
 use crate::encoding::composite;
 use crate::error::{Error, QueryError, StorageError};
 use crate::mvcc::ops as mvcc_ops;
-use crate::types::{PageId, TxnId};
+use crate::types::{PageId, TxnId, VersionedItem};
 
 use super::key_utils;
 use super::page_store::BufferedPageStore;
@@ -30,12 +30,15 @@ impl Transaction {
         let entry = catalog::ops::get_table(&self.store, self.catalog_root, table)?;
         let schema = &entry.schema;
 
-        // 3. Extract partition key.
+        // 3. Extract and validate partition key.
         let pk = key_utils::extract_key_from_doc(&document, &schema.partition_key)?;
+        key_utils::validate_partition_key_size(&pk)?;
 
-        // 4. Extract sort key if present.
+        // 4. Extract and validate sort key if present.
         let sk = if let Some(ref sk_def) = schema.sort_key {
-            Some(key_utils::extract_key_from_doc(&document, sk_def)?)
+            let sk_val = key_utils::extract_key_from_doc(&document, sk_def)?;
+            key_utils::validate_sort_key_size(&sk_val)?;
+            Some(sk_val)
         } else {
             None
         };
@@ -60,6 +63,102 @@ impl Transaction {
         Ok(())
     }
 
+    /// Insert or replace an item with optimistic concurrency control.
+    ///
+    /// If `expected_version` does not match the current version of the item,
+    /// the write is rejected with `TxnError::VersionMismatch`. This prevents
+    /// lost updates when multiple writers target the same key.
+    pub fn put_item_conditional(
+        &mut self,
+        table: &str,
+        document: Value,
+        expected_version: u64,
+    ) -> Result<(), Error> {
+        let doc_bytes = key_utils::validate_document_size(&document)?;
+
+        let entry = catalog::ops::get_table(&self.store, self.catalog_root, table)?;
+        let schema = &entry.schema;
+
+        let pk = key_utils::extract_key_from_doc(&document, &schema.partition_key)?;
+        key_utils::validate_partition_key_size(&pk)?;
+
+        let sk = if let Some(ref sk_def) = schema.sort_key {
+            let sk_val = key_utils::extract_key_from_doc(&document, sk_def)?;
+            key_utils::validate_sort_key_size(&sk_val)?;
+            Some(sk_val)
+        } else {
+            None
+        };
+
+        let composite_key = composite::encode_composite(&pk, sk.as_ref())?;
+
+        let new_data_root = mvcc_ops::mvcc_put_conditional(
+            &mut self.store,
+            entry.data_root_page,
+            &composite_key,
+            &doc_bytes,
+            self.txn_id,
+            expected_version,
+        )?;
+
+        if new_data_root != entry.data_root_page {
+            self.update_catalog_data_root(table, &entry, new_data_root)?;
+        }
+
+        Ok(())
+    }
+
+    /// Get an item by key, returning the version number.
+    ///
+    /// The returned `VersionedItem` includes the document and its version
+    /// (the `created_txn` of the MVCC version). Pass this version to
+    /// `put_item_conditional` for optimistic concurrency control.
+    pub fn get_item_versioned(
+        &self,
+        table: &str,
+        partition_key: &Value,
+        sort_key: Option<&Value>,
+    ) -> Result<Option<VersionedItem>, Error> {
+        let entry = catalog::ops::get_table(&self.store, self.catalog_root, table)?;
+        let schema = &entry.schema;
+
+        let pk = key_utils::json_to_key_value(
+            partition_key,
+            schema.partition_key.key_type,
+            &schema.partition_key.name,
+        )?;
+        key_utils::validate_partition_key_size(&pk)?;
+
+        let sk = match (&schema.sort_key, sort_key) {
+            (Some(sk_def), Some(sk_val)) => {
+                let sk = key_utils::json_to_key_value(sk_val, sk_def.key_type, &sk_def.name)?;
+                key_utils::validate_sort_key_size(&sk)?;
+                Some(sk)
+            }
+            (Some(_), None) => None,
+            (None, Some(_)) => return Err(QueryError::SortKeyNotSupported.into()),
+            (None, None) => None,
+        };
+
+        let composite_key = composite::encode_composite(&pk, sk.as_ref())?;
+        let data = mvcc_ops::mvcc_get_versioned(
+            &self.store,
+            entry.data_root_page,
+            &composite_key,
+            self.txn_id,
+        )?;
+
+        match data {
+            Some((bytes, version)) => {
+                let val: Value = rmp_serde::from_slice(&bytes).map_err(|e| {
+                    StorageError::CorruptedPage(format!("failed to deserialize document: {e}"))
+                })?;
+                Ok(Some(VersionedItem { item: val, version }))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Get an item by key.
     pub fn get_item(
         &self,
@@ -75,13 +174,14 @@ impl Transaction {
             schema.partition_key.key_type,
             &schema.partition_key.name,
         )?;
+        key_utils::validate_partition_key_size(&pk)?;
 
         let sk = match (&schema.sort_key, sort_key) {
-            (Some(sk_def), Some(sk_val)) => Some(key_utils::json_to_key_value(
-                sk_val,
-                sk_def.key_type,
-                &sk_def.name,
-            )?),
+            (Some(sk_def), Some(sk_val)) => {
+                let sk = key_utils::json_to_key_value(sk_val, sk_def.key_type, &sk_def.name)?;
+                key_utils::validate_sort_key_size(&sk)?;
+                Some(sk)
+            }
             (Some(_), None) => None,
             (None, Some(_)) => return Err(QueryError::SortKeyNotSupported.into()),
             (None, None) => None,
@@ -121,13 +221,14 @@ impl Transaction {
             schema.partition_key.key_type,
             &schema.partition_key.name,
         )?;
+        key_utils::validate_partition_key_size(&pk)?;
 
         let sk = match (&schema.sort_key, sort_key) {
-            (Some(sk_def), Some(sk_val)) => Some(key_utils::json_to_key_value(
-                sk_val,
-                sk_def.key_type,
-                &sk_def.name,
-            )?),
+            (Some(sk_def), Some(sk_val)) => {
+                let sk = key_utils::json_to_key_value(sk_val, sk_def.key_type, &sk_def.name)?;
+                key_utils::validate_sort_key_size(&sk)?;
+                Some(sk)
+            }
             (Some(_), None) => None,
             (None, Some(_)) => return Err(QueryError::SortKeyNotSupported.into()),
             (None, None) => None,
@@ -212,6 +313,7 @@ mod tests {
             } else {
                 None
             },
+            ttl_attribute: None,
         };
         let (new_root, entry) = catalog::ops::create_table(store, catalog_root, schema).unwrap();
         (new_root, entry)

@@ -116,6 +116,87 @@ pub fn mvcc_delete(
     btree_ops::insert(store, data_root, key, &serialized)
 }
 
+/// Read a value with snapshot isolation, returning the version number.
+///
+/// Like `mvcc_get` but also returns the `created_txn` of the visible version.
+/// The version can be used for optimistic concurrency control via
+/// `mvcc_put_conditional`.
+pub fn mvcc_get_versioned(
+    store: &impl PageStore,
+    data_root: PageId,
+    key: &[u8],
+    snapshot_txn: TxnId,
+) -> Result<Option<(Vec<u8>, TxnId)>, StorageError> {
+    let raw = btree_ops::search(store, data_root, key)?;
+
+    let Some(raw_bytes) = raw else {
+        return Ok(None);
+    };
+
+    let latest = VersionedDocument::deserialize(&raw_bytes)?;
+    let visible = visibility::find_visible_version(store, &latest, snapshot_txn)?;
+
+    Ok(visible.map(|doc| (doc.data, doc.created_txn)))
+}
+
+/// Insert or update a key-value pair with optimistic concurrency control.
+///
+/// Checks that the current version's `created_txn` matches `expected_version`
+/// before writing. Returns `TxnError::VersionMismatch` if:
+/// - The key exists but its `created_txn` differs from `expected_version`
+/// - The key does not exist (version 0 vs the expected version)
+///
+/// Returns the (possibly new) B+Tree root page ID.
+pub fn mvcc_put_conditional(
+    store: &mut impl PageStore,
+    data_root: PageId,
+    key: &[u8],
+    value: &[u8],
+    write_txn: TxnId,
+    expected_version: TxnId,
+) -> Result<PageId, crate::error::Error> {
+    let existing = btree_ops::search(store, data_root, key)?;
+
+    match existing {
+        Some(existing_bytes) => {
+            let mut old_doc = VersionedDocument::deserialize(&existing_bytes)?;
+
+            if old_doc.created_txn != expected_version {
+                return Err(crate::error::TxnError::VersionMismatch {
+                    expected: expected_version,
+                    actual: old_doc.created_txn,
+                }
+                .into());
+            }
+
+            // Version matches: archive old and insert new.
+            old_doc.deleted_txn = Some(write_txn);
+            let old_serialized = old_doc.serialize();
+            let (chain_page, chain_len) =
+                version_chain::write_version_chain(store, &old_serialized)?;
+
+            let new_doc = VersionedDocument {
+                created_txn: write_txn,
+                deleted_txn: None,
+                data: value.to_vec(),
+                prev_version_page: chain_page,
+                prev_version_len: chain_len,
+            };
+
+            let versioned_bytes = new_doc.serialize();
+            Ok(btree_ops::insert(store, data_root, key, &versioned_bytes)?)
+        }
+        None => {
+            // Key doesn't exist but caller expected a specific version.
+            Err(crate::error::TxnError::VersionMismatch {
+                expected: expected_version,
+                actual: 0,
+            }
+            .into())
+        }
+    }
+}
+
 /// A key-value pair with raw byte vectors.
 pub type RawKvPair = (Vec<u8>, Vec<u8>);
 
@@ -318,6 +399,109 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0, b"b".to_vec());
         assert_eq!(results[1].0, b"c".to_vec());
+    }
+
+    #[test]
+    fn test_mvcc_get_versioned() {
+        let (mut store, mut root) = setup();
+        root = mvcc_put(&mut store, root, b"key1", b"value1", 3).unwrap();
+
+        let result = mvcc_get_versioned(&store, root, b"key1", 3).unwrap();
+        assert!(result.is_some());
+        let (data, version) = result.unwrap();
+        assert_eq!(data, b"value1");
+        assert_eq!(version, 3);
+    }
+
+    #[test]
+    fn test_mvcc_get_versioned_not_found() {
+        let (store, root) = setup();
+        let result = mvcc_get_versioned(&store, root, b"nope", 5).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_mvcc_get_versioned_after_overwrite() {
+        let (mut store, mut root) = setup();
+        root = mvcc_put(&mut store, root, b"key1", b"v1", 1).unwrap();
+        root = mvcc_put(&mut store, root, b"key1", b"v2", 5).unwrap();
+
+        // Snapshot at 5: sees v2 created at txn 5.
+        let (data, version) = mvcc_get_versioned(&store, root, b"key1", 5)
+            .unwrap()
+            .unwrap();
+        assert_eq!(data, b"v2");
+        assert_eq!(version, 5);
+
+        // Snapshot at 3: sees v1 created at txn 1.
+        let (data, version) = mvcc_get_versioned(&store, root, b"key1", 3)
+            .unwrap()
+            .unwrap();
+        assert_eq!(data, b"v1");
+        assert_eq!(version, 1);
+    }
+
+    #[test]
+    fn test_mvcc_put_conditional_success() {
+        let (mut store, mut root) = setup();
+        root = mvcc_put(&mut store, root, b"key1", b"v1", 3).unwrap();
+
+        // Conditional put with correct expected version.
+        root = mvcc_put_conditional(&mut store, root, b"key1", b"v2", 7, 3).unwrap();
+
+        // Should see v2 now.
+        let result = mvcc_get(&store, root, b"key1", 7).unwrap();
+        assert_eq!(result, Some(b"v2".to_vec()));
+    }
+
+    #[test]
+    fn test_mvcc_put_conditional_version_mismatch() {
+        let (mut store, mut root) = setup();
+        root = mvcc_put(&mut store, root, b"key1", b"v1", 3).unwrap();
+
+        // Conditional put with wrong expected version.
+        let result = mvcc_put_conditional(&mut store, root, b"key1", b"v2", 7, 99);
+        assert!(result.is_err());
+
+        match result {
+            Err(crate::error::Error::Transaction(crate::error::TxnError::VersionMismatch {
+                expected: 99,
+                actual: 3,
+            })) => {}
+            other => panic!("expected VersionMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_mvcc_put_conditional_key_not_found() {
+        let (mut store, root) = setup();
+
+        // Conditional put on non-existent key.
+        let result = mvcc_put_conditional(&mut store, root, b"nope", b"v1", 5, 1);
+        assert!(result.is_err());
+
+        match result {
+            Err(crate::error::Error::Transaction(crate::error::TxnError::VersionMismatch {
+                expected: 1,
+                actual: 0,
+            })) => {}
+            other => panic!("expected VersionMismatch with actual=0, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_mvcc_put_conditional_preserves_history() {
+        let (mut store, mut root) = setup();
+        root = mvcc_put(&mut store, root, b"key1", b"v1", 1).unwrap();
+        root = mvcc_put_conditional(&mut store, root, b"key1", b"v2", 5, 1).unwrap();
+
+        // Old snapshot at txn 3 should still see v1.
+        let result = mvcc_get(&store, root, b"key1", 3).unwrap();
+        assert_eq!(result, Some(b"v1".to_vec()));
+
+        // New snapshot at txn 5 should see v2.
+        let result = mvcc_get(&store, root, b"key1", 5).unwrap();
+        assert_eq!(result, Some(b"v2".to_vec()));
     }
 
     #[test]

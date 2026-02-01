@@ -56,6 +56,12 @@ pub enum EncodingError {
 
     #[error("malformed encoded key")]
     MalformedKey,
+
+    #[error("null byte (0x00) is not allowed in string or binary keys")]
+    NullByteInKey,
+
+    #[error("key exceeds maximum size of {max} bytes (got {actual})")]
+    KeyTooLarge { max: usize, actual: usize },
 }
 
 #[derive(Debug, Error)]
@@ -65,6 +71,9 @@ pub enum TxnError {
 
     #[error("transaction conflict")]
     Conflict,
+
+    #[error("version mismatch: expected {expected}, actual {actual}")]
+    VersionMismatch { expected: u64, actual: u64 },
 }
 
 #[derive(Debug, Error)]
