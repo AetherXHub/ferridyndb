@@ -4,89 +4,120 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-FerridynDB is a local, embedded, DynamoDB-style document database written in Rust (edition 2024). It stores JSON documents with partition key + optional sort key in a single file using copy-on-write pages. Designed for multi-GB databases with full MVCC transactions.
+FerridynDB is a local, embedded, DynamoDB-style document database written in Rust (edition 2024). It stores JSON documents with partition key + optional sort key in a single file using copy-on-write pages. The name combines ferric iron, Ferris the Rust crab, and dynamo (from DynamoDB).
+
+## Why
+
+DynamoDB's API is simple and effective for key-value and document workloads, but requires AWS. FerridynDB brings that same API to a single-file embedded database — no network, no cloud, no WAL. Useful for local-first apps, CLI tools, and as a backing store for systems like the ferridyn-memory Claude Code plugin.
 
 ## Build Commands
 
 This is a Cargo workspace. Build/test from the repository root:
 
-- `cargo build` - compile all crates
-- `cargo test` - run all tests across the workspace
-- `cargo test -p ferridyn-core` - test only the core crate
-- `cargo test -p ferridyn-core <test_name>` - run a single test by name
-- `cargo clippy --workspace` - lint all crates
-- `cargo fmt --all` - format all crates
-- `cargo fmt --all --check` - check formatting without modifying files
-- `cargo bench -p ferridyn-core` - run benchmarks (criterion, uses tmpfs by default)
-- `BENCH_DIR=/var/home/travis/development/dyna_mite/target/bench_real cargo bench --bench ferridyn_file_bench` - run file-backed benchmarks on real NVMe (only after major refactors)
+- `cargo build` — compile all crates
+- `cargo test` — run all tests across the workspace (348 tests)
+- `cargo test -p ferridyn-core` — test only the core crate
+- `cargo test -p ferridyn-core <test_name>` — run a single test by name
+- `cargo clippy --workspace -- -D warnings` — lint all crates (zero warnings required)
+- `cargo fmt --all` — format all crates
+- `cargo fmt --all --check` — check formatting without modifying files
+- `cargo bench -p ferridyn-core` — run benchmarks (criterion, uses tmpfs by default)
+- `BENCH_DIR=/path/to/nvme cargo bench --bench ferridyn_file_bench` — file-backed benchmarks on real storage
 
 ## Architecture
 
 Six-layer stack, bottom to top:
 
-1. **Storage Engine** (`storage/`) - mmap-based file I/O, atomic commits. Single file with 4KB pages. Double-buffered header (pages 0 and 1) for truly atomic commits. File locking via `flock()`.
-2. **Page Manager** (`storage/`) - Page allocation, free list, copy-on-write. Never modifies pages in place; writes new pages then atomically updates the alternate header. Crash recovery = use last committed header. xxHash64 checksums on every page.
-3. **B+Tree Index** (`btree/`) - One tree per table, keyed by `(partition_key, sort_key)`. Slotted page layout. Internal nodes hold `[key, child_page_id]` pairs; leaf nodes hold `[key, document]` pairs with linked `next_leaf` pointers. Overflow pages for large documents.
-4. **Key Encoding** (`encoding/`) - Byte-ordered encoding for comparable `memcmp` keys. Strings/binary use escaped-terminator scheme (`0x00` → `0x00 0xFF`, terminated with `0x00 0x00`). Numbers use byte-flipped IEEE 754.
-5. **Table Catalog** (`catalog/`) - Schema definitions (table name, partition key name+type, optional sort key name+type). Stored in its own B+Tree rooted from the header.
-6. **MVCC / Transactions** (`mvcc/`) - Snapshot isolation only (v1). Single writer, unlimited concurrent readers. Latest document version inline in B+Tree leaf, older versions in overflow chain. Each document carries `created_txn` and `deleted_txn` IDs. Visibility: `created_txn <= snapshot && (deleted_txn is None || deleted_txn > snapshot)`.
+1. **Storage Engine** (`storage/`) — Standard file I/O with 4KB pages. Double-buffered header (pages 0 and 1) for atomic commits. File locking via `flock()` (fs2 crate). No mmap, no WAL.
+2. **Page Manager** (`storage/`) — Page allocation, free list, copy-on-write. Never modifies pages in place; writes new pages then atomically updates the alternate header. Crash recovery = use last committed header. xxHash64 checksums on every page.
+3. **B+Tree Index** (`btree/`) — One tree per table, keyed by `(partition_key, sort_key)`. Slotted page layout. Internal nodes hold `[key, child_page_id]` pairs; leaf nodes hold `[key, document]` pairs with linked `next_leaf` pointers. Overflow pages for large documents.
+4. **Key Encoding** (`encoding/`) — Byte-ordered encoding for `memcmp`-comparable keys. Strings/binary use escaped-terminator scheme (`0x00` → `0x00 0xFF`, terminated with `0x00 0x00`). Numbers use byte-flipped IEEE 754.
+5. **Table Catalog** (`catalog/`) — Schema definitions (table name, partition key name+type, optional sort key name+type). Stored in its own B+Tree rooted from the header.
+6. **MVCC / Transactions** (`mvcc/`) — Snapshot isolation. Single writer, unlimited concurrent readers. Latest document version inline in B+Tree leaf, older versions in overflow chain. Each document carries `created_txn` and `deleted_txn` IDs. Visibility: `created_txn <= snapshot && (deleted_txn is None || deleted_txn > snapshot)`.
 
 Public API (`api/`) sits on top: `put/get/delete/query/scan/transact`.
+
+Documents are stored on disk as MessagePack (via rmp-serde) for compactness. The public API accepts and returns `serde_json::Value`.
 
 ## Workspace Layout
 
 ```
 crates/
-  ferridyn-core/     # Core database engine (lib crate)
+  ferridyn-core/       # Core database engine (lib crate)
     src/
-      storage/       # File I/O, page management, mmap
-      btree/         # B+Tree implementation
-      mvcc/          # Transaction manager, snapshots
-      catalog/       # Table schemas
-      api/           # Public API types
-      encoding/      # Key/value serialization
-tests/
-  integration/       # Cross-crate integration tests
+      storage/         # File I/O, page management, header, free list
+      btree/           # B+Tree: node layout, ops, overflow
+      mvcc/            # Transaction manager, snapshots, version chains, GC
+      catalog/         # Table schemas
+      api/             # Public API: FerridynDB, builders, batch, query
+      encoding/        # Key encoding: string, number, binary, composite
+    benches/           # Criterion benchmarks (ferridyn_bench, ferridyn_file_bench)
+  ferridyn-server/     # Unix socket server + async client library
+    src/
+      server.rs        # FerridynServer — tokio-based Unix socket listener
+      client.rs        # FerridynClient — async client for multi-process access
+      protocol.rs      # Wire protocol (JSON over length-prefixed frames)
+    tests/
+      integration.rs   # Server integration tests (8 tests)
+  ferridyn-console/    # Interactive REPL for exploring databases
+    src/
+      parser.rs        # SQL-like command parser
+      executor.rs      # Command execution against FerridynDB
+      commands.rs      # Command definitions
+      display.rs       # Output formatting
 ```
 
 ## Key Design Decisions
 
-- **Copy-on-write over WAL**: Simpler crash recovery, no separate log file
-- **mmap for reads**: OS handles caching, simplifies buffer management
-- **B+Tree over LSM**: Better read performance for the embedded use case
-- **4KB pages**: Matches OS page size for mmap alignment
-- **Single writer, unlimited readers**: LMDB concurrency model
-- **Slotted pages**: Slot array grows forward, cell data grows backward
+- **Copy-on-write over WAL** — Simpler crash recovery, no separate log file
+- **Standard file I/O over mmap** — Direct read/write with page-level buffering
+- **MessagePack over JSON on disk** — Compact binary serialization for document storage
+- **B+Tree over LSM** — Better read performance for the embedded use case
+- **4KB pages** — Matches OS page size
+- **Single writer, unlimited readers** — LMDB concurrency model
+- **Slotted pages** — Slot array grows forward, cell data grows backward
+- **Magic bytes `b"DYNA"`** — File format identifier in header; do not change
 - **No secondary indexes in v1**
-- **No B+Tree rebalancing in v1**: Mark-as-dead delete, reclaim fully empty pages
+- **No B+Tree rebalancing in v1** — Mark-as-dead delete, reclaim fully empty pages
 
 ## Development Process
 
 Work proceeds incrementally. Every change must leave the project in a fully working state:
 
-1. **Compile first**: `cargo build -p ferridyn-core` must pass with zero errors before moving on.
-2. **Test everything**: Write tests for each new piece of functionality before considering it done. Run `cargo test -p ferridyn-core` and confirm all tests pass.
-3. **Lint clean**: `cargo clippy --workspace -- -D warnings` must pass. No warnings allowed.
-4. **Format**: `cargo fmt --all --check` must pass.
-5. **No dead code**: Don't stub out modules or leave `todo!()` / `unimplemented!()` in committed code. Each step should produce working, tested code — not scaffolding for the future.
-6. **One layer at a time**: Build bottom-up through the architecture. Do not start a higher layer until the layer beneath it compiles, passes tests, and is lint-clean.
+1. **Compile first** — `cargo build` must pass with zero errors before moving on
+2. **Test everything** — Write tests for each new feature before considering it done
+3. **Lint clean** — `cargo clippy --workspace -- -D warnings` must pass
+4. **Format** — `cargo fmt --all --check` must pass
+5. **No dead code** — No `todo!()` or `unimplemented!()` in committed code
+6. **One layer at a time** — Build bottom-up through the architecture stack
 
 ## Benchmarks
 
-Two benchmark suites exist in `ferridyn-core`:
+Two benchmark suites in `ferridyn-core`:
 
-- `ferridyn_bench` — in-memory (tmpfs) microbenchmarks. Run these routinely.
-- `ferridyn_file_bench` — file-backed benchmarks with real I/O. Uses tmpfs by default; set `BENCH_DIR` to point at real storage.
+- `ferridyn_bench` — In-memory (tmpfs) microbenchmarks. Run routinely.
+- `ferridyn_file_bench` — File-backed benchmarks with real I/O. Uses tmpfs by default; set `BENCH_DIR` to point at real storage.
 
-**Default workflow**: run benchmarks on tmpfs (`cargo bench`). Only run on real NVMe disk after major refactors where all in-memory benchmarks have improved or not regressed. NVMe results are dominated by fsync latency (~5ms per commit) which masks algorithmic changes.
+Default: run on tmpfs (`cargo bench`). Only run on real NVMe after major refactors. NVMe results are dominated by fsync latency (~5ms per commit) which masks algorithmic changes.
 
-## Core Dependencies
+## Dependencies
 
-- `serde` / `serde_json` - JSON document serialization
-- `memmap2` - Memory-mapped file I/O
-- `parking_lot` - Fast RwLock for concurrency
-- `thiserror` - Error types
-- `bytes` - Byte buffer manipulation
-- `xxhash-rust` - Page checksums
-- `tempfile` (dev) - Test isolation
-- `criterion` (dev) - Benchmarks
+### ferridyn-core
+- `serde` / `serde_json` — JSON document API
+- `rmp-serde` — MessagePack serialization for on-disk document storage
+- `fs2` — Cross-platform file locking (`flock`)
+- `parking_lot` — Fast RwLock for concurrency
+- `thiserror` — Error types
+- `bytes` — Byte buffer manipulation
+- `xxhash-rust` — Page checksums (xxHash64)
+- `tempfile` (dev) — Test isolation
+- `criterion` (dev) — Statistical benchmarking
+
+### ferridyn-server
+- `tokio` — Async runtime for Unix socket server
+- `tracing` / `tracing-subscriber` — Structured logging
+- `dirs` — XDG directory resolution
+
+### ferridyn-console
+- `rustyline` — Line editing and history for the REPL
+- `clap` — CLI argument parsing
