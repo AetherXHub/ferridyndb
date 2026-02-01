@@ -13,41 +13,6 @@ A local, embedded, DynamoDB-style document database written in Rust with single-
 - **Unix socket server** — Multi-process access with async client library
 - **Claude Code memory plugin** — Agentic memory system with automatic context retrieval
 
-## Architecture
-
-DynaMite is built as a six-layer stack, from bottom to top:
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  6. MVCC / Transactions                                 │
-│     Snapshot isolation, version chains, visibility      │
-├─────────────────────────────────────────────────────────┤
-│  5. Table Catalog                                       │
-│     Schema definitions in dedicated B+Tree              │
-├─────────────────────────────────────────────────────────┤
-│  4. Key Encoding                                        │
-│     Byte-ordered strings, byte-flipped IEEE 754 numbers │
-├─────────────────────────────────────────────────────────┤
-│  3. B+Tree Index                                        │
-│     One tree per table, slotted pages, leaf linking     │
-├─────────────────────────────────────────────────────────┤
-│  2. Page Manager                                        │
-│     Allocation, free list, copy-on-write, xxHash64      │
-├─────────────────────────────────────────────────────────┤
-│  1. Storage Engine                                      │
-│     mmap-based I/O, 4KB pages, flock, atomic commits    │
-└─────────────────────────────────────────────────────────┘
-```
-
-Each layer builds on the one below it:
-
-1. **Storage Engine** (`storage/`) — Memory-mapped file I/O with atomic commits via double-buffered headers (pages 0 and 1). Exclusive file locking using `flock()`.
-2. **Page Manager** (`storage/`) — Page allocation with free list management. Copy-on-write semantics: never modify pages in place. Every page has an xxHash64 checksum.
-3. **B+Tree Index** (`btree/`) — One B+Tree per table, keyed by `(partition_key, sort_key)`. Internal nodes hold `[key, child_page_id]` pairs; leaf nodes hold `[key, document]` pairs with linked-list pointers. Large documents spill to overflow pages.
-4. **Key Encoding** (`encoding/`) — Byte-ordered encoding for efficient range scans. Strings use escaped-terminator scheme (`0x00` → `0x00 0xFF`, terminated with `0x00 0x00`). Numbers use byte-flipped IEEE 754 for correct lexicographic ordering.
-5. **Table Catalog** (`catalog/`) — Table schemas (partition key name/type, optional sort key name/type) stored in a dedicated B+Tree rooted from the database header.
-6. **MVCC / Transactions** (`mvcc/`) — Snapshot isolation with single writer and unlimited concurrent readers. Latest document version stored inline in B+Tree leaf; older versions chained via overflow pages. Each document carries `created_txn` and `deleted_txn` timestamps for visibility checks.
-
 ## Quick Start
 
 ### Embedded Usage
