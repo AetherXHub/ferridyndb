@@ -1,0 +1,12 @@
+{
+  "name": "dynamite-memory-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Claude Code plugin for DynaMite-backed agentic memory",
+  "type": "module",
+  "scripts": {
+    "build": "cargo build --release -p dynamite-server -p dynamite-memory",
+    "test:retrieval": "echo '{\"prompt\": \"test\", \"hook_event_name\": \"UserPromptSubmit\"}' | node scripts/memory-retrieval.mjs",
+    "test:commit": "echo '{\"transcript_path\": \"/dev/null\", \"hook_event_name\": \"PreCompact\"}' | node scripts/memory-commit.mjs"
+  }
+}

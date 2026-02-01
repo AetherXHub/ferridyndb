@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "dynamite-memory": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/../target/release/dynamite-memory"
+    }
+  }
+}
