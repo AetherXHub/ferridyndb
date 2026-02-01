@@ -1,4 +1,4 @@
-# DynamiteDB
+# FerridynDB
 
 A local, embedded, DynamoDB-style document database written in Rust with single-file storage and full MVCC transactions.
 
@@ -17,12 +17,12 @@ A local, embedded, DynamoDB-style document database written in Rust with single-
 ### Embedded Usage
 
 ```rust
-use dynamite_core::api::DynamiteDB;
-use dynamite_core::types::KeyType;
+use ferridyn_core::api::FerridynDB;
+use ferridyn_core::types::KeyType;
 use serde_json::json;
 
 // Create or open a database
-let db = DynamiteDB::create("my_database.db").unwrap();
+let db = FerridynDB::create("my_database.db").unwrap();
 
 // Create a table with partition key
 db.create_table("users")
@@ -68,7 +68,7 @@ cargo build
 cargo test
 
 # Run tests for a specific crate
-cargo test -p dynamite-core
+cargo test -p ferridyn-core
 
 # Lint all crates
 cargo clippy --workspace
@@ -77,31 +77,31 @@ cargo clippy --workspace
 cargo fmt --all
 
 # Run benchmarks
-cargo bench -p dynamite-core
+cargo bench -p ferridyn-core
 ```
 
 ## Server Mode
 
-DynamiteDB can run as a standalone server accessed by multiple processes over a Unix socket. This enables multi-process access with version-aware optimistic concurrency control.
+FerridynDB can run as a standalone server accessed by multiple processes over a Unix socket. This enables multi-process access with version-aware optimistic concurrency control.
 
 ### Starting the Server
 
 ```bash
 # Start server with custom database and socket paths
-dynamite-server --db ~/.local/share/dynamite/default.db --socket /tmp/dynamite.sock
+ferridyn-server --db ~/.local/share/ferridyn/default.db --socket /tmp/ferridyn.sock
 
-# Or use defaults (XDG_DATA_HOME/dynamite/default.db and XDG_RUNTIME_DIR/dynamite.sock)
-dynamite-server
+# Or use defaults (XDG_DATA_HOME/ferridyn/default.db and XDG_RUNTIME_DIR/ferridyn.sock)
+ferridyn-server
 ```
 
 ### Client Usage
 
 ```rust
-use dynamite_server::DynamiteClient;
+use ferridyn_server::FerridynClient;
 use serde_json::json;
 
 // Connect to server
-let mut client = DynamiteClient::connect("/tmp/dynamite.sock").await?;
+let mut client = FerridynClient::connect("/tmp/ferridyn.sock").await?;
 
 // Regular operations
 client.put_item("users", json!({"user_id": "bob", "name": "Bob"})).await?;
@@ -145,17 +145,17 @@ loop {
 
 | Crate | Description |
 |-------|-------------|
-| `dynamite-core` | Core database engine (storage, B+Tree, MVCC, public API) |
-| `dynamite-server` | Unix socket server + async client library for multi-process access |
-| `dynamite-console` | Interactive REPL for exploring and manipulating DynamiteDB databases |
+| `ferridyn-core` | Core database engine (storage, B+Tree, MVCC, public API) |
+| `ferridyn-server` | Unix socket server + async client library for multi-process access |
+| `ferridyn-console` | Interactive REPL for exploring and manipulating FerridynDB databases |
 
 ## Development
 
 ### Workflow
 
-DynamiteDB development follows an incremental, test-driven approach:
+FerridynDB development follows an incremental, test-driven approach:
 
-1. **Compile first** — `cargo build -p dynamite-core` must pass with zero errors before proceeding
+1. **Compile first** — `cargo build -p ferridyn-core` must pass with zero errors before proceeding
 2. **Test everything** — Write tests for each new feature before considering it done
 3. **Lint clean** — `cargo clippy --workspace -- -D warnings` must pass (zero warnings allowed)
 4. **Format** — `cargo fmt --all --check` must pass
@@ -167,7 +167,7 @@ DynamiteDB development follows an incremental, test-driven approach:
 Two benchmark suites are available:
 
 - `cargo bench` — In-memory (tmpfs) microbenchmarks for routine performance checks
-- `BENCH_DIR=/path/to/nvme cargo bench --bench dynamite_file_bench` — File-backed benchmarks on real storage (run only after major refactors)
+- `BENCH_DIR=/path/to/nvme cargo bench --bench ferridyn_file_bench` — File-backed benchmarks on real storage (run only after major refactors)
 
 By default, benchmarks use tmpfs. Real NVMe benchmarks are dominated by fsync latency (~5ms per commit) and should only be run to validate algorithmic changes that show improvement in tmpfs benchmarks.
 
@@ -175,7 +175,7 @@ By default, benchmarks use tmpfs. Real NVMe benchmarks are dominated by fsync la
 
 ### Copy-on-write over Write-Ahead Log
 
-DynamiteDB uses copy-on-write semantics with double-buffered headers instead of a traditional WAL. This simplifies crash recovery (just use the last committed header) and eliminates the need for a separate log file.
+FerridynDB uses copy-on-write semantics with double-buffered headers instead of a traditional WAL. This simplifies crash recovery (just use the last committed header) and eliminates the need for a separate log file.
 
 ### mmap for Reads
 
@@ -191,7 +191,7 @@ Page size matches the OS page size for optimal mmap alignment and cache efficien
 
 ### Single Writer, Unlimited Readers
 
-DynamiteDB follows the LMDB concurrency model: one writer at a time (via file lock), unlimited concurrent readers (via MVCC snapshots). This avoids the complexity of multi-writer coordination while providing excellent read scalability.
+FerridynDB follows the LMDB concurrency model: one writer at a time (via file lock), unlimited concurrent readers (via MVCC snapshots). This avoids the complexity of multi-writer coordination while providing excellent read scalability.
 
 ### No Secondary Indexes (v1)
 

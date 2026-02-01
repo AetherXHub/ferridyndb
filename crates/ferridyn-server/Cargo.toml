@@ -1,0 +1,25 @@
+[package]
+name = "ferridyn-server"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "ferridyn_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ferridyn-server"
+path = "src/main.rs"
+
+[dependencies]
+ferridyn-core = { path = "../ferridyn-core" }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dirs = "6"
+
+[dev-dependencies]
+tempfile = "3"

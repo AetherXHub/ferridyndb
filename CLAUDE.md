@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-DynamiteDB is a local, embedded, DynamoDB-style document database written in Rust (edition 2024). It stores JSON documents with partition key + optional sort key in a single file using copy-on-write pages. Designed for multi-GB databases with full MVCC transactions.
+FerridynDB is a local, embedded, DynamoDB-style document database written in Rust (edition 2024). It stores JSON documents with partition key + optional sort key in a single file using copy-on-write pages. Designed for multi-GB databases with full MVCC transactions.
 
 ## Build Commands
 
@@ -12,13 +12,13 @@ This is a Cargo workspace. Build/test from the repository root:
 
 - `cargo build` - compile all crates
 - `cargo test` - run all tests across the workspace
-- `cargo test -p dynamite-core` - test only the core crate
-- `cargo test -p dynamite-core <test_name>` - run a single test by name
+- `cargo test -p ferridyn-core` - test only the core crate
+- `cargo test -p ferridyn-core <test_name>` - run a single test by name
 - `cargo clippy --workspace` - lint all crates
 - `cargo fmt --all` - format all crates
 - `cargo fmt --all --check` - check formatting without modifying files
-- `cargo bench -p dynamite-core` - run benchmarks (criterion, uses tmpfs by default)
-- `BENCH_DIR=/var/home/travis/development/dyna_mite/target/bench_real cargo bench --bench dynamite_file_bench` - run file-backed benchmarks on real NVMe (only after major refactors)
+- `cargo bench -p ferridyn-core` - run benchmarks (criterion, uses tmpfs by default)
+- `BENCH_DIR=/var/home/travis/development/dyna_mite/target/bench_real cargo bench --bench ferridyn_file_bench` - run file-backed benchmarks on real NVMe (only after major refactors)
 
 ## Architecture
 
@@ -37,7 +37,7 @@ Public API (`api/`) sits on top: `put/get/delete/query/scan/transact`.
 
 ```
 crates/
-  dynamite-core/     # Core database engine (lib crate)
+  ferridyn-core/     # Core database engine (lib crate)
     src/
       storage/       # File I/O, page management, mmap
       btree/         # B+Tree implementation
@@ -64,8 +64,8 @@ tests/
 
 Work proceeds incrementally. Every change must leave the project in a fully working state:
 
-1. **Compile first**: `cargo build -p dynamite-core` must pass with zero errors before moving on.
-2. **Test everything**: Write tests for each new piece of functionality before considering it done. Run `cargo test -p dynamite-core` and confirm all tests pass.
+1. **Compile first**: `cargo build -p ferridyn-core` must pass with zero errors before moving on.
+2. **Test everything**: Write tests for each new piece of functionality before considering it done. Run `cargo test -p ferridyn-core` and confirm all tests pass.
 3. **Lint clean**: `cargo clippy --workspace -- -D warnings` must pass. No warnings allowed.
 4. **Format**: `cargo fmt --all --check` must pass.
 5. **No dead code**: Don't stub out modules or leave `todo!()` / `unimplemented!()` in committed code. Each step should produce working, tested code — not scaffolding for the future.
@@ -73,10 +73,10 @@ Work proceeds incrementally. Every change must leave the project in a fully work
 
 ## Benchmarks
 
-Two benchmark suites exist in `dynamite-core`:
+Two benchmark suites exist in `ferridyn-core`:
 
-- `dynamite_bench` — in-memory (tmpfs) microbenchmarks. Run these routinely.
-- `dynamite_file_bench` — file-backed benchmarks with real I/O. Uses tmpfs by default; set `BENCH_DIR` to point at real storage.
+- `ferridyn_bench` — in-memory (tmpfs) microbenchmarks. Run these routinely.
+- `ferridyn_file_bench` — file-backed benchmarks with real I/O. Uses tmpfs by default; set `BENCH_DIR` to point at real storage.
 
 **Default workflow**: run benchmarks on tmpfs (`cargo bench`). Only run on real NVMe disk after major refactors where all in-memory benchmarks have improved or not regressed. NVMe results are dominated by fsync latency (~5ms per commit) which masks algorithmic changes.
 
