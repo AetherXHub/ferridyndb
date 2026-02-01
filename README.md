@@ -179,21 +179,35 @@ loop {
 
 ## Claude Code Memory Plugin
 
-DynaMite includes a Model Context Protocol (MCP) server that provides agentic memory capabilities for Claude Code. The plugin automatically retrieves relevant context based on semantic categories and hierarchical keys.
+DynaMite includes a Claude Code plugin that provides agentic memory — automatically retrieving relevant context and persisting learnings across sessions.
+
+### Install
 
 ```bash
-# Connect to memory plugin
-dynamite-memory --db ~/.local/share/dynamite/memory.db
+# Install the plugin from GitHub
+/plugin marketplace add AetherXHub/dynamite
 
-# Use from Claude Code
-# The plugin automatically registers as an MCP server and provides:
-# - remember(category, key, content) - Store a memory
-# - recall(category, prefix) - Retrieve memories by category/prefix
-# - discover(category) - Browse available categories and key hierarchies
-# - forget(category, key) - Remove a memory
+# Run first-time setup (builds binaries, starts server, verifies tools)
+/dynamite-memory:setup
 ```
 
-See [`plugin/README.md`](plugin/README.md) for detailed plugin documentation and Claude Code integration instructions.
+### What It Does
+
+- **MCP tools** — `remember`, `recall`, `discover`, `forget` available directly in Claude conversations
+- **Auto-retrieval** (UserPromptSubmit hook) — injects relevant memories into context before each prompt
+- **Auto-save** (PreCompact hook) — extracts key learnings before conversation compaction
+
+### Architecture
+
+```
+dynamite-server (background, owns DB file)
+    ^ Unix socket (~/.local/share/dynamite/server.sock)
+    |
+    +-- dynamite-memory (MCP server, provides tools to Claude)
+    +-- dynamite-memory-cli (used by hooks for read/write)
+```
+
+See [`plugin-README.md`](plugin-README.md) for detailed plugin documentation.
 
 ## Workspace Layout
 
@@ -203,7 +217,6 @@ See [`plugin/README.md`](plugin/README.md) for detailed plugin documentation and
 | `dynamite-server` | Unix socket server + async client library for multi-process access |
 | `dynamite-memory` | Claude Code MCP server + CLI for agentic memory system |
 | `dynamite-console` | Interactive REPL for exploring and manipulating DynaMite databases |
-| `plugin/` | Claude Code plugin (hooks, skills, MCP configuration) |
 
 ## Development
 
