@@ -1,11 +1,11 @@
-//! DynaMite server binary.
+//! DynamiteDB server binary.
 //!
 //! Opens or creates a database and serves it over a Unix domain socket.
 
 use std::path::PathBuf;
 
-use dynamite_core::api::DynaMite;
-use dynamite_server::DynaMiteServer;
+use dynamite_core::api::DynamiteDB;
+use dynamite_server::DynamiteServer;
 use tracing::info;
 
 fn default_data_dir() -> PathBuf {
@@ -70,12 +70,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Open or create the database.
     let db = if db_path.exists() {
-        DynaMite::open(&db_path)?
+        DynamiteDB::open(&db_path)?
     } else {
-        DynaMite::create(&db_path)?
+        DynamiteDB::create(&db_path)?
     };
 
-    let server = DynaMiteServer::new(db, socket_path);
+    let server = DynamiteServer::new(db, socket_path);
     server.run().await?;
 
     Ok(())

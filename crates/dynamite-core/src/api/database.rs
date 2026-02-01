@@ -49,13 +49,13 @@ struct DatabaseInner {
 
 /// The main database handle.
 ///
-/// `DynaMite` is cheaply clonable (`Arc`-based) and `Send + Sync`.
+/// `DynamiteDB` is cheaply clonable (`Arc`-based) and `Send + Sync`.
 #[derive(Clone)]
-pub struct DynaMite {
+pub struct DynamiteDB {
     inner: Arc<DatabaseInner>,
 }
 
-impl DynaMite {
+impl DynamiteDB {
     /// Create a new database at the given path.
     pub fn create(path: impl AsRef<Path>) -> Result<Self, Error> {
         let path = path.as_ref();
@@ -456,10 +456,10 @@ mod tests {
     use std::thread;
     use tempfile::tempdir;
 
-    fn create_test_db() -> (DynaMite, tempfile::TempDir) {
+    fn create_test_db() -> (DynamiteDB, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let db = DynaMite::create(&db_path).unwrap();
+        let db = DynamiteDB::create(&db_path).unwrap();
         (db, dir)
     }
 
@@ -469,7 +469,7 @@ mod tests {
         let db_path = dir.path().join("test.db");
 
         {
-            let db = DynaMite::create(&db_path).unwrap();
+            let db = DynamiteDB::create(&db_path).unwrap();
             db.create_table("users")
                 .partition_key("user_id", KeyType::String)
                 .execute()
@@ -479,7 +479,7 @@ mod tests {
         }
 
         {
-            let db = DynaMite::open(&db_path).unwrap();
+            let db = DynamiteDB::open(&db_path).unwrap();
             let item = db
                 .get_item("users")
                 .partition_key("alice")
@@ -893,7 +893,7 @@ mod crash_recovery_tests {
 
         // Create DB and insert data via a normal commit.
         {
-            let db = DynaMite::create(&db_path).unwrap();
+            let db = DynamiteDB::create(&db_path).unwrap();
             db.create_table("items")
                 .partition_key("id", KeyType::String)
                 .execute()
@@ -929,7 +929,7 @@ mod crash_recovery_tests {
 
         // Reopen the database -- it should recover from the valid header.
         {
-            let db = DynaMite::open(&db_path).unwrap();
+            let db = DynamiteDB::open(&db_path).unwrap();
             let item = db
                 .get_item("items")
                 .partition_key("key1")
@@ -947,7 +947,7 @@ mod crash_recovery_tests {
 
         // Create DB and do several operations to bump txn_counter.
         {
-            let db = DynaMite::create(&db_path).unwrap();
+            let db = DynamiteDB::create(&db_path).unwrap();
             db.create_table("items")
                 .partition_key("id", KeyType::String)
                 .execute()
@@ -966,7 +966,7 @@ mod crash_recovery_tests {
         // Reopen and verify the header with the higher txn_counter is selected
         // and all data is accessible.
         {
-            let db = DynaMite::open(&db_path).unwrap();
+            let db = DynamiteDB::open(&db_path).unwrap();
 
             // Verify all 5 items are readable.
             for i in 0..5 {
@@ -999,7 +999,7 @@ mod crash_recovery_tests {
 
         // Create DB and insert data.
         {
-            let db = DynaMite::create(&db_path).unwrap();
+            let db = DynamiteDB::create(&db_path).unwrap();
             db.create_table("data")
                 .partition_key("id", KeyType::String)
                 .execute()
@@ -1040,7 +1040,7 @@ mod crash_recovery_tests {
         // Reopen -- should use the valid (active) header and ignore the
         // corrupted alternate.
         {
-            let db = DynaMite::open(&db_path).unwrap();
+            let db = DynamiteDB::open(&db_path).unwrap();
             let item = db
                 .get_item("data")
                 .partition_key("hello")
@@ -1073,7 +1073,7 @@ mod concurrency_stress_tests {
     fn test_concurrent_readers_and_writer() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("concurrent.db");
-        let db = DynaMite::create(&db_path).unwrap();
+        let db = DynamiteDB::create(&db_path).unwrap();
 
         db.create_table("items")
             .partition_key("id", KeyType::String)
@@ -1167,7 +1167,7 @@ mod concurrency_stress_tests {
     fn test_stress_many_operations() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("stress.db");
-        let db = DynaMite::create(&db_path).unwrap();
+        let db = DynamiteDB::create(&db_path).unwrap();
 
         db.create_table("stress")
             .partition_key("id", KeyType::String)
@@ -1208,10 +1208,10 @@ mod ttl_tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    fn create_test_db() -> (DynaMite, tempfile::TempDir) {
+    fn create_test_db() -> (DynamiteDB, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let db = DynaMite::create(&db_path).unwrap();
+        let db = DynamiteDB::create(&db_path).unwrap();
         (db, dir)
     }
 
@@ -1498,10 +1498,10 @@ mod list_partition_keys_tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    fn create_test_db() -> (DynaMite, tempfile::TempDir) {
+    fn create_test_db() -> (DynamiteDB, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let db = DynaMite::create(&db_path).unwrap();
+        let db = DynamiteDB::create(&db_path).unwrap();
         (db, dir)
     }
 
@@ -1610,10 +1610,10 @@ mod list_sort_key_prefixes_tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    fn create_test_db() -> (DynaMite, tempfile::TempDir) {
+    fn create_test_db() -> (DynamiteDB, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let db = DynaMite::create(&db_path).unwrap();
+        let db = DynamiteDB::create(&db_path).unwrap();
         (db, dir)
     }
 

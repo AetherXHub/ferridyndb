@@ -4,10 +4,10 @@ use serde_json::json;
 use tempfile::tempdir;
 use tokio::time::{Duration, sleep};
 
-use dynamite_core::api::DynaMite;
-use dynamite_server::client::DynaMiteClient;
+use dynamite_core::api::DynamiteDB;
+use dynamite_server::client::DynamiteClient;
 use dynamite_server::protocol::KeyDef;
-use dynamite_server::server::DynaMiteServer;
+use dynamite_server::server::DynamiteServer;
 
 /// Start a server on a temp socket and return the socket path.
 /// The server runs in a background tokio task.
@@ -16,8 +16,8 @@ async fn start_test_server() -> (tempfile::TempDir, std::path::PathBuf) {
     let db_path = dir.path().join("test.db");
     let socket_path = dir.path().join("test.sock");
 
-    let db = DynaMite::create(&db_path).unwrap();
-    let server = DynaMiteServer::new(db, socket_path.clone());
+    let db = DynamiteDB::create(&db_path).unwrap();
+    let server = DynamiteServer::new(db, socket_path.clone());
 
     tokio::spawn(async move {
         server.run().await.unwrap();
@@ -32,7 +32,7 @@ async fn start_test_server() -> (tempfile::TempDir, std::path::PathBuf) {
 #[tokio::test]
 async fn test_create_table_and_crud() {
     let (_dir, sock) = start_test_server().await;
-    let mut client = DynaMiteClient::connect(&sock).await.unwrap();
+    let mut client = DynamiteClient::connect(&sock).await.unwrap();
 
     // Create table.
     client
@@ -87,7 +87,7 @@ async fn test_create_table_and_crud() {
 #[tokio::test]
 async fn test_versioned_get_and_conditional_put() {
     let (_dir, sock) = start_test_server().await;
-    let mut client = DynaMiteClient::connect(&sock).await.unwrap();
+    let mut client = DynamiteClient::connect(&sock).await.unwrap();
 
     client
         .create_table(
@@ -150,8 +150,8 @@ async fn test_concurrent_version_conflict() {
     let (_dir, sock) = start_test_server().await;
 
     // Two clients sharing the same server.
-    let mut client_a = DynaMiteClient::connect(&sock).await.unwrap();
-    let mut client_b = DynaMiteClient::connect(&sock).await.unwrap();
+    let mut client_a = DynamiteClient::connect(&sock).await.unwrap();
+    let mut client_b = DynamiteClient::connect(&sock).await.unwrap();
 
     client_a
         .create_table(
@@ -216,7 +216,7 @@ async fn test_concurrent_version_conflict() {
 #[tokio::test]
 async fn test_query_and_scan() {
     let (_dir, sock) = start_test_server().await;
-    let mut client = DynaMiteClient::connect(&sock).await.unwrap();
+    let mut client = DynamiteClient::connect(&sock).await.unwrap();
 
     client
         .create_table(
@@ -271,7 +271,7 @@ async fn test_query_and_scan() {
 #[tokio::test]
 async fn test_describe_and_drop_table() {
     let (_dir, sock) = start_test_server().await;
-    let mut client = DynaMiteClient::connect(&sock).await.unwrap();
+    let mut client = DynamiteClient::connect(&sock).await.unwrap();
 
     client
         .create_table(
@@ -306,7 +306,7 @@ async fn test_describe_and_drop_table() {
 #[tokio::test]
 async fn test_list_partition_keys_and_prefixes() {
     let (_dir, sock) = start_test_server().await;
-    let mut client = DynaMiteClient::connect(&sock).await.unwrap();
+    let mut client = DynamiteClient::connect(&sock).await.unwrap();
 
     client
         .create_table(
@@ -364,7 +364,7 @@ async fn test_list_partition_keys_and_prefixes() {
 #[tokio::test]
 async fn test_error_table_not_found() {
     let (_dir, sock) = start_test_server().await;
-    let mut client = DynaMiteClient::connect(&sock).await.unwrap();
+    let mut client = DynamiteClient::connect(&sock).await.unwrap();
 
     let result = client.get_item("nonexistent", json!("key"), None).await;
     assert!(result.is_err());
@@ -373,7 +373,7 @@ async fn test_error_table_not_found() {
 #[tokio::test]
 async fn test_error_table_already_exists() {
     let (_dir, sock) = start_test_server().await;
-    let mut client = DynaMiteClient::connect(&sock).await.unwrap();
+    let mut client = DynamiteClient::connect(&sock).await.unwrap();
 
     client
         .create_table(

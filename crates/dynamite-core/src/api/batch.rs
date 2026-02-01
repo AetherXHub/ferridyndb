@@ -2,7 +2,7 @@ use serde_json::Value;
 
 use crate::error::Error;
 
-use super::database::DynaMite;
+use super::database::DynamiteDB;
 
 /// Controls when `fsync` is called during commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,12 +39,12 @@ pub enum BatchOp {
 /// Collects multiple write operations and commits them atomically in a
 /// single transaction (one fsync instead of N).
 pub struct WriteBatch<'a> {
-    db: &'a DynaMite,
+    db: &'a DynamiteDB,
     ops: Vec<BatchOp>,
 }
 
 impl<'a> WriteBatch<'a> {
-    pub(crate) fn new(db: &'a DynaMite) -> Self {
+    pub(crate) fn new(db: &'a DynamiteDB) -> Self {
         Self {
             db,
             ops: Vec::new(),
@@ -124,10 +124,10 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    fn create_test_db() -> (DynaMite, tempfile::TempDir) {
+    fn create_test_db() -> (DynamiteDB, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let db = DynaMite::create(&db_path).unwrap();
+        let db = DynamiteDB::create(&db_path).unwrap();
         db.create_table("items")
             .partition_key("id", KeyType::String)
             .execute()

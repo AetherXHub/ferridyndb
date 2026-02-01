@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-DynaMite is a local, embedded, DynamoDB-style document database written in Rust (edition 2024). It stores JSON documents with partition key + optional sort key in a single file using copy-on-write pages. Designed for multi-GB databases with full MVCC transactions.
+DynamiteDB is a local, embedded, DynamoDB-style document database written in Rust (edition 2024). It stores JSON documents with partition key + optional sort key in a single file using copy-on-write pages. Designed for multi-GB databases with full MVCC transactions.
 
 ## Build Commands
 

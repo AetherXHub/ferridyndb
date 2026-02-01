@@ -1,8 +1,8 @@
-//! Unix domain socket server that wraps a `DynaMite` database handle.
+//! Unix domain socket server that wraps a `DynamiteDB` database handle.
 //!
 //! Each connected client sends JSON-line requests and receives JSON-line
 //! responses. Reads are concurrent (via `RwLock::read`), writes are
-//! serialized (via `RwLock::write`) — the lock is internal to `DynaMite`.
+//! serialized (via `RwLock::write`) — the lock is internal to `DynamiteDB`.
 
 use std::path::PathBuf;
 
@@ -10,20 +10,20 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tracing::{error, info, warn};
 
-use dynamite_core::api::DynaMite;
+use dynamite_core::api::DynamiteDB;
 use dynamite_core::error::{Error as DynError, SchemaError, TxnError};
 use dynamite_core::types::{KeyType, TableSchema};
 
 use crate::protocol::{KeyDef, KeyDefWire, Request, Response, SortKeyCondition, TableSchemaWire};
 
-/// A DynaMite server listening on a Unix socket.
-pub struct DynaMiteServer {
-    db: DynaMite,
+/// A DynamiteDB server listening on a Unix socket.
+pub struct DynamiteServer {
+    db: DynamiteDB,
     socket_path: PathBuf,
 }
 
-impl DynaMiteServer {
-    pub fn new(db: DynaMite, socket_path: PathBuf) -> Self {
+impl DynamiteServer {
+    pub fn new(db: DynamiteDB, socket_path: PathBuf) -> Self {
         Self { db, socket_path }
     }
 
@@ -79,7 +79,7 @@ impl DynaMiteServer {
     }
 }
 
-async fn handle_connection(db: DynaMite, stream: tokio::net::UnixStream) -> std::io::Result<()> {
+async fn handle_connection(db: DynamiteDB, stream: tokio::net::UnixStream) -> std::io::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
@@ -115,7 +115,7 @@ async fn handle_connection(db: DynaMite, stream: tokio::net::UnixStream) -> std:
     Ok(())
 }
 
-fn dispatch(db: &DynaMite, req: Request) -> Response {
+fn dispatch(db: &DynamiteDB, req: Request) -> Response {
     match req {
         Request::GetItem {
             table,
@@ -194,7 +194,7 @@ fn dispatch(db: &DynaMite, req: Request) -> Response {
 // ---------------------------------------------------------------------------
 
 fn handle_get_item(
-    db: &DynaMite,
+    db: &DynamiteDB,
     table: &str,
     partition_key: serde_json::Value,
     sort_key: Option<serde_json::Value>,
@@ -210,7 +210,7 @@ fn handle_get_item(
 }
 
 fn handle_get_item_versioned(
-    db: &DynaMite,
+    db: &DynamiteDB,
     table: &str,
     partition_key: serde_json::Value,
     sort_key: Option<serde_json::Value>,
@@ -227,7 +227,7 @@ fn handle_get_item_versioned(
 }
 
 fn handle_put_item(
-    db: &DynaMite,
+    db: &DynamiteDB,
     table: &str,
     item: serde_json::Value,
     expected_version: Option<u64>,
@@ -244,7 +244,7 @@ fn handle_put_item(
 }
 
 fn handle_delete_item(
-    db: &DynaMite,
+    db: &DynamiteDB,
     table: &str,
     partition_key: serde_json::Value,
     sort_key: Option<serde_json::Value>,
@@ -260,7 +260,7 @@ fn handle_delete_item(
 }
 
 fn handle_query(
-    db: &DynaMite,
+    db: &DynamiteDB,
     table: &str,
     partition_key: serde_json::Value,
     sort_key_condition: Option<SortKeyCondition>,
@@ -299,7 +299,7 @@ fn handle_query(
 }
 
 fn handle_scan(
-    db: &DynaMite,
+    db: &DynamiteDB,
     table: &str,
     limit: Option<usize>,
     exclusive_start_key: Option<serde_json::Value>,
@@ -318,7 +318,7 @@ fn handle_scan(
 }
 
 fn handle_create_table(
-    db: &DynaMite,
+    db: &DynamiteDB,
     table: &str,
     partition_key: KeyDef,
     sort_key: Option<KeyDef>,
@@ -361,28 +361,28 @@ fn handle_create_table(
     }
 }
 
-fn handle_drop_table(db: &DynaMite, table: &str) -> Response {
+fn handle_drop_table(db: &DynamiteDB, table: &str) -> Response {
     match db.drop_table(table) {
         Ok(()) => Response::ok_empty(),
         Err(e) => dyn_error_to_response(e),
     }
 }
 
-fn handle_list_tables(db: &DynaMite) -> Response {
+fn handle_list_tables(db: &DynamiteDB) -> Response {
     match db.list_tables() {
         Ok(tables) => Response::ok_tables(tables),
         Err(e) => dyn_error_to_response(e),
     }
 }
 
-fn handle_describe_table(db: &DynaMite, table: &str) -> Response {
+fn handle_describe_table(db: &DynamiteDB, table: &str) -> Response {
     match db.describe_table(table) {
         Ok(schema) => Response::ok_schema(schema_to_wire(&schema)),
         Err(e) => dyn_error_to_response(e),
     }
 }
 
-fn handle_list_partition_keys(db: &DynaMite, table: &str, limit: Option<usize>) -> Response {
+fn handle_list_partition_keys(db: &DynamiteDB, table: &str, limit: Option<usize>) -> Response {
     let mut builder = db.list_partition_keys(table);
     if let Some(n) = limit {
         builder = builder.limit(n);
@@ -394,7 +394,7 @@ fn handle_list_partition_keys(db: &DynaMite, table: &str, limit: Option<usize>) 
 }
 
 fn handle_list_sort_key_prefixes(
-    db: &DynaMite,
+    db: &DynamiteDB,
     table: &str,
     partition_key: serde_json::Value,
     limit: Option<usize>,

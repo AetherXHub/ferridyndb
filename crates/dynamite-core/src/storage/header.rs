@@ -2,7 +2,7 @@ use crate::error::StorageError;
 use crate::types::{PAGE_SIZE, PageId};
 use xxhash_rust::xxh64::xxh64;
 
-/// Magic bytes identifying a DynaMite database file.
+/// Magic bytes identifying a DynamiteDB database file.
 pub const MAGIC: &[u8; 4] = b"DYNA";
 
 /// Current file format version.

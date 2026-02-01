@@ -1,4 +1,4 @@
-use dynamite_core::api::{DynaMite, QueryResult};
+use dynamite_core::api::{DynamiteDB, QueryResult};
 use dynamite_core::error::Error;
 use dynamite_core::types::TableSchema;
 use serde_json::Value;
@@ -28,7 +28,7 @@ pub enum CommandResult {
 }
 
 /// Execute a parsed command against the database.
-pub fn execute(db: &DynaMite, cmd: Command) -> Result<CommandResult, Error> {
+pub fn execute(db: &DynamiteDB, cmd: Command) -> Result<CommandResult, Error> {
     match cmd {
         Command::CreateTable {
             name,
@@ -59,7 +59,7 @@ pub fn execute(db: &DynaMite, cmd: Command) -> Result<CommandResult, Error> {
 }
 
 fn exec_create_table(
-    db: &DynaMite,
+    db: &DynamiteDB,
     name: &str,
     pk_name: &str,
     pk_type: dynamite_core::types::KeyType,
@@ -77,28 +77,28 @@ fn exec_create_table(
     Ok(CommandResult::Ok(format!("Table '{name}' created.")))
 }
 
-fn exec_drop_table(db: &DynaMite, name: &str) -> Result<CommandResult, Error> {
+fn exec_drop_table(db: &DynamiteDB, name: &str) -> Result<CommandResult, Error> {
     db.drop_table(name)?;
     Ok(CommandResult::Ok(format!("Table '{name}' dropped.")))
 }
 
-fn exec_list_tables(db: &DynaMite) -> Result<CommandResult, Error> {
+fn exec_list_tables(db: &DynamiteDB) -> Result<CommandResult, Error> {
     let tables = db.list_tables()?;
     Ok(CommandResult::TableList(tables))
 }
 
-fn exec_describe_table(db: &DynaMite, name: &str) -> Result<CommandResult, Error> {
+fn exec_describe_table(db: &DynamiteDB, name: &str) -> Result<CommandResult, Error> {
     let schema = db.describe_table(name)?;
     Ok(CommandResult::TableSchema(schema))
 }
 
-fn exec_put(db: &DynaMite, table: &str, document: Value) -> Result<CommandResult, Error> {
+fn exec_put(db: &DynamiteDB, table: &str, document: Value) -> Result<CommandResult, Error> {
     db.put_item(table, document)?;
     Ok(CommandResult::Ok("OK".to_string()))
 }
 
 fn exec_get(
-    db: &DynaMite,
+    db: &DynamiteDB,
     table: &str,
     pk: Value,
     sk: Option<Value>,
@@ -112,7 +112,7 @@ fn exec_get(
 }
 
 fn exec_delete(
-    db: &DynaMite,
+    db: &DynamiteDB,
     table: &str,
     pk: Value,
     sk: Option<Value>,
@@ -126,7 +126,7 @@ fn exec_delete(
 }
 
 fn exec_query(
-    db: &DynaMite,
+    db: &DynamiteDB,
     table: &str,
     pk: Value,
     sort_condition: Option<SortClause>,
@@ -159,7 +159,7 @@ fn exec_query(
     Ok(CommandResult::QueryResult(result))
 }
 
-fn exec_scan(db: &DynaMite, table: &str, limit: Option<usize>) -> Result<CommandResult, Error> {
+fn exec_scan(db: &DynamiteDB, table: &str, limit: Option<usize>) -> Result<CommandResult, Error> {
     let mut builder = db.scan(table);
     if let Some(n) = limit {
         builder = builder.limit(n);
@@ -169,7 +169,7 @@ fn exec_scan(db: &DynaMite, table: &str, limit: Option<usize>) -> Result<Command
 }
 
 fn exec_list_keys(
-    db: &DynaMite,
+    db: &DynamiteDB,
     table: &str,
     limit: Option<usize>,
 ) -> Result<CommandResult, Error> {
@@ -182,7 +182,7 @@ fn exec_list_keys(
 }
 
 fn exec_list_prefixes(
-    db: &DynaMite,
+    db: &DynamiteDB,
     table: &str,
     pk: Value,
     limit: Option<usize>,

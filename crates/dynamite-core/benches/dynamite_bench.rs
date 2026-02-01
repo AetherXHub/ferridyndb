@@ -1,5 +1,5 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use dynamite_core::api::DynaMite;
+use dynamite_core::api::DynamiteDB;
 use dynamite_core::types::KeyType;
 use serde_json::json;
 use std::sync::Arc;
@@ -10,7 +10,7 @@ fn bench_put_item(c: &mut Criterion) {
     c.bench_function("put_item", |b| {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("bench.db");
-        let db = DynaMite::create(&db_path).unwrap();
+        let db = DynamiteDB::create(&db_path).unwrap();
         db.create_table("items")
             .partition_key("id", KeyType::String)
             .execute()
@@ -30,7 +30,7 @@ fn bench_get_item(c: &mut Criterion) {
     c.bench_function("get_item", |b| {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("bench.db");
-        let db = DynaMite::create(&db_path).unwrap();
+        let db = DynamiteDB::create(&db_path).unwrap();
         db.create_table("items")
             .partition_key("id", KeyType::String)
             .execute()
@@ -60,7 +60,7 @@ fn bench_bulk_insert_1k(c: &mut Criterion) {
         b.iter(|| {
             let dir = tempdir().unwrap();
             let db_path = dir.path().join("bench.db");
-            let db = DynaMite::create(&db_path).unwrap();
+            let db = DynamiteDB::create(&db_path).unwrap();
             db.create_table("items")
                 .partition_key("id", KeyType::String)
                 .execute()
@@ -78,7 +78,7 @@ fn bench_range_query(c: &mut Criterion) {
     // Prepopulate a database once outside the benchmark loop.
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("bench.db");
-    let db = DynaMite::create(&db_path).unwrap();
+    let db = DynamiteDB::create(&db_path).unwrap();
     db.create_table("events")
         .partition_key("pk", KeyType::String)
         .sort_key("sk", KeyType::Number)
@@ -110,7 +110,7 @@ fn bench_concurrent_reads(c: &mut Criterion) {
     // Prepopulate a database once.
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("bench.db");
-    let db = DynaMite::create(&db_path).unwrap();
+    let db = DynamiteDB::create(&db_path).unwrap();
     db.create_table("items")
         .partition_key("id", KeyType::String)
         .execute()

@@ -1,20 +1,20 @@
-//! # DynaMite
+//! # DynamiteDB
 //!
 //! A local, embedded DynamoDB-style document database written in Rust.
 //!
-//! DynaMite provides a DynamoDB-compatible key-value and document storage
+//! DynamiteDB provides a DynamoDB-compatible key-value and document storage
 //! engine backed by a single file, with MVCC snapshot isolation, a B+Tree
 //! index, and a builder-pattern query API.
 //!
 //! ## Quick Start
 //!
 //! ```no_run
-//! use dynamite_core::api::DynaMite;
+//! use dynamite_core::api::DynamiteDB;
 //! use dynamite_core::types::KeyType;
 //! use serde_json::json;
 //!
 //! // Create or open a database
-//! let db = DynaMite::create("my_database.db").unwrap();
+//! let db = DynamiteDB::create("my_database.db").unwrap();
 //!
 //! // Create a table
 //! db.create_table("users")

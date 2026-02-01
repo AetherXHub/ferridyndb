@@ -8,7 +8,7 @@ use crate::error::{Error, QueryError, StorageError};
 use crate::mvcc::ops as mvcc_ops;
 use crate::types::{KeyDefinition, KeyType, TableSchema, VersionedItem};
 
-use super::database::DynaMite;
+use super::database::DynamiteDB;
 use super::key_utils;
 use super::query::{QueryResult, SortCondition, compute_scan_bounds};
 
@@ -18,7 +18,7 @@ use super::query::{QueryResult, SortCondition, compute_scan_bounds};
 
 /// Builder for creating a new table.
 pub struct TableBuilder<'a> {
-    db: &'a DynaMite,
+    db: &'a DynamiteDB,
     name: String,
     partition_key: Option<(String, KeyType)>,
     sort_key: Option<(String, KeyType)>,
@@ -26,7 +26,7 @@ pub struct TableBuilder<'a> {
 }
 
 impl<'a> TableBuilder<'a> {
-    pub(crate) fn new(db: &'a DynaMite, name: String) -> Self {
+    pub(crate) fn new(db: &'a DynamiteDB, name: String) -> Self {
         Self {
             db,
             name,
@@ -86,14 +86,14 @@ impl<'a> TableBuilder<'a> {
 
 /// Builder for getting a single item by key.
 pub struct GetItemBuilder<'a> {
-    db: &'a DynaMite,
+    db: &'a DynamiteDB,
     table: String,
     partition_key: Option<Value>,
     sort_key: Option<Value>,
 }
 
 impl<'a> GetItemBuilder<'a> {
-    pub(crate) fn new(db: &'a DynaMite, table: String) -> Self {
+    pub(crate) fn new(db: &'a DynamiteDB, table: String) -> Self {
         Self {
             db,
             table,
@@ -171,14 +171,14 @@ impl<'a> GetItemBuilder<'a> {
 /// (`created_txn`). Pass this version to `put_item_conditional` for
 /// optimistic concurrency control.
 pub struct GetItemVersionedBuilder<'a> {
-    db: &'a DynaMite,
+    db: &'a DynamiteDB,
     table: String,
     partition_key: Option<Value>,
     sort_key: Option<Value>,
 }
 
 impl<'a> GetItemVersionedBuilder<'a> {
-    pub(crate) fn new(db: &'a DynaMite, table: String) -> Self {
+    pub(crate) fn new(db: &'a DynamiteDB, table: String) -> Self {
         Self {
             db,
             table,
@@ -256,14 +256,14 @@ impl<'a> GetItemVersionedBuilder<'a> {
 
 /// Builder for deleting an item by key.
 pub struct DeleteItemBuilder<'a> {
-    db: &'a DynaMite,
+    db: &'a DynamiteDB,
     table: String,
     partition_key: Option<Value>,
     sort_key: Option<Value>,
 }
 
 impl<'a> DeleteItemBuilder<'a> {
-    pub(crate) fn new(db: &'a DynaMite, table: String) -> Self {
+    pub(crate) fn new(db: &'a DynamiteDB, table: String) -> Self {
         Self {
             db,
             table,
@@ -301,7 +301,7 @@ impl<'a> DeleteItemBuilder<'a> {
 
 /// Builder for querying items with partition key and optional sort conditions.
 pub struct QueryBuilder<'a> {
-    db: &'a DynaMite,
+    db: &'a DynamiteDB,
     table: String,
     partition_key: Option<Value>,
     sort_condition: Option<SortCondition>,
@@ -311,7 +311,7 @@ pub struct QueryBuilder<'a> {
 }
 
 impl<'a> QueryBuilder<'a> {
-    pub(crate) fn new(db: &'a DynaMite, table: String) -> Self {
+    pub(crate) fn new(db: &'a DynamiteDB, table: String) -> Self {
         Self {
             db,
             table,
@@ -480,14 +480,14 @@ impl<'a> QueryBuilder<'a> {
 
 /// Builder for scanning all items in a table.
 pub struct ScanBuilder<'a> {
-    db: &'a DynaMite,
+    db: &'a DynamiteDB,
     table: String,
     limit: Option<usize>,
     exclusive_start_key: Option<Value>,
 }
 
 impl<'a> ScanBuilder<'a> {
-    pub(crate) fn new(db: &'a DynaMite, table: String) -> Self {
+    pub(crate) fn new(db: &'a DynamiteDB, table: String) -> Self {
         Self {
             db,
             table,
@@ -573,13 +573,13 @@ impl<'a> ScanBuilder<'a> {
 
 /// Builder for listing distinct partition keys in a table.
 pub struct ListPartitionKeysBuilder<'a> {
-    db: &'a DynaMite,
+    db: &'a DynamiteDB,
     table: String,
     limit: Option<usize>,
 }
 
 impl<'a> ListPartitionKeysBuilder<'a> {
-    pub(crate) fn new(db: &'a DynaMite, table: String) -> Self {
+    pub(crate) fn new(db: &'a DynamiteDB, table: String) -> Self {
         Self {
             db,
             table,
@@ -643,14 +643,14 @@ impl<'a> ListPartitionKeysBuilder<'a> {
 /// convention of `#`-separated hierarchical keys and you want to discover
 /// what top-level categories exist under a partition key.
 pub struct ListSortKeyPrefixesBuilder<'a> {
-    db: &'a DynaMite,
+    db: &'a DynamiteDB,
     table: String,
     partition_key: Option<Value>,
     limit: Option<usize>,
 }
 
 impl<'a> ListSortKeyPrefixesBuilder<'a> {
-    pub(crate) fn new(db: &'a DynaMite, table: String) -> Self {
+    pub(crate) fn new(db: &'a DynamiteDB, table: String) -> Self {
         Self {
             db,
             table,

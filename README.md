@@ -1,4 +1,4 @@
-# DynaMite
+# DynamiteDB
 
 A local, embedded, DynamoDB-style document database written in Rust with single-file storage and full MVCC transactions.
 
@@ -17,12 +17,12 @@ A local, embedded, DynamoDB-style document database written in Rust with single-
 ### Embedded Usage
 
 ```rust
-use dynamite_core::api::DynaMite;
+use dynamite_core::api::DynamiteDB;
 use dynamite_core::types::KeyType;
 use serde_json::json;
 
 // Create or open a database
-let db = DynaMite::create("my_database.db").unwrap();
+let db = DynamiteDB::create("my_database.db").unwrap();
 
 // Create a table with partition key
 db.create_table("users")
@@ -82,7 +82,7 @@ cargo bench -p dynamite-core
 
 ## Server Mode
 
-DynaMite can run as a standalone server accessed by multiple processes over a Unix socket. This enables multi-process access with version-aware optimistic concurrency control.
+DynamiteDB can run as a standalone server accessed by multiple processes over a Unix socket. This enables multi-process access with version-aware optimistic concurrency control.
 
 ### Starting the Server
 
@@ -97,11 +97,11 @@ dynamite-server
 ### Client Usage
 
 ```rust
-use dynamite_server::DynaMiteClient;
+use dynamite_server::DynamiteClient;
 use serde_json::json;
 
 // Connect to server
-let mut client = DynaMiteClient::connect("/tmp/dynamite.sock").await?;
+let mut client = DynamiteClient::connect("/tmp/dynamite.sock").await?;
 
 // Regular operations
 client.put_item("users", json!({"user_id": "bob", "name": "Bob"})).await?;
@@ -147,13 +147,13 @@ loop {
 |-------|-------------|
 | `dynamite-core` | Core database engine (storage, B+Tree, MVCC, public API) |
 | `dynamite-server` | Unix socket server + async client library for multi-process access |
-| `dynamite-console` | Interactive REPL for exploring and manipulating DynaMite databases |
+| `dynamite-console` | Interactive REPL for exploring and manipulating DynamiteDB databases |
 
 ## Development
 
 ### Workflow
 
-DynaMite development follows an incremental, test-driven approach:
+DynamiteDB development follows an incremental, test-driven approach:
 
 1. **Compile first** — `cargo build -p dynamite-core` must pass with zero errors before proceeding
 2. **Test everything** — Write tests for each new feature before considering it done
@@ -175,7 +175,7 @@ By default, benchmarks use tmpfs. Real NVMe benchmarks are dominated by fsync la
 
 ### Copy-on-write over Write-Ahead Log
 
-DynaMite uses copy-on-write semantics with double-buffered headers instead of a traditional WAL. This simplifies crash recovery (just use the last committed header) and eliminates the need for a separate log file.
+DynamiteDB uses copy-on-write semantics with double-buffered headers instead of a traditional WAL. This simplifies crash recovery (just use the last committed header) and eliminates the need for a separate log file.
 
 ### mmap for Reads
 
@@ -191,7 +191,7 @@ Page size matches the OS page size for optimal mmap alignment and cache efficien
 
 ### Single Writer, Unlimited Readers
 
-DynaMite follows the LMDB concurrency model: one writer at a time (via file lock), unlimited concurrent readers (via MVCC snapshots). This avoids the complexity of multi-writer coordination while providing excellent read scalability.
+DynamiteDB follows the LMDB concurrency model: one writer at a time (via file lock), unlimited concurrent readers (via MVCC snapshots). This avoids the complexity of multi-writer coordination while providing excellent read scalability.
 
 ### No Secondary Indexes (v1)
 

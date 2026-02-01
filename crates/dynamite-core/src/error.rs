@@ -1,9 +1,9 @@
-//! Error types for all DynaMite operations.
+//! Error types for all DynamiteDB operations.
 
 use std::io;
 use thiserror::Error;
 
-/// Top-level error type for DynaMite operations.
+/// Top-level error type for DynamiteDB operations.
 #[derive(Debug, Error)]
 pub enum Error {
     #[error(transparent)]

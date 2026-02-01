@@ -41,15 +41,15 @@ pub struct TableSchema {
     pub ttl_attribute: Option<String>,
 }
 
-/// Client for a DynaMite server.
-pub struct DynaMiteClient {
+/// Client for a DynamiteDB server.
+pub struct DynamiteClient {
     reader: BufReader<OwnedReadHalf>,
     writer: BufWriter<OwnedWriteHalf>,
     line_buf: String,
 }
 
-impl DynaMiteClient {
-    /// Connect to a DynaMite server at the given Unix socket path.
+impl DynamiteClient {
+    /// Connect to a DynamiteDB server at the given Unix socket path.
     pub async fn connect(path: impl AsRef<Path>) -> Result<Self> {
         let stream = UnixStream::connect(path.as_ref()).await?;
         let (read_half, write_half) = stream.into_split();

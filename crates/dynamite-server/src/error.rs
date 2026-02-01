@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use crate::protocol::ErrorResponse;
 
-/// Errors returned by `DynaMiteClient` methods.
+/// Errors returned by `DynamiteClient` methods.
 #[derive(Debug, Error)]
 pub enum ClientError {
     #[error("I/O error: {0}")]

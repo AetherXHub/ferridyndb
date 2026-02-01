@@ -1,6 +1,6 @@
-# DynaMite Server
+# DynamiteDB Server
 
-Local Unix socket server for DynaMite database, enabling multiple clients to share a single database instance without file lock conflicts.
+Local Unix socket server for DynamiteDB database, enabling multiple clients to share a single database instance without file lock conflicts.
 
 ## Protocol
 
@@ -36,10 +36,10 @@ JSON-over-newlines on Unix domain socket. Each request is one JSON line, each re
 ## Client Library
 
 ```rust
-use dynamite_server::DynaMiteClient;
+use dynamite_server::DynamiteClient;
 use serde_json::json;
 
-let mut client = DynaMiteClient::connect("/tmp/dynamite.sock").await?;
+let mut client = DynamiteClient::connect("/tmp/dynamite.sock").await?;
 
 // CRUD operations
 client.put_item("users", json!({"user_id": "alice", "name": "Alice"})).await?;
@@ -73,7 +73,7 @@ dynamite-server [--db PATH] [--socket PATH]
 
 ## Features
 
-- **Concurrent reads**: Multiple clients can read simultaneously via DynaMite's RwLock::read
+- **Concurrent reads**: Multiple clients can read simultaneously via DynamiteDB's RwLock::read
 - **Serialized writes**: Writes are serialized through RwLock::write (single writer at a time)
 - **Graceful shutdown**: SIGINT/SIGTERM handling with socket cleanup
 - **Stale socket cleanup**: Automatically removes socket file from crashed servers
@@ -81,7 +81,7 @@ dynamite-server [--db PATH] [--socket PATH]
 
 ## Concurrency Model
 
-The server inherits DynaMite's concurrency semantics:
+The server inherits DynamiteDB's concurrency semantics:
 
 - **Read operations** (get, query, scan, list_*) execute concurrently via read lock
 - **Write operations** (put, delete, create_table) are serialized via write lock

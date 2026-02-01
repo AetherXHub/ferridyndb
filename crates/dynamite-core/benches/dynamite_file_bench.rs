@@ -1,5 +1,5 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use dynamite_core::api::{DynaMite, SyncMode};
+use dynamite_core::api::{DynamiteDB, SyncMode};
 use dynamite_core::types::KeyType;
 use serde_json::json;
 use std::hint::black_box;
@@ -28,9 +28,9 @@ fn bench_tempdir() -> TempDir {
 
 /// Create a file-backed DB with a table ("events", pk=String, sk=Number) and
 /// `n` pre-populated items: pk = "user-{i/100}", sk = i as f64.
-fn setup_db_with_items(dir: &Path, n: usize) -> DynaMite {
+fn setup_db_with_items(dir: &Path, n: usize) -> DynamiteDB {
     let db_path = dir.join("bench.db");
-    let db = DynaMite::create(&db_path).unwrap();
+    let db = DynamiteDB::create(&db_path).unwrap();
     db.create_table("events")
         .partition_key("pk", KeyType::String)
         .sort_key("sk", KeyType::Number)
@@ -167,7 +167,7 @@ fn bench_bulk_ops(c: &mut Criterion) {
         b.iter(|| {
             let dir = bench_tempdir();
             let db_path = dir.path().join("bench.db");
-            let db = DynaMite::create(&db_path).unwrap();
+            let db = DynamiteDB::create(&db_path).unwrap();
             db.create_table("events")
                 .partition_key("pk", KeyType::String)
                 .sort_key("sk", KeyType::Number)
@@ -190,7 +190,7 @@ fn bench_bulk_ops(c: &mut Criterion) {
         b.iter(|| {
             let dir = bench_tempdir();
             let db_path = dir.path().join("bench.db");
-            let db = DynaMite::create(&db_path).unwrap();
+            let db = DynamiteDB::create(&db_path).unwrap();
             db.create_table("events")
                 .partition_key("pk", KeyType::String)
                 .sort_key("sk", KeyType::Number)
@@ -217,7 +217,7 @@ fn bench_bulk_ops(c: &mut Criterion) {
         b.iter(|| {
             let dir = bench_tempdir();
             let db_path = dir.path().join("bench.db");
-            let db = DynaMite::create(&db_path).unwrap();
+            let db = DynamiteDB::create(&db_path).unwrap();
             db.create_table("events")
                 .partition_key("pk", KeyType::String)
                 .sort_key("sk", KeyType::Number)
@@ -241,7 +241,7 @@ fn bench_bulk_ops(c: &mut Criterion) {
         b.iter(|| {
             let dir = bench_tempdir();
             let db_path = dir.path().join("bench.db");
-            let db = DynaMite::create(&db_path).unwrap();
+            let db = DynamiteDB::create(&db_path).unwrap();
             db.create_table("events")
                 .partition_key("pk", KeyType::String)
                 .sort_key("sk", KeyType::Number)
@@ -265,7 +265,7 @@ fn bench_bulk_ops(c: &mut Criterion) {
         b.iter(|| {
             let dir = bench_tempdir();
             let db_path = dir.path().join("bench.db");
-            let db = DynaMite::create(&db_path).unwrap();
+            let db = DynamiteDB::create(&db_path).unwrap();
             db.set_sync_mode(SyncMode::None);
             db.create_table("events")
                 .partition_key("pk", KeyType::String)
@@ -300,7 +300,7 @@ fn bench_queries(c: &mut Criterion) {
     let dir_query = bench_tempdir();
     let db_query = {
         let db_path = dir_query.path().join("bench.db");
-        let db = DynaMite::create(&db_path).unwrap();
+        let db = DynamiteDB::create(&db_path).unwrap();
         db.create_table("events")
             .partition_key("pk", KeyType::String)
             .sort_key("sk", KeyType::Number)
@@ -540,7 +540,7 @@ fn bench_cold_start(c: &mut Criterion) {
     let dir = bench_tempdir();
     let db_path = dir.path().join("cold.db");
     {
-        let db = DynaMite::create(&db_path).unwrap();
+        let db = DynamiteDB::create(&db_path).unwrap();
         db.create_table("events")
             .partition_key("pk", KeyType::String)
             .sort_key("sk", KeyType::Number)
@@ -559,7 +559,7 @@ fn bench_cold_start(c: &mut Criterion) {
     // --- file_open_and_read ---
     group.bench_function("file_open_and_read", |b| {
         b.iter(|| {
-            let db = DynaMite::open(&db_path).unwrap();
+            let db = DynamiteDB::open(&db_path).unwrap();
             let item = db
                 .get_item("events")
                 .partition_key("user-5")

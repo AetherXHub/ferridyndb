@@ -385,7 +385,7 @@ LIMIT restricts the number of results. DESC reverses sort order.",
         name: "EXIT / QUIT",
         summary: "Exit the console",
         syntax: "EXIT  (or QUIT)",
-        details: "Closes the DynaMite console session.",
+        details: "Closes the DynamiteDB console session.",
         examples: &["EXIT", "QUIT"],
     },
 ];
@@ -410,7 +410,7 @@ fn render_help_pretty(topic: Option<&str>) {
 }
 
 fn print_help_overview() {
-    println!("DynaMite Console \u{2014} Command Reference");
+    println!("DynamiteDB Console \u{2014} Command Reference");
     println!();
     println!("  Table Management");
     println!("    CREATE TABLE   Create a new table with partition and optional sort key");

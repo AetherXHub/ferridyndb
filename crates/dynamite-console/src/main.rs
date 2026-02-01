@@ -3,7 +3,7 @@ use std::path::Path;
 use std::process;
 
 use clap::Parser;
-use dynamite_core::api::DynaMite;
+use dynamite_core::api::DynamiteDB;
 use rustyline::DefaultEditor;
 
 mod commands;
@@ -13,7 +13,7 @@ mod parser;
 
 use display::OutputMode;
 
-/// DynaMite Console — interactive and scriptable CLI for DynaMite databases.
+/// DynamiteDB Console — interactive and scriptable CLI for DynamiteDB databases.
 #[derive(Parser, Debug)]
 #[command(name = "dynamite-console", version)]
 struct Cli {
@@ -33,9 +33,9 @@ fn main() {
     let cli = Cli::parse();
 
     let db = if Path::new(&cli.database).exists() {
-        DynaMite::open(&cli.database)
+        DynamiteDB::open(&cli.database)
     } else {
-        DynaMite::create(&cli.database)
+        DynamiteDB::create(&cli.database)
     };
     let db = match db {
         Ok(db) => db,
@@ -59,7 +59,7 @@ fn main() {
 /// Execute one or more commands non-interactively (--exec mode).
 ///
 /// Returns exit code: 0 = all succeeded, 1 = first error stops execution.
-fn run_exec_mode(db: &DynaMite, commands: &[String], json_mode: bool) -> i32 {
+fn run_exec_mode(db: &DynamiteDB, commands: &[String], json_mode: bool) -> i32 {
     let mode = if json_mode {
         OutputMode::Json
     } else {
@@ -92,7 +92,7 @@ fn run_exec_mode(db: &DynaMite, commands: &[String], json_mode: bool) -> i32 {
 /// Read commands from stdin (pipe mode).
 ///
 /// Returns exit code: 0 = all succeeded, 1 = first error.
-fn run_pipe_mode(db: &DynaMite, json_mode: bool) -> i32 {
+fn run_pipe_mode(db: &DynamiteDB, json_mode: bool) -> i32 {
     let mode = if json_mode {
         OutputMode::Json
     } else {
@@ -139,8 +139,8 @@ fn run_pipe_mode(db: &DynaMite, json_mode: bool) -> i32 {
 }
 
 /// Interactive REPL mode (unchanged behavior).
-fn run_repl(db: &DynaMite) {
-    println!("DynaMite Console v0.1.0");
+fn run_repl(db: &DynamiteDB) {
+    println!("DynamiteDB Console v0.1.0");
     println!("Type HELP for available commands.\n");
 
     let mut rl = DefaultEditor::new().expect("failed to initialize line editor");
@@ -261,7 +261,7 @@ mod tests {
     fn test_exec_list_tables_empty() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let db = DynaMite::create(db_path.to_str().unwrap()).unwrap();
+        let db = DynamiteDB::create(db_path.to_str().unwrap()).unwrap();
 
         let code = run_exec_mode(&db, &["LIST TABLES".to_string()], false);
         assert_eq!(code, 0);
@@ -271,7 +271,7 @@ mod tests {
     fn test_exec_json_output() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let db = DynaMite::create(db_path.to_str().unwrap()).unwrap();
+        let db = DynamiteDB::create(db_path.to_str().unwrap()).unwrap();
 
         let code = run_exec_mode(&db, &["LIST TABLES".to_string()], true);
         assert_eq!(code, 0);
@@ -281,7 +281,7 @@ mod tests {
     fn test_exec_error_returns_1() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let db = DynaMite::create(db_path.to_str().unwrap()).unwrap();
+        let db = DynamiteDB::create(db_path.to_str().unwrap()).unwrap();
 
         let code = run_exec_mode(&db, &["SCAN nonexistent".to_string()], false);
         assert_eq!(code, 1);
@@ -291,7 +291,7 @@ mod tests {
     fn test_exec_multiple_commands() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let db = DynaMite::create(db_path.to_str().unwrap()).unwrap();
+        let db = DynamiteDB::create(db_path.to_str().unwrap()).unwrap();
 
         let code = run_exec_mode(
             &db,
@@ -308,7 +308,7 @@ mod tests {
     fn test_exec_error_stops_early() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let db = DynaMite::create(db_path.to_str().unwrap()).unwrap();
+        let db = DynamiteDB::create(db_path.to_str().unwrap()).unwrap();
 
         let code = run_exec_mode(
             &db,
@@ -322,7 +322,7 @@ mod tests {
     fn test_exec_parse_error_returns_1() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let db = DynaMite::create(db_path.to_str().unwrap()).unwrap();
+        let db = DynamiteDB::create(db_path.to_str().unwrap()).unwrap();
 
         let code = run_exec_mode(&db, &["INVALID GIBBERISH".to_string()], false);
         assert_eq!(code, 1);
@@ -332,7 +332,7 @@ mod tests {
     fn test_exec_json_error_returns_1() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let db = DynaMite::create(db_path.to_str().unwrap()).unwrap();
+        let db = DynamiteDB::create(db_path.to_str().unwrap()).unwrap();
 
         let code = run_exec_mode(&db, &["SCAN nonexistent".to_string()], true);
         assert_eq!(code, 1);
