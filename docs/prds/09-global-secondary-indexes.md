@@ -2,7 +2,7 @@
 
 **Priority:** 9
 **Status:** Approved
-**Proposal:** [docs/proposals/global-secondary-indexes.md](../proposals/global-secondary-indexes.md)
+**Proposal:** [docs/proposals/accepted/global-secondary-indexes.md](../proposals/accepted/global-secondary-indexes.md)
 
 ## Summary
 

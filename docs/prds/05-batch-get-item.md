@@ -2,7 +2,7 @@
 
 **Priority:** 5
 **Status:** Approved
-**Proposal:** [docs/proposals/batch-get-item.md](../proposals/batch-get-item.md)
+**Proposal:** [docs/proposals/accepted/batch-get-item.md](../proposals/accepted/batch-get-item.md)
 
 ## Summary
 

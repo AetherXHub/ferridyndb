@@ -2,7 +2,7 @@
 
 **Priority:** 4
 **Status:** Approved
-**Proposal:** [docs/proposals/index-query-pagination.md](../proposals/index-query-pagination.md)
+**Proposal:** [docs/proposals/accepted/index-query-pagination.md](../proposals/accepted/index-query-pagination.md)
 
 ## Summary
 

@@ -2,7 +2,7 @@
 
 **Priority:** 3
 **Status:** Approved
-**Proposal:** [docs/proposals/condition-expressions.md](../proposals/condition-expressions.md)
+**Proposal:** [docs/proposals/accepted/condition-expressions.md](../proposals/accepted/condition-expressions.md)
 
 ## Summary
 

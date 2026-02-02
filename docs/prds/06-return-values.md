@@ -2,7 +2,7 @@
 
 **Priority:** 6
 **Status:** Approved
-**Proposal:** [docs/proposals/return-values.md](../proposals/return-values.md)
+**Proposal:** [docs/proposals/accepted/return-values.md](../proposals/accepted/return-values.md)
 
 ## Summary
 

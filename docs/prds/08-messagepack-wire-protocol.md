@@ -2,7 +2,7 @@
 
 **Priority:** 8
 **Status:** Approved
-**Proposal:** [docs/proposals/messagepack-wire-protocol.md](../proposals/messagepack-wire-protocol.md)
+**Proposal:** [docs/proposals/accepted/messagepack-wire-protocol.md](../proposals/accepted/messagepack-wire-protocol.md)
 
 ## Summary
 

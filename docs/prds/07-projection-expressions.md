@@ -2,7 +2,7 @@
 
 **Priority:** 7
 **Status:** Approved
-**Proposal:** [docs/proposals/projection-expressions.md](../proposals/projection-expressions.md)
+**Proposal:** [docs/proposals/accepted/projection-expressions.md](../proposals/accepted/projection-expressions.md)
 
 ## Summary
 

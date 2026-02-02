@@ -2,7 +2,7 @@
 
 **Priority:** 2
 **Status:** Approved
-**Proposal:** [docs/proposals/filter-expressions.md](../proposals/filter-expressions.md)
+**Proposal:** [docs/proposals/accepted/filter-expressions.md](../proposals/accepted/filter-expressions.md)
 
 ## Summary
 

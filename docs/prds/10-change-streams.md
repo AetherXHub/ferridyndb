@@ -2,7 +2,7 @@
 
 **Priority:** 10
 **Status:** Approved
-**Proposal:** [docs/proposals/change-streams.md](../proposals/change-streams.md)
+**Proposal:** [docs/proposals/accepted/change-streams.md](../proposals/accepted/change-streams.md)
 
 ## Summary
 

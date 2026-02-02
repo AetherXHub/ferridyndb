@@ -2,7 +2,7 @@
 
 **Priority:** 1
 **Status:** Approved
-**Proposal:** [docs/proposals/update-item.md](../proposals/update-item.md)
+**Proposal:** [docs/proposals/accepted/update-item.md](../proposals/accepted/update-item.md)
 
 ## Summary
 
