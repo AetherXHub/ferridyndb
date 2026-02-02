@@ -1,4 +1,4 @@
-use ferridyn_core::types::KeyType;
+use ferridyn_core::types::{AttrType, KeyType};
 use serde_json::Value;
 
 /// A parsed console command.
@@ -51,6 +51,49 @@ pub enum Command {
         table: String,
         pk: Value,
         limit: Option<usize>,
+    },
+    CreateSchema {
+        table: String,
+        prefix: String,
+        description: Option<String>,
+        attributes: Vec<(String, AttrType, bool)>, // (name, type, required)
+        validate: bool,
+    },
+    DropSchema {
+        table: String,
+        prefix: String,
+    },
+    ListSchemas {
+        table: String,
+    },
+    DescribeSchema {
+        table: String,
+        prefix: String,
+    },
+    CreateIndex {
+        table: String,
+        name: String,
+        schema_prefix: String,
+        key_attr: String,
+        key_type: KeyType,
+    },
+    DropIndex {
+        table: String,
+        name: String,
+    },
+    ListIndexes {
+        table: String,
+    },
+    DescribeIndex {
+        table: String,
+        name: String,
+    },
+    QueryIndex {
+        table: String,
+        index_name: String,
+        key_value: Value,
+        limit: Option<usize>,
+        desc: bool,
     },
     Help(Option<String>),
     Exit,

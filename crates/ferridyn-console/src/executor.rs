@@ -1,6 +1,6 @@
 use ferridyn_core::api::{FerridynDB, QueryResult};
 use ferridyn_core::error::Error;
-use ferridyn_core::types::TableSchema;
+use ferridyn_core::types::{IndexDefinition, PartitionSchema, TableSchema};
 use serde_json::Value;
 
 use crate::commands::{Command, SortClause};
@@ -21,6 +21,14 @@ pub enum CommandResult {
     PartitionKeys(Vec<Value>),
     /// Distinct sort key prefixes (LIST PREFIXES).
     SortKeyPrefixes(Vec<Value>),
+    /// Partition schema list (LIST SCHEMAS).
+    SchemaList(Vec<PartitionSchema>),
+    /// Partition schema detail (DESCRIBE SCHEMA).
+    SchemaDetail(PartitionSchema),
+    /// Index list (LIST INDEXES).
+    IndexList(Vec<IndexDefinition>),
+    /// Index detail (DESCRIBE INDEX).
+    IndexDetail(IndexDefinition),
     /// Help text (optional topic for per-command help).
     Help(Option<String>),
     /// Exit signal.
@@ -53,6 +61,33 @@ pub fn execute(db: &FerridynDB, cmd: Command) -> Result<CommandResult, Error> {
         Command::Scan { table, limit } => exec_scan(db, &table, limit),
         Command::ListKeys { table, limit } => exec_list_keys(db, &table, limit),
         Command::ListPrefixes { table, pk, limit } => exec_list_prefixes(db, &table, pk, limit),
+        Command::CreateSchema {
+            table,
+            prefix,
+            description,
+            attributes,
+            validate,
+        } => exec_create_schema(db, &table, &prefix, description, attributes, validate),
+        Command::DropSchema { table, prefix } => exec_drop_schema(db, &table, &prefix),
+        Command::ListSchemas { table } => exec_list_schemas(db, &table),
+        Command::DescribeSchema { table, prefix } => exec_describe_schema(db, &table, &prefix),
+        Command::CreateIndex {
+            table,
+            name,
+            schema_prefix,
+            key_attr,
+            key_type,
+        } => exec_create_index(db, &table, &name, &schema_prefix, &key_attr, key_type),
+        Command::DropIndex { table, name } => exec_drop_index(db, &table, &name),
+        Command::ListIndexes { table } => exec_list_indexes(db, &table),
+        Command::DescribeIndex { table, name } => exec_describe_index(db, &table, &name),
+        Command::QueryIndex {
+            table,
+            index_name,
+            key_value,
+            limit,
+            desc,
+        } => exec_query_index(db, &table, &index_name, key_value, limit, desc),
         Command::Help(topic) => Ok(CommandResult::Help(topic)),
         Command::Exit => Ok(CommandResult::Exit),
     }
@@ -193,4 +228,101 @@ fn exec_list_prefixes(
     }
     let prefixes = builder.execute()?;
     Ok(CommandResult::SortKeyPrefixes(prefixes))
+}
+
+fn exec_create_schema(
+    db: &FerridynDB,
+    table: &str,
+    prefix: &str,
+    description: Option<String>,
+    attributes: Vec<(String, ferridyn_core::types::AttrType, bool)>,
+    validate: bool,
+) -> Result<CommandResult, Error> {
+    let mut builder = db.create_partition_schema(table).prefix(prefix);
+    if let Some(desc) = description {
+        builder = builder.description(&desc);
+    }
+    for (name, attr_type, required) in attributes {
+        builder = builder.attribute(&name, attr_type, required);
+    }
+    if validate {
+        builder = builder.validate(true);
+    }
+    builder.execute()?;
+    Ok(CommandResult::Ok(format!(
+        "Partition schema '{prefix}' created on table '{table}'."
+    )))
+}
+
+fn exec_drop_schema(db: &FerridynDB, table: &str, prefix: &str) -> Result<CommandResult, Error> {
+    db.drop_partition_schema(table, prefix)?;
+    Ok(CommandResult::Ok(format!(
+        "Partition schema '{prefix}' dropped."
+    )))
+}
+
+fn exec_list_schemas(db: &FerridynDB, table: &str) -> Result<CommandResult, Error> {
+    let schemas = db.list_partition_schemas(table)?;
+    Ok(CommandResult::SchemaList(schemas))
+}
+
+fn exec_describe_schema(
+    db: &FerridynDB,
+    table: &str,
+    prefix: &str,
+) -> Result<CommandResult, Error> {
+    let schema = db.describe_partition_schema(table, prefix)?;
+    Ok(CommandResult::SchemaDetail(schema))
+}
+
+fn exec_create_index(
+    db: &FerridynDB,
+    table: &str,
+    name: &str,
+    schema_prefix: &str,
+    key_attr: &str,
+    key_type: ferridyn_core::types::KeyType,
+) -> Result<CommandResult, Error> {
+    db.create_index(table)
+        .name(name)
+        .partition_schema(schema_prefix)
+        .index_key(key_attr, key_type)
+        .execute()?;
+    Ok(CommandResult::Ok(format!(
+        "Index '{name}' created on table '{table}'."
+    )))
+}
+
+fn exec_drop_index(db: &FerridynDB, table: &str, name: &str) -> Result<CommandResult, Error> {
+    db.drop_index(table, name)?;
+    Ok(CommandResult::Ok(format!("Index '{name}' dropped.")))
+}
+
+fn exec_list_indexes(db: &FerridynDB, table: &str) -> Result<CommandResult, Error> {
+    let indexes = db.list_indexes(table)?;
+    Ok(CommandResult::IndexList(indexes))
+}
+
+fn exec_describe_index(db: &FerridynDB, table: &str, name: &str) -> Result<CommandResult, Error> {
+    let index = db.describe_index(table, name)?;
+    Ok(CommandResult::IndexDetail(index))
+}
+
+fn exec_query_index(
+    db: &FerridynDB,
+    table: &str,
+    index_name: &str,
+    key_value: Value,
+    limit: Option<usize>,
+    desc: bool,
+) -> Result<CommandResult, Error> {
+    let mut builder = db.query_index(table, index_name).key_value(key_value);
+    if let Some(n) = limit {
+        builder = builder.limit(n);
+    }
+    if desc {
+        builder = builder.scan_forward(false);
+    }
+    let result = builder.execute()?;
+    Ok(CommandResult::QueryResult(result))
 }

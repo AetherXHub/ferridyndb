@@ -1,5 +1,5 @@
 use ferridyn_core::api::QueryResult;
-use ferridyn_core::types::{KeyType, TableSchema};
+use ferridyn_core::types::{IndexDefinition, KeyType, PartitionSchema, TableSchema};
 use serde_json::{Value, json};
 
 use crate::executor::CommandResult;
@@ -76,6 +76,80 @@ pub fn render(result: &CommandResult, mode: &OutputMode) -> bool {
                         },
                         "sort_key": sk,
                         "ttl_attribute": schema.ttl_attribute,
+                    })
+                );
+            }
+        },
+        CommandResult::SchemaList(schemas) => match mode {
+            OutputMode::Pretty => print_schema_list(schemas),
+            OutputMode::Json => {
+                let items: Vec<Value> = schemas
+                    .iter()
+                    .map(|s| {
+                        json!({
+                            "prefix": s.prefix,
+                            "description": s.description,
+                            "attributes": s.attributes.iter().map(|a| json!({
+                                "name": a.name,
+                                "type": format!("{:?}", a.attr_type),
+                                "required": a.required,
+                            })).collect::<Vec<_>>(),
+                            "validate": s.validate,
+                        })
+                    })
+                    .collect();
+                println!("{}", json!({"partition_schemas": items}));
+            }
+        },
+        CommandResult::SchemaDetail(schema) => match mode {
+            OutputMode::Pretty => print_schema_detail(schema),
+            OutputMode::Json => {
+                println!(
+                    "{}",
+                    json!({
+                        "prefix": schema.prefix,
+                        "description": schema.description,
+                        "attributes": schema.attributes.iter().map(|a| json!({
+                            "name": a.name,
+                            "type": format!("{:?}", a.attr_type),
+                            "required": a.required,
+                        })).collect::<Vec<Value>>(),
+                        "validate": schema.validate,
+                    })
+                );
+            }
+        },
+        CommandResult::IndexList(indexes) => match mode {
+            OutputMode::Pretty => print_index_list(indexes),
+            OutputMode::Json => {
+                let items: Vec<Value> = indexes
+                    .iter()
+                    .map(|idx| {
+                        json!({
+                            "name": idx.name,
+                            "partition_schema": idx.partition_schema,
+                            "index_key": {
+                                "name": idx.index_key.name,
+                                "type": format_key_type(idx.index_key.key_type),
+                            },
+                        })
+                    })
+                    .collect();
+                println!("{}", json!({"indexes": items}));
+            }
+        },
+        CommandResult::IndexDetail(index) => match mode {
+            OutputMode::Pretty => print_index_detail(index),
+            OutputMode::Json => {
+                println!(
+                    "{}",
+                    json!({
+                        "name": index.name,
+                        "partition_schema": index.partition_schema,
+                        "index_key": {
+                            "name": index.index_key.name,
+                            "type": format_key_type(index.index_key.key_type),
+                        },
                     })
                 );
             }
@@ -195,6 +269,63 @@ pub fn print_sort_key_prefixes(prefixes: &[Value]) {
     }
 }
 
+/// Print a list of partition schemas.
+fn print_schema_list(schemas: &[PartitionSchema]) {
+    if schemas.is_empty() {
+        println!("No partition schemas.");
+    } else {
+        for s in schemas {
+            println!("  {} \u{2014} {}", s.prefix, s.description);
+        }
+        println!("({} schema(s))", schemas.len());
+    }
+}
+
+/// Print details of a single partition schema.
+fn print_schema_detail(schema: &PartitionSchema) {
+    println!("Partition schema: {}", schema.prefix);
+    println!("  Description: {}", schema.description);
+    println!("  Validate:    {}", schema.validate);
+    if schema.attributes.is_empty() {
+        println!("  Attributes:  (none)");
+    } else {
+        println!("  Attributes:");
+        for attr in &schema.attributes {
+            let req = if attr.required { " (required)" } else { "" };
+            println!("    {} {:?}{}", attr.name, attr.attr_type, req);
+        }
+    }
+}
+
+/// Print a list of secondary indexes.
+fn print_index_list(indexes: &[IndexDefinition]) {
+    if indexes.is_empty() {
+        println!("No indexes.");
+    } else {
+        for idx in indexes {
+            println!(
+                "  {} \u{2014} schema: {}, key: {} ({})",
+                idx.name,
+                idx.partition_schema,
+                idx.index_key.name,
+                format_key_type(idx.index_key.key_type)
+            );
+        }
+        println!("({} index(es))", indexes.len());
+    }
+}
+
+/// Print details of a single secondary index.
+fn print_index_detail(index: &IndexDefinition) {
+    println!("Index: {}", index.name);
+    println!("  Partition schema: {}", index.partition_schema);
+    println!(
+        "  Index key:        {} ({})",
+        index.index_key.name,
+        format_key_type(index.index_key.key_type)
+    );
+}
+
 /// Print a success message.
 pub fn print_ok(msg: &str) {
     println!("{msg}");
@@ -221,12 +352,21 @@ struct CommandHelp {
 /// First element is the canonical short form; extra elements are aliases.
 fn topic_keys(cmd: &CommandHelp) -> Vec<&'static str> {
     match cmd.name {
-        "CREATE TABLE" => vec!["create table", "create"],
-        "DROP TABLE" => vec!["drop table", "drop"],
+        "CREATE TABLE" => vec!["create table"],
+        "DROP TABLE" => vec!["drop table"],
         "LIST TABLES" => vec!["list tables", "list"],
         "LIST KEYS" => vec!["list keys"],
         "LIST PREFIXES" => vec!["list prefixes"],
-        "DESCRIBE TABLE" => vec!["describe table", "describe"],
+        "DESCRIBE TABLE" => vec!["describe table"],
+        "CREATE SCHEMA" => vec!["create schema"],
+        "DROP SCHEMA" => vec!["drop schema"],
+        "LIST SCHEMAS" => vec!["list schemas"],
+        "DESCRIBE SCHEMA" => vec!["describe schema"],
+        "CREATE INDEX" => vec!["create index"],
+        "DROP INDEX" => vec!["drop index"],
+        "LIST INDEXES" => vec!["list indexes"],
+        "DESCRIBE INDEX" => vec!["describe index"],
+        "QUERY INDEX" => vec!["query index"],
         "PUT" => vec!["put"],
         "GET" => vec!["get"],
         "DELETE" => vec!["delete"],
@@ -281,6 +421,81 @@ a missing/non-numeric attribute means the item never expires.",
         syntax: "DESCRIBE TABLE <name>",
         details: "Displays the partition key and sort key (if any) with their types.",
         examples: &["DESCRIBE TABLE users", "DESCRIBE TABLE events"],
+    },
+    // -- Partition Schema Management --
+    CommandHelp {
+        name: "CREATE SCHEMA",
+        summary: "Declare a partition schema on a table",
+        syntax: "CREATE SCHEMA <table> PREFIX <prefix> [DESCRIPTION \"text\"] [ATTR <name> <STRING|NUMBER|BOOLEAN> [REQUIRED]]... [VALIDATE]",
+        details: "Defines entity metadata for a partition key prefix. Attributes declare expected fields with types. VALIDATE enables write-time validation.",
+        examples: &[
+            "CREATE SCHEMA data PREFIX CONTACT",
+            "CREATE SCHEMA data PREFIX CONTACT DESCRIPTION \"People\" ATTR email STRING REQUIRED ATTR age NUMBER VALIDATE",
+        ],
+    },
+    CommandHelp {
+        name: "DROP SCHEMA",
+        summary: "Remove a partition schema from a table",
+        syntax: "DROP SCHEMA <table> <prefix>",
+        details: "Fails if any indexes reference the partition schema. Drop indexes first.",
+        examples: &["DROP SCHEMA data CONTACT"],
+    },
+    CommandHelp {
+        name: "LIST SCHEMAS",
+        summary: "List partition schemas for a table",
+        syntax: "LIST SCHEMAS <table>",
+        details: "Shows all declared partition schemas with their prefixes and descriptions.",
+        examples: &["LIST SCHEMAS data"],
+    },
+    CommandHelp {
+        name: "DESCRIBE SCHEMA",
+        summary: "Show details of a partition schema",
+        syntax: "DESCRIBE SCHEMA <table> <prefix>",
+        details: "Displays the schema's attributes, types, required flags, and validation setting.",
+        examples: &["DESCRIBE SCHEMA data CONTACT"],
+    },
+    // -- Index Management --
+    CommandHelp {
+        name: "CREATE INDEX",
+        summary: "Create a secondary index on a table",
+        syntax: "CREATE INDEX <table> <name> SCHEMA <prefix> KEY <attr> <STRING|NUMBER|BINARY>",
+        details: "Creates an index scoped to a partition schema. Existing data matching the prefix is backfilled synchronously.",
+        examples: &[
+            "CREATE INDEX data email-idx SCHEMA CONTACT KEY email STRING",
+            "CREATE INDEX data price-idx SCHEMA PRODUCT KEY price NUMBER",
+        ],
+    },
+    CommandHelp {
+        name: "DROP INDEX",
+        summary: "Remove a secondary index from a table",
+        syntax: "DROP INDEX <table> <name>",
+        details: "Removes the index definition. Index B+Tree pages are not reclaimed in v1.",
+        examples: &["DROP INDEX data email-idx"],
+    },
+    CommandHelp {
+        name: "LIST INDEXES",
+        summary: "List secondary indexes for a table",
+        syntax: "LIST INDEXES <table>",
+        details: "Shows all indexes with their names, schemas, and key attributes.",
+        examples: &["LIST INDEXES data"],
+    },
+    CommandHelp {
+        name: "DESCRIBE INDEX",
+        summary: "Show details of a secondary index",
+        syntax: "DESCRIBE INDEX <table> <name>",
+        details: "Displays the index's partition schema, key attribute, and key type.",
+        examples: &["DESCRIBE INDEX data email-idx"],
+    },
+    CommandHelp {
+        name: "QUERY INDEX",
+        summary: "Find items by secondary index value",
+        syntax: "QUERY INDEX <table> <index_name> key=<value> [LIMIT <n>] [DESC]",
+        details: "Looks up documents by an indexed attribute value. Returns full documents from the primary table. Expired (TTL) documents are filtered out.",
+        examples: &[
+            "QUERY INDEX data email-idx key=\"alice@example.com\"",
+            "QUERY INDEX data email-idx key=\"alice@example.com\" LIMIT 5",
+            "QUERY INDEX data status-idx key=active DESC",
+        ],
     },
     CommandHelp {
         name: "LIST KEYS",
@@ -420,6 +635,12 @@ fn print_help_overview() {
     println!("    LIST PREFIXES  List distinct sort key prefixes for a partition key");
     println!("    DESCRIBE TABLE Show a table's key schema");
     println!();
+    println!("  Partition Schemas");
+    println!("    CREATE SCHEMA  Declare a partition schema on a table");
+    println!("    DROP SCHEMA    Remove a partition schema from a table");
+    println!("    LIST SCHEMAS   List partition schemas for a table");
+    println!("    DESCRIBE SCHEMA Show details of a partition schema");
+    println!();
     println!("  Data Operations");
     println!("    PUT            Insert or replace an item");
     println!("    GET            Retrieve a single item by key");
@@ -428,6 +649,13 @@ fn print_help_overview() {
     println!("  Query & Scan");
     println!("    QUERY          Find items by partition key with optional sort key filters");
     println!("    SCAN           Read all items in a table");
+    println!();
+    println!("  Secondary Indexes");
+    println!("    CREATE INDEX   Create a secondary index on a table");
+    println!("    DROP INDEX     Remove a secondary index from a table");
+    println!("    LIST INDEXES   List secondary indexes for a table");
+    println!("    DESCRIBE INDEX Show details of a secondary index");
+    println!("    QUERY INDEX    Find items by secondary index value");
     println!();
     println!("  Other");
     println!("    HELP [command] Show this overview, or detailed help for a command");
