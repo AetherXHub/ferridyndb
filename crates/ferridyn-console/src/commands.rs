@@ -110,6 +110,12 @@ pub enum Command {
         limit: Option<usize>,
         desc: bool,
     },
+    Update {
+        table: String,
+        pk: Value,
+        sk: Option<Value>,
+        actions: Vec<UpdateActionCmd>,
+    },
     Use {
         table: Option<String>, // None = clear
     },
@@ -127,4 +133,13 @@ pub enum SortClause {
     Ge(Value),
     Between(Value, Value),
     BeginsWith(String),
+}
+
+/// An update action from the console UPDATE command.
+#[derive(Debug)]
+pub enum UpdateActionCmd {
+    Set(String, Value),
+    Remove(String),
+    Add(String, Value),
+    Delete(String, Value),
 }

@@ -120,6 +120,9 @@ pub enum SchemaError {
 
     #[error("cannot update key attribute: {0}")]
     KeyAttributeUpdate(String),
+
+    #[error("type mismatch for update action on '{attribute}': {message}")]
+    UpdateTypeMismatch { attribute: String, message: String },
 }
 
 #[derive(Debug, Error)]

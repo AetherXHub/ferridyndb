@@ -75,6 +75,14 @@ pub struct AttributeDefInput {
     pub required: bool,
 }
 
+/// Input for an update action sent to the server.
+#[derive(Debug, Clone)]
+pub struct UpdateActionInput {
+    pub action: String,
+    pub path: String,
+    pub value: Option<Value>,
+}
+
 /// Client for a FerridynDB server.
 pub struct FerridynClient {
     reader: BufReader<OwnedReadHalf>,
@@ -171,6 +179,40 @@ impl FerridynClient {
             "table": table,
             "partition_key": partition_key,
             "sort_key": sort_key,
+        });
+        let resp = self.send_request(&req).await?;
+        check_ok(&resp)
+    }
+
+    /// Update an item with a set of update actions.
+    pub async fn update_item(
+        &mut self,
+        table: &str,
+        partition_key: Value,
+        sort_key: Option<Value>,
+        updates: &[UpdateActionInput],
+    ) -> Result<()> {
+        let updates_json: Vec<Value> = updates
+            .iter()
+            .map(|u| {
+                let mut obj = serde_json::json!({
+                    "action": u.action,
+                    "path": u.path,
+                });
+                if let Some(v) = &u.value {
+                    obj.as_object_mut()
+                        .unwrap()
+                        .insert("value".to_string(), v.clone());
+                }
+                obj
+            })
+            .collect();
+        let req = serde_json::json!({
+            "op": "update_item",
+            "table": table,
+            "partition_key": partition_key,
+            "sort_key": sort_key,
+            "updates": updates_json,
         });
         let resp = self.send_request(&req).await?;
         check_ok(&resp)

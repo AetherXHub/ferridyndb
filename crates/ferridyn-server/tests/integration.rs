@@ -5,7 +5,7 @@ use tempfile::tempdir;
 use tokio::time::{Duration, sleep};
 
 use ferridyn_core::api::FerridynDB;
-use ferridyn_server::client::{AttributeDefInput, FerridynClient};
+use ferridyn_server::client::{AttributeDefInput, FerridynClient, UpdateActionInput};
 use ferridyn_server::protocol::KeyDef;
 use ferridyn_server::server::FerridynServer;
 
@@ -400,6 +400,171 @@ async fn test_error_table_already_exists() {
         )
         .await;
     assert!(result.is_err());
+}
+
+// ---------------------------------------------------------------------------
+// UpdateItem tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_update_item_server_round_trip() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    client
+        .create_table(
+            "users",
+            KeyDef {
+                name: "id".to_string(),
+                key_type: "String".to_string(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Put initial item.
+    client
+        .put_item("users", json!({"id": "alice", "name": "Alice", "age": 25}))
+        .await
+        .unwrap();
+
+    // Update: SET email, REMOVE age.
+    client
+        .update_item(
+            "users",
+            json!("alice"),
+            None,
+            &[
+                UpdateActionInput {
+                    action: "set".to_string(),
+                    path: "email".to_string(),
+                    value: Some(json!("alice@example.com")),
+                },
+                UpdateActionInput {
+                    action: "remove".to_string(),
+                    path: "age".to_string(),
+                    value: None,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+    // Verify the update.
+    let item = client
+        .get_item("users", json!("alice"), None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(item["name"], "Alice");
+    assert_eq!(item["email"], "alice@example.com");
+    assert!(item.get("age").is_none());
+}
+
+#[tokio::test]
+async fn test_update_item_upsert_via_server() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    client
+        .create_table(
+            "users",
+            KeyDef {
+                name: "id".to_string(),
+                key_type: "String".to_string(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Update non-existent item — should upsert.
+    client
+        .update_item(
+            "users",
+            json!("bob"),
+            None,
+            &[UpdateActionInput {
+                action: "set".to_string(),
+                path: "name".to_string(),
+                value: Some(json!("Bob")),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let item = client
+        .get_item("users", json!("bob"), None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(item["id"], "bob");
+    assert_eq!(item["name"], "Bob");
+}
+
+#[tokio::test]
+async fn test_update_item_add_and_delete_via_server() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    client
+        .create_table(
+            "counters",
+            KeyDef {
+                name: "id".to_string(),
+                key_type: "String".to_string(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Put initial item with a counter and tags.
+    client
+        .put_item(
+            "counters",
+            json!({"id": "item1", "count": 10, "tags": ["a", "b", "c"]}),
+        )
+        .await
+        .unwrap();
+
+    // ADD to counter, DELETE from tags.
+    client
+        .update_item(
+            "counters",
+            json!("item1"),
+            None,
+            &[
+                UpdateActionInput {
+                    action: "add".to_string(),
+                    path: "count".to_string(),
+                    value: Some(json!(5)),
+                },
+                UpdateActionInput {
+                    action: "delete".to_string(),
+                    path: "tags".to_string(),
+                    value: Some(json!(["b"])),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+    let item = client
+        .get_item("counters", json!("item1"), None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(item["count"].as_f64().unwrap(), 15.0);
+    let tags = item["tags"].as_array().unwrap();
+    assert_eq!(tags.len(), 2);
+    assert!(tags.contains(&json!("a")));
+    assert!(tags.contains(&json!("c")));
+    assert!(!tags.contains(&json!("b")));
 }
 
 // ---------------------------------------------------------------------------

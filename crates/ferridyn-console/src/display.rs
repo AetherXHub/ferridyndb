@@ -362,6 +362,7 @@ fn topic_keys(cmd: &CommandHelp) -> Vec<&'static str> {
         "PUT" => vec!["put"],
         "GET" => vec!["get"],
         "DELETE" => vec!["delete"],
+        "UPDATE" => vec!["update"],
         "QUERY" => vec!["query"],
         "SCAN" => vec!["scan"],
         "HELP" => vec!["help"],
@@ -550,6 +551,29 @@ Returns the full JSON document or \"Item not found.\"",
         details: "Deletes the item matching the given key(s). No error if the item does not exist.",
         examples: &["DELETE users pk=alice", "DELETE events pk=alice sk=1000"],
     },
+    CommandHelp {
+        name: "UPDATE",
+        summary: "Atomically modify attributes of an existing item (or upsert)",
+        syntax: "UPDATE <table> pk=<value> [sk=<value>] SET path=value [REMOVE path] [ADD path=value] [DELETE path=value]",
+        details: "\
+Actions (applied in order):
+  SET path=value          Set an attribute to a value
+  REMOVE path             Remove an attribute
+  ADD path=value          Numeric increment or array union
+  DELETE path=value       Array set difference (remove elements)
+
+Paths support dot-separated nesting (e.g., address.city).
+If the item does not exist, it is created (upsert).
+Updates to partition key or sort key attributes are rejected.",
+        examples: &[
+            "UPDATE users pk=alice SET name=\"Alice\"",
+            "UPDATE users pk=alice SET age=30 SET email=\"a@b.com\"",
+            "UPDATE users pk=alice SET address.city=NYC",
+            "UPDATE users pk=alice REMOVE old_field",
+            "UPDATE users pk=alice ADD login_count=1",
+            "UPDATE events pk=alice sk=1000 SET status=processed",
+        ],
+    },
     // -- Query & Scan --
     CommandHelp {
         name: "QUERY",
@@ -658,6 +682,7 @@ fn print_help_overview() {
     println!("    PUT            Insert or replace an item");
     println!("    GET            Retrieve a single item by key");
     println!("    DELETE         Remove an item by key");
+    println!("    UPDATE         Atomically modify attributes of an item");
     println!();
     println!("  Query & Scan");
     println!("    QUERY          Find items by partition key with optional sort key filters");

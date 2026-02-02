@@ -3450,4 +3450,153 @@ mod update_item_tests {
             "should mention missing email: {err_msg}"
         );
     }
+
+    #[test]
+    fn test_update_add_number() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+        db.put_item("items", json!({"pk": "a", "count": 10}))
+            .unwrap();
+
+        db.update_item("items")
+            .partition_key("a")
+            .add("count", 5)
+            .execute()
+            .unwrap();
+
+        let item = db
+            .get_item("items")
+            .partition_key("a")
+            .execute()
+            .unwrap()
+            .unwrap();
+        assert_eq!(item["count"], 15.0);
+    }
+
+    #[test]
+    fn test_update_add_number_init() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+        db.put_item("items", json!({"pk": "a"})).unwrap();
+
+        db.update_item("items")
+            .partition_key("a")
+            .add("count", 5)
+            .execute()
+            .unwrap();
+
+        let item = db
+            .get_item("items")
+            .partition_key("a")
+            .execute()
+            .unwrap()
+            .unwrap();
+        assert_eq!(item["count"], 5);
+    }
+
+    #[test]
+    fn test_update_add_set() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+        db.put_item("items", json!({"pk": "a", "tags": ["x", "y"]}))
+            .unwrap();
+
+        db.update_item("items")
+            .partition_key("a")
+            .add("tags", json!(["y", "z"]))
+            .execute()
+            .unwrap();
+
+        let item = db
+            .get_item("items")
+            .partition_key("a")
+            .execute()
+            .unwrap()
+            .unwrap();
+        let tags = item["tags"].as_array().unwrap();
+        assert_eq!(tags.len(), 3);
+        assert!(tags.contains(&json!("x")));
+        assert!(tags.contains(&json!("y")));
+        assert!(tags.contains(&json!("z")));
+    }
+
+    #[test]
+    fn test_update_delete_set() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+        db.put_item("items", json!({"pk": "a", "tags": ["x", "y", "z"]}))
+            .unwrap();
+
+        db.update_item("items")
+            .partition_key("a")
+            .delete("tags", json!(["y"]))
+            .execute()
+            .unwrap();
+
+        let item = db
+            .get_item("items")
+            .partition_key("a")
+            .execute()
+            .unwrap()
+            .unwrap();
+        assert_eq!(item["tags"], json!(["x", "z"]));
+    }
+
+    #[test]
+    fn test_update_delete_empty_set() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+        db.put_item("items", json!({"pk": "a", "tags": ["x"]}))
+            .unwrap();
+
+        db.update_item("items")
+            .partition_key("a")
+            .delete("tags", json!(["x"]))
+            .execute()
+            .unwrap();
+
+        let item = db
+            .get_item("items")
+            .partition_key("a")
+            .execute()
+            .unwrap()
+            .unwrap();
+        assert!(item.get("tags").is_none());
+    }
+
+    #[test]
+    fn test_update_add_type_error() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+        db.put_item("items", json!({"pk": "a", "name": "Alice"}))
+            .unwrap();
+
+        let result = db
+            .update_item("items")
+            .partition_key("a")
+            .add("name", 5)
+            .execute();
+
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("type mismatch"), "error: {msg}");
+    }
 }

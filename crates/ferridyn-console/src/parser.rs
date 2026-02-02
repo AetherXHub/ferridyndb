@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use crate::commands::{AttrType, Command, KeyType, SortClause};
+use crate::commands::{AttrType, Command, KeyType, SortClause, UpdateActionCmd};
 
 /// Tokenize an input line into a vector of string tokens.
 ///
@@ -62,6 +62,43 @@ fn tokenize(input: &str) -> Result<Vec<String>, String> {
             continue;
         }
 
+        // JSON array.
+        if chars[i] == '[' {
+            let start = i;
+            let mut depth = 0;
+            let mut in_string = false;
+            loop {
+                if i >= len {
+                    return Err("Unterminated JSON array".to_string());
+                }
+                let c = chars[i];
+                if in_string {
+                    if c == '\\' {
+                        i += 1;
+                    } else if c == '"' {
+                        in_string = false;
+                    }
+                } else {
+                    match c {
+                        '"' => in_string = true,
+                        '[' => depth += 1,
+                        ']' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                i += 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                i += 1;
+            }
+            let token: String = chars[start..i].iter().collect();
+            tokens.push(token);
+            continue;
+        }
+
         // Quoted string.
         if chars[i] == '"' {
             let start = i;
@@ -96,7 +133,7 @@ fn tokenize(input: &str) -> Result<Vec<String>, String> {
             continue;
         }
 
-        // Regular word token: everything up to whitespace, quote, brace, or angle bracket.
+        // Regular word token: everything up to whitespace, quote, brace, bracket, or angle bracket.
         // Special case: if the word ends with `=` and the next character is `"`,
         // consume the quoted string as part of this token (e.g., `pk="hello world"`).
         let start = i;
@@ -104,6 +141,7 @@ fn tokenize(input: &str) -> Result<Vec<String>, String> {
             && !chars[i].is_whitespace()
             && chars[i] != '"'
             && chars[i] != '{'
+            && chars[i] != '['
             && chars[i] != '<'
             && chars[i] != '>'
         {
@@ -230,6 +268,7 @@ pub fn parse(input: &str, default_table: Option<&str>) -> Result<Command, String
             }
         }
         "SCAN" => parse_scan(&tokens, default_table),
+        "UPDATE" => parse_update(&tokens, default_table),
         "HELP" => {
             let topic = if tokens.len() > 1 {
                 Some(tokens[1..].join(" "))
@@ -533,6 +572,128 @@ fn parse_delete(tokens: &[String], default_table: Option<&str>) -> Result<Comman
     };
 
     Ok(Command::Delete { table, pk, sk })
+}
+
+/// UPDATE [table] pk=<value> [sk=<value>] SET path=value ... REMOVE path ...
+///   ADD path=value ... DELETE path=value ...
+fn parse_update(tokens: &[String], default_table: Option<&str>) -> Result<Command, String> {
+    if tokens.len() < 3 {
+        return Err(
+            "Usage: UPDATE [table] pk=<value> [sk=<value>] SET path=value [REMOVE path] [ADD path=value] [DELETE path=value]  (Type HELP UPDATE for details)"
+                .to_string(),
+        );
+    }
+    // Detect: tokens[1] is table if it does NOT contain '='
+    let (table, offset) = if tokens[1].contains('=') {
+        (resolve_table(None, default_table)?, 1)
+    } else {
+        if tokens.len() < 4 {
+            return Err(
+                "Usage: UPDATE [table] pk=<value> [sk=<value>] SET path=value [REMOVE path] [ADD path=value] [DELETE path=value]  (Type HELP UPDATE for details)"
+                    .to_string(),
+            );
+        }
+        (tokens[1].clone(), 2)
+    };
+
+    let (key_name, pk) = parse_kv_pair(&tokens[offset])?;
+    if key_name.to_uppercase() != "PK" {
+        return Err(format!("Expected pk=<value>, got '{}'", tokens[offset]));
+    }
+
+    let mut sk = None;
+    let mut action_start = offset + 1;
+
+    // Check for optional sk=<value>
+    if action_start < tokens.len() && tokens[action_start].contains('=') {
+        let upper_prefix: String = tokens[action_start]
+            .chars()
+            .take_while(|c| *c != '=')
+            .collect();
+        if upper_prefix.to_uppercase() == "SK" {
+            let (_, sk_val) = parse_kv_pair(&tokens[action_start])?;
+            sk = Some(sk_val);
+            action_start += 1;
+        }
+    }
+
+    let mut actions = Vec::new();
+    let mut i = action_start;
+
+    while i < tokens.len() {
+        let upper = tokens[i].to_uppercase();
+        match upper.as_str() {
+            "SET" | "ADD" => {
+                let action_name = upper.clone();
+                i += 1;
+                if i >= tokens.len() {
+                    return Err(format!("{action_name} requires path=value"));
+                }
+                let (path, value) = if tokens[i].ends_with('=') && i + 1 < tokens.len() {
+                    // Value is in the next token (JSON body: {...} or [...])
+                    let path = &tokens[i][..tokens[i].len() - 1];
+                    i += 1;
+                    let val: serde_json::Value = serde_json::from_str(&tokens[i])
+                        .map_err(|e| format!("Invalid JSON value: {e}"))?;
+                    (path.to_string(), val)
+                } else {
+                    let (p, v) = parse_kv_pair(&tokens[i])?;
+                    (p.to_string(), v)
+                };
+                if action_name == "SET" {
+                    actions.push(UpdateActionCmd::Set(path, value));
+                } else {
+                    actions.push(UpdateActionCmd::Add(path, value));
+                }
+                i += 1;
+            }
+            "REMOVE" => {
+                i += 1;
+                if i >= tokens.len() {
+                    return Err("REMOVE requires a path".to_string());
+                }
+                actions.push(UpdateActionCmd::Remove(tokens[i].clone()));
+                i += 1;
+            }
+            "DELETE" => {
+                i += 1;
+                if i >= tokens.len() {
+                    return Err("DELETE requires path=value".to_string());
+                }
+                let (path, value) = if tokens[i].ends_with('=') && i + 1 < tokens.len() {
+                    let path = &tokens[i][..tokens[i].len() - 1];
+                    i += 1;
+                    let val: serde_json::Value = serde_json::from_str(&tokens[i])
+                        .map_err(|e| format!("Invalid JSON value: {e}"))?;
+                    (path.to_string(), val)
+                } else {
+                    let (p, v) = parse_kv_pair(&tokens[i])?;
+                    (p.to_string(), v)
+                };
+                actions.push(UpdateActionCmd::Delete(path, value));
+                i += 1;
+            }
+            _ => {
+                return Err(format!(
+                    "Unexpected token '{}' in UPDATE. Expected SET, REMOVE, ADD, or DELETE.",
+                    tokens[i]
+                ));
+            }
+        }
+    }
+
+    if actions.is_empty() {
+        return Err(
+            "UPDATE requires at least one action (SET, REMOVE, ADD, or DELETE)".to_string(),
+        );
+    }
+
+    Ok(Command::Update {
+        table,
+        pk,
+        sk,
+        actions,
+    })
 }
 
 /// QUERY [table] pk=<value> [SK <op> <value>] [BETWEEN <lo> AND <hi>]

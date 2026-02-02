@@ -33,6 +33,13 @@ pub enum Request {
         #[serde(default)]
         sort_key: Option<Value>,
     },
+    UpdateItem {
+        table: String,
+        partition_key: Value,
+        #[serde(default)]
+        sort_key: Option<Value>,
+        updates: Vec<UpdateActionWire>,
+    },
     Query {
         table: String,
         partition_key: Value,
@@ -148,6 +155,15 @@ pub struct KeyDef {
     pub name: String,
     #[serde(rename = "type")]
     pub key_type: String,
+}
+
+/// Update action in wire format.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UpdateActionWire {
+    pub action: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<Value>,
 }
 
 /// Attribute definition for partition schema (wire format).

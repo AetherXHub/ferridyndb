@@ -360,6 +360,31 @@ impl<'a> UpdateItemBuilder<'a> {
         self
     }
 
+    /// Add an ADD action: increment a number or union elements into an array.
+    ///
+    /// If the attribute doesn't exist, initializes it to `value`.
+    /// Returns a type error if the existing attribute is not a number or array.
+    pub fn add(mut self, path: &str, value: impl Into<Value>) -> Self {
+        self.actions.push(UpdateAction::Add {
+            path: path.to_string(),
+            value: value.into(),
+        });
+        self
+    }
+
+    /// Add a DELETE action: remove elements from an array (set difference).
+    ///
+    /// `value` must be an array of elements to remove. If the resulting array
+    /// is empty, the attribute is removed entirely. Silent no-op if the
+    /// attribute doesn't exist.
+    pub fn delete(mut self, path: &str, value: impl Into<Value>) -> Self {
+        self.actions.push(UpdateAction::Delete {
+            path: path.to_string(),
+            value: value.into(),
+        });
+        self
+    }
+
     /// Execute the update operation.
     pub fn execute(self) -> Result<(), Error> {
         let pk_val = self.partition_key.ok_or(QueryError::PartitionKeyRequired)?;

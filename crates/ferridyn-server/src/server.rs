@@ -16,7 +16,7 @@ use ferridyn_core::types::{AttrType, IndexDefinition, KeyType, PartitionSchema, 
 
 use crate::protocol::{
     AttributeDefWire, IndexDefWire, KeyDef, KeyDefWire, PartitionSchemaWire, Request, Response,
-    SortKeyCondition, TableSchemaWire,
+    SortKeyCondition, TableSchemaWire, UpdateActionWire,
 };
 
 /// A FerridynDB server listening on a Unix socket.
@@ -143,6 +143,13 @@ fn dispatch(db: &FerridynDB, req: Request) -> Response {
             partition_key,
             sort_key,
         } => handle_delete_item(db, &table, partition_key, sort_key),
+
+        Request::UpdateItem {
+            table,
+            partition_key,
+            sort_key,
+            updates,
+        } => handle_update_item(db, &table, partition_key, sort_key, updates),
 
         Request::Query {
             table,
@@ -290,6 +297,69 @@ fn handle_delete_item(
     let mut builder = db.delete_item(table).partition_key(partition_key);
     if let Some(sk) = sort_key {
         builder = builder.sort_key(sk);
+    }
+    match builder.execute() {
+        Ok(()) => Response::ok_empty(),
+        Err(e) => dyn_error_to_response(e),
+    }
+}
+
+fn handle_update_item(
+    db: &FerridynDB,
+    table: &str,
+    partition_key: serde_json::Value,
+    sort_key: Option<serde_json::Value>,
+    updates: Vec<UpdateActionWire>,
+) -> Response {
+    let mut builder = db.update_item(table).partition_key(partition_key);
+    if let Some(sk) = sort_key {
+        builder = builder.sort_key(sk);
+    }
+    for update in &updates {
+        match update.action.as_str() {
+            "set" => {
+                let value = match &update.value {
+                    Some(v) => v.clone(),
+                    None => {
+                        return Response::error(
+                            "InvalidUpdateAction",
+                            "SET requires a value".to_string(),
+                        );
+                    }
+                };
+                builder = builder.set(&update.path, value);
+            }
+            "remove" => {
+                builder = builder.remove(&update.path);
+            }
+            "add" => {
+                let value = match &update.value {
+                    Some(v) => v.clone(),
+                    None => {
+                        return Response::error(
+                            "InvalidUpdateAction",
+                            "ADD requires a value".to_string(),
+                        );
+                    }
+                };
+                builder = builder.add(&update.path, value);
+            }
+            "delete" => {
+                let value = match &update.value {
+                    Some(v) => v.clone(),
+                    None => {
+                        return Response::error(
+                            "InvalidUpdateAction",
+                            "DELETE requires a value".to_string(),
+                        );
+                    }
+                };
+                builder = builder.delete(&update.path, value);
+            }
+            other => {
+                return Response::error("InvalidUpdateAction", format!("unknown action: {other}"));
+            }
+        }
     }
     match builder.execute() {
         Ok(()) => Response::ok_empty(),

@@ -1,12 +1,13 @@
 use ferridyn_server::client::{
     AttributeDefInput, FerridynClient, IndexInfo, PartitionSchemaInfo, QueryResult, TableSchema,
+    UpdateActionInput,
 };
 use ferridyn_server::error::ClientError;
 use ferridyn_server::protocol::{KeyDef, SortKeyCondition};
 use serde_json::Value;
 use tokio::runtime::Runtime;
 
-use crate::commands::{AttrType, Command, KeyType, SortClause};
+use crate::commands::{AttrType, Command, KeyType, SortClause, UpdateActionCmd};
 
 /// Structured result from executing a command.
 pub enum CommandResult {
@@ -117,6 +118,12 @@ pub fn execute(
             limit,
             desc,
         } => exec_query_index(client, rt, &table, &index_name, key_value, limit, desc),
+        Command::Update {
+            table,
+            pk,
+            sk,
+            actions,
+        } => exec_update(client, rt, &table, pk, sk, actions),
         Command::Use { table } => Ok(CommandResult::Use(table)),
         Command::Help(topic) => Ok(CommandResult::Help(topic)),
         Command::Exit => Ok(CommandResult::Exit),
@@ -236,6 +243,43 @@ fn exec_delete(
     sk: Option<Value>,
 ) -> Result<CommandResult, ClientError> {
     rt.block_on(client.delete_item(table, pk, sk))?;
+    Ok(CommandResult::Ok("OK".to_string()))
+}
+
+fn exec_update(
+    client: &mut FerridynClient,
+    rt: &Runtime,
+    table: &str,
+    pk: Value,
+    sk: Option<Value>,
+    actions: Vec<UpdateActionCmd>,
+) -> Result<CommandResult, ClientError> {
+    let updates: Vec<UpdateActionInput> = actions
+        .into_iter()
+        .map(|a| match a {
+            UpdateActionCmd::Set(path, value) => UpdateActionInput {
+                action: "set".to_string(),
+                path,
+                value: Some(value),
+            },
+            UpdateActionCmd::Remove(path) => UpdateActionInput {
+                action: "remove".to_string(),
+                path,
+                value: None,
+            },
+            UpdateActionCmd::Add(path, value) => UpdateActionInput {
+                action: "add".to_string(),
+                path,
+                value: Some(value),
+            },
+            UpdateActionCmd::Delete(path, value) => UpdateActionInput {
+                action: "delete".to_string(),
+                path,
+                value: Some(value),
+            },
+        })
+        .collect();
+    rt.block_on(client.update_item(table, pk, sk, &updates))?;
     Ok(CommandResult::Ok("OK".to_string()))
 }
 
