@@ -212,6 +212,30 @@ ferridyn-console -j -e "SCAN users"
 echo "LIST TABLES" | ferridyn-console
 ```
 
+### Interactive session
+
+The `USE` command sets a default table for the session, so you don't have to repeat it on every command. The prompt updates to show the active table.
+
+```
+ferridyn> CREATE TABLE data PK pk STRING
+Table 'data' created.
+ferridyn> USE data
+Using table 'data'.
+ferridyn:data> PUT {"pk": "CONTACT#alice", "email": "alice@example.com", "name": "Alice"}
+OK
+ferridyn:data> GET pk=CONTACT#alice
+{ "pk": "CONTACT#alice", "email": "alice@example.com", "name": "Alice" }
+ferridyn:data> SCAN LIMIT 5
+...
+ferridyn:data> SCAN other_table LIMIT 10   ← explicit table overrides the default
+...
+ferridyn:data> USE                          ← clears the active table
+Cleared active table.
+ferridyn>
+```
+
+`USE` also works in non-interactive modes — the active table persists across `-e` flags and piped commands.
+
 The console supports table management, partition schemas, secondary indexes, and all query operations through a SQL-like command syntax. Type `HELP` in the REPL for a full command reference.
 
 Because the console and server are separate processes, multiple clients (console sessions, agents, MCP servers) can access the same database concurrently without file lock conflicts.
