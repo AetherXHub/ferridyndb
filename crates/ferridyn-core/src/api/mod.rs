@@ -7,12 +7,14 @@ pub mod key_utils;
 pub mod page_store;
 pub mod query;
 pub mod transaction;
+pub mod update;
 
 pub use batch::{BatchOp, SyncMode, WriteBatch};
 pub use builders::{
     CreateIndexBuilder, DeleteItemBuilder, GetItemBuilder, IndexQueryBuilder,
-    PartitionSchemaBuilder, QueryBuilder, ScanBuilder, TableBuilder,
+    PartitionSchemaBuilder, QueryBuilder, ScanBuilder, TableBuilder, UpdateItemBuilder,
 };
 pub use database::FerridynDB;
 pub use query::{QueryResult, SortCondition};
 pub use transaction::Transaction;
+pub use update::UpdateAction;

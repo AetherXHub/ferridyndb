@@ -22,7 +22,7 @@ use super::batch::{SyncMode, WriteBatch};
 use super::builders::{
     CreateIndexBuilder, DeleteItemBuilder, GetItemBuilder, GetItemVersionedBuilder,
     IndexQueryBuilder, ListPartitionKeysBuilder, ListSortKeyPrefixesBuilder,
-    PartitionSchemaBuilder, QueryBuilder, ScanBuilder, TableBuilder,
+    PartitionSchemaBuilder, QueryBuilder, ScanBuilder, TableBuilder, UpdateItemBuilder,
 };
 use super::page_store::{BufferedPageStore, FilePageStore};
 use super::transaction::Transaction;
@@ -203,6 +203,14 @@ impl FerridynDB {
     ) -> Result<(), Error> {
         let table = table.to_string();
         self.transact(move |txn| txn.put_item_conditional(&table, document, expected_version))
+    }
+
+    /// Partially update an item in a table.
+    ///
+    /// Returns a builder to specify the key and the SET/REMOVE actions.
+    /// If the item doesn't exist, an upsert creates it.
+    pub fn update_item(&self, table: &str) -> UpdateItemBuilder<'_> {
+        UpdateItemBuilder::new(self, table.to_string())
     }
 
     /// Delete an item from a table by key.
@@ -3029,5 +3037,417 @@ mod partition_schema_and_index_tests {
             .unwrap();
         assert_eq!(result.items.len(), 3);
         assert!(result.last_evaluated_key.is_none());
+    }
+}
+
+#[cfg(test)]
+mod update_item_tests {
+    use super::*;
+    use crate::types::{AttrType, KeyType};
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    fn create_test_db() -> (FerridynDB, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = FerridynDB::create(&db_path).unwrap();
+        (db, dir)
+    }
+
+    #[test]
+    fn test_update_set_top_level() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+        db.put_item("items", json!({"pk": "a", "name": "Alice"}))
+            .unwrap();
+
+        db.update_item("items")
+            .partition_key("a")
+            .set("age", 30)
+            .execute()
+            .unwrap();
+
+        let item = db
+            .get_item("items")
+            .partition_key("a")
+            .execute()
+            .unwrap()
+            .unwrap();
+        assert_eq!(item["name"], "Alice");
+        assert_eq!(item["age"], 30);
+    }
+
+    #[test]
+    fn test_update_set_overwrite() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+        db.put_item("items", json!({"pk": "a", "name": "Alice"}))
+            .unwrap();
+
+        db.update_item("items")
+            .partition_key("a")
+            .set("name", "Bob")
+            .execute()
+            .unwrap();
+
+        let item = db
+            .get_item("items")
+            .partition_key("a")
+            .execute()
+            .unwrap()
+            .unwrap();
+        assert_eq!(item["name"], "Bob");
+    }
+
+    #[test]
+    fn test_update_set_nested() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+        db.put_item("items", json!({"pk": "a"})).unwrap();
+
+        db.update_item("items")
+            .partition_key("a")
+            .set("address.city", "NYC")
+            .execute()
+            .unwrap();
+
+        let item = db
+            .get_item("items")
+            .partition_key("a")
+            .execute()
+            .unwrap()
+            .unwrap();
+        assert_eq!(item["address"]["city"], "NYC");
+    }
+
+    #[test]
+    fn test_update_set_create_intermediate() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+        db.put_item("items", json!({"pk": "a"})).unwrap();
+
+        db.update_item("items")
+            .partition_key("a")
+            .set("a.b.c", 42)
+            .execute()
+            .unwrap();
+
+        let item = db
+            .get_item("items")
+            .partition_key("a")
+            .execute()
+            .unwrap()
+            .unwrap();
+        assert_eq!(item["a"]["b"]["c"], 42);
+    }
+
+    #[test]
+    fn test_update_remove() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+        db.put_item("items", json!({"pk": "a", "name": "Alice", "age": 30}))
+            .unwrap();
+
+        db.update_item("items")
+            .partition_key("a")
+            .remove("age")
+            .execute()
+            .unwrap();
+
+        let item = db
+            .get_item("items")
+            .partition_key("a")
+            .execute()
+            .unwrap()
+            .unwrap();
+        assert_eq!(item["name"], "Alice");
+        assert!(item.get("age").is_none());
+    }
+
+    #[test]
+    fn test_update_remove_nonexistent() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+        db.put_item("items", json!({"pk": "a"})).unwrap();
+
+        // Removing a non-existent attribute should succeed silently.
+        db.update_item("items")
+            .partition_key("a")
+            .remove("missing")
+            .execute()
+            .unwrap();
+    }
+
+    #[test]
+    fn test_update_remove_nested() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+        db.put_item(
+            "items",
+            json!({"pk": "a", "address": {"city": "NYC", "zip": "10001"}}),
+        )
+        .unwrap();
+
+        db.update_item("items")
+            .partition_key("a")
+            .remove("address.city")
+            .execute()
+            .unwrap();
+
+        let item = db
+            .get_item("items")
+            .partition_key("a")
+            .execute()
+            .unwrap()
+            .unwrap();
+        assert!(item["address"].get("city").is_none());
+        assert_eq!(item["address"]["zip"], "10001");
+    }
+
+    #[test]
+    fn test_update_nonexistent_item() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        // No item exists — should upsert.
+        db.update_item("items")
+            .partition_key("a")
+            .set("name", "Alice")
+            .set("age", 30)
+            .execute()
+            .unwrap();
+
+        let item = db
+            .get_item("items")
+            .partition_key("a")
+            .execute()
+            .unwrap()
+            .unwrap();
+        assert_eq!(item["pk"], "a");
+        assert_eq!(item["name"], "Alice");
+        assert_eq!(item["age"], 30);
+    }
+
+    #[test]
+    fn test_update_upsert_with_sort_key() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", KeyType::String)
+            .sort_key("sk", KeyType::Number)
+            .execute()
+            .unwrap();
+
+        // Upsert with sort key.
+        db.update_item("items")
+            .partition_key("a")
+            .sort_key(1.0)
+            .set("data", "hello")
+            .execute()
+            .unwrap();
+
+        let item = db
+            .get_item("items")
+            .partition_key("a")
+            .sort_key(1.0)
+            .execute()
+            .unwrap()
+            .unwrap();
+        assert_eq!(item["pk"], "a");
+        assert_eq!(item["sk"], 1.0);
+        assert_eq!(item["data"], "hello");
+    }
+
+    #[test]
+    fn test_update_multiple_actions() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+        db.put_item("items", json!({"pk": "a", "x": 1, "y": 2}))
+            .unwrap();
+
+        db.update_item("items")
+            .partition_key("a")
+            .set("z", 3)
+            .remove("x")
+            .set("y", 99)
+            .execute()
+            .unwrap();
+
+        let item = db
+            .get_item("items")
+            .partition_key("a")
+            .execute()
+            .unwrap()
+            .unwrap();
+        assert!(item.get("x").is_none());
+        assert_eq!(item["y"], 99);
+        assert_eq!(item["z"], 3);
+    }
+
+    #[test]
+    fn test_update_rejects_key_attribute() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+        db.put_item("items", json!({"pk": "a"})).unwrap();
+
+        let result = db
+            .update_item("items")
+            .partition_key("a")
+            .set("pk", "b")
+            .execute();
+
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("key attribute"), "error: {err_msg}");
+    }
+
+    #[test]
+    fn test_update_rejects_sort_key_attribute() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", KeyType::String)
+            .sort_key("sk", KeyType::Number)
+            .execute()
+            .unwrap();
+        db.put_item("items", json!({"pk": "a", "sk": 1.0})).unwrap();
+
+        let result = db
+            .update_item("items")
+            .partition_key("a")
+            .sort_key(1.0)
+            .set("sk", 2.0)
+            .execute();
+
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("key attribute"), "error: {err_msg}");
+    }
+
+    #[test]
+    fn test_update_index_maintenance() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        // Set up partition schema and index.
+        db.create_partition_schema("data")
+            .prefix("CONTACT")
+            .description("People")
+            .execute()
+            .unwrap();
+        db.create_index("data")
+            .name("email-idx")
+            .partition_schema("CONTACT")
+            .index_key("email", KeyType::String)
+            .execute()
+            .unwrap();
+
+        // Insert a contact.
+        db.put_item(
+            "data",
+            json!({"pk": "CONTACT#alice", "email": "old@test.com"}),
+        )
+        .unwrap();
+
+        // Verify index query with old email.
+        let result = db
+            .query_index("data", "email-idx")
+            .key_value("old@test.com")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+
+        // Update email via update_item.
+        db.update_item("data")
+            .partition_key("CONTACT#alice")
+            .set("email", "new@test.com")
+            .execute()
+            .unwrap();
+
+        // Old email should no longer be in index.
+        let result = db
+            .query_index("data", "email-idx")
+            .key_value("old@test.com")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 0);
+
+        // New email should be in index.
+        let result = db
+            .query_index("data", "email-idx")
+            .key_value("new@test.com")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["email"], "new@test.com");
+    }
+
+    #[test]
+    fn test_update_partition_schema_validation() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_partition_schema("data")
+            .prefix("CONTACT")
+            .description("People")
+            .attribute("email", AttrType::String, true)
+            .validate(true)
+            .execute()
+            .unwrap();
+
+        // Insert a valid contact.
+        db.put_item(
+            "data",
+            json!({"pk": "CONTACT#alice", "email": "alice@test.com"}),
+        )
+        .unwrap();
+
+        // Update that removes the required attribute should fail validation.
+        let result = db
+            .update_item("data")
+            .partition_key("CONTACT#alice")
+            .remove("email")
+            .execute();
+
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("email"),
+            "should mention missing email: {err_msg}"
+        );
     }
 }

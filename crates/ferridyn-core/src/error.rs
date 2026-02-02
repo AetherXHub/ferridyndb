@@ -117,6 +117,9 @@ pub enum SchemaError {
 
     #[error("partition schemas require a String partition key")]
     PartitionSchemaRequiresStringKey,
+
+    #[error("cannot update key attribute: {0}")]
+    KeyAttributeUpdate(String),
 }
 
 #[derive(Debug, Error)]

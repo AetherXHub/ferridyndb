@@ -486,10 +486,7 @@ fn parse_get(tokens: &[String], default_table: Option<&str>) -> Result<Command, 
     let sk = if tokens.len() > offset + 1 {
         let (sk_key, sk_val) = parse_kv_pair(&tokens[offset + 1])?;
         if sk_key.to_uppercase() != "SK" {
-            return Err(format!(
-                "Expected sk=<value>, got '{}'",
-                tokens[offset + 1]
-            ));
+            return Err(format!("Expected sk=<value>, got '{}'", tokens[offset + 1]));
         }
         Some(sk_val)
     } else {
@@ -528,10 +525,7 @@ fn parse_delete(tokens: &[String], default_table: Option<&str>) -> Result<Comman
     let sk = if tokens.len() > offset + 1 {
         let (sk_key, sk_val) = parse_kv_pair(&tokens[offset + 1])?;
         if sk_key.to_uppercase() != "SK" {
-            return Err(format!(
-                "Expected sk=<value>, got '{}'",
-                tokens[offset + 1]
-            ));
+            return Err(format!("Expected sk=<value>, got '{}'", tokens[offset + 1]));
         }
         Some(sk_val)
     } else {
@@ -647,9 +641,7 @@ fn parse_query(tokens: &[String], default_table: Option<&str>) -> Result<Command
 /// SCAN [table] [LIMIT <n>]
 fn parse_scan(tokens: &[String], default_table: Option<&str>) -> Result<Command, String> {
     // Detect: tokens[1] is table if it exists AND is NOT "LIMIT" (case-insensitive)
-    let (table, offset) = if tokens.len() < 2
-        || tokens[1].to_uppercase() == "LIMIT"
-    {
+    let (table, offset) = if tokens.len() < 2 || tokens[1].to_uppercase() == "LIMIT" {
         (resolve_table(None, default_table)?, 1)
     } else {
         (tokens[1].clone(), 2)
@@ -859,7 +851,10 @@ fn parse_drop_index(tokens: &[String], default_table: Option<&str>) -> Result<Co
 }
 
 /// DESCRIBE SCHEMA [table] <prefix>
-fn parse_describe_schema(tokens: &[String], default_table: Option<&str>) -> Result<Command, String> {
+fn parse_describe_schema(
+    tokens: &[String],
+    default_table: Option<&str>,
+) -> Result<Command, String> {
     if tokens.len() < 3 {
         return Err(
             "Usage: DESCRIBE SCHEMA [table] <prefix>  (Type HELP DESCRIBE SCHEMA for details)"
@@ -1011,7 +1006,11 @@ mod tests {
 
     #[test]
     fn test_create_table_with_sort_key() {
-        let cmd = parse("CREATE TABLE events PK user_id STRING SK timestamp NUMBER", None).unwrap();
+        let cmd = parse(
+            "CREATE TABLE events PK user_id STRING SK timestamp NUMBER",
+            None,
+        )
+        .unwrap();
         match cmd {
             Command::CreateTable {
                 name,
@@ -1074,7 +1073,11 @@ mod tests {
 
     #[test]
     fn test_create_table_with_sk_and_ttl() {
-        let cmd = parse("CREATE TABLE cache PK key STRING SK sort NUMBER TTL expires", None).unwrap();
+        let cmd = parse(
+            "CREATE TABLE cache PK key STRING SK sort NUMBER TTL expires",
+            None,
+        )
+        .unwrap();
         match cmd {
             Command::CreateTable { sk, ttl, .. } => {
                 assert!(sk.is_some());
@@ -1110,7 +1113,11 @@ mod tests {
 
     #[test]
     fn test_put_with_nested_json() {
-        let cmd = parse(r#"PUT items {"id": "x", "meta": {"nested": true, "count": 5}}"#, None).unwrap();
+        let cmd = parse(
+            r#"PUT items {"id": "x", "meta": {"nested": true, "count": 5}}"#,
+            None,
+        )
+        .unwrap();
         match cmd {
             Command::Put { document, .. } => {
                 assert_eq!(document["meta"]["nested"], true);
@@ -1910,7 +1917,11 @@ mod tests {
 
     #[test]
     fn test_create_index() {
-        let cmd = parse("CREATE INDEX data email-idx SCHEMA CONTACT KEY email STRING", None).unwrap();
+        let cmd = parse(
+            "CREATE INDEX data email-idx SCHEMA CONTACT KEY email STRING",
+            None,
+        )
+        .unwrap();
         match cmd {
             Command::CreateIndex {
                 table,
@@ -1931,7 +1942,11 @@ mod tests {
 
     #[test]
     fn test_create_index_number_key() {
-        let cmd = parse("CREATE INDEX data price-idx SCHEMA PRODUCT KEY price NUMBER", None).unwrap();
+        let cmd = parse(
+            "CREATE INDEX data price-idx SCHEMA PRODUCT KEY price NUMBER",
+            None,
+        )
+        .unwrap();
         match cmd {
             Command::CreateIndex { key_type, .. } => {
                 assert_eq!(key_type, KeyType::Number);
@@ -1989,7 +2004,11 @@ mod tests {
 
     #[test]
     fn test_query_index_with_limit_desc() {
-        let cmd = parse("QUERY INDEX data email-idx key=\"alice@test.com\" LIMIT 5 DESC", None).unwrap();
+        let cmd = parse(
+            "QUERY INDEX data email-idx key=\"alice@test.com\" LIMIT 5 DESC",
+            None,
+        )
+        .unwrap();
         match cmd {
             Command::QueryIndex {
                 table,

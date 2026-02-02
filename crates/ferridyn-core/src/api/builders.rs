@@ -12,6 +12,7 @@ use crate::types::{AttrType, AttributeDef, KeyDefinition, KeyType, TableSchema, 
 use super::database::FerridynDB;
 use super::key_utils;
 use super::query::{QueryResult, SortCondition, compute_scan_bounds};
+use super::update::UpdateAction;
 
 // ---------------------------------------------------------------------------
 // TableBuilder
@@ -293,6 +294,81 @@ impl<'a> DeleteItemBuilder<'a> {
 
         self.db
             .transact(move |txn| txn.delete_item(&table, &pk_val, sk_val.as_ref()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UpdateItemBuilder
+// ---------------------------------------------------------------------------
+
+/// Builder for partially updating an item by key.
+///
+/// Collects SET and REMOVE actions, then applies them atomically inside a
+/// write transaction. If the item doesn't exist, an upsert creates it with
+/// the key attributes plus the SET values.
+pub struct UpdateItemBuilder<'a> {
+    db: &'a FerridynDB,
+    table: String,
+    partition_key: Option<Value>,
+    sort_key: Option<Value>,
+    actions: Vec<UpdateAction>,
+}
+
+impl<'a> UpdateItemBuilder<'a> {
+    pub(crate) fn new(db: &'a FerridynDB, table: String) -> Self {
+        Self {
+            db,
+            table,
+            partition_key: None,
+            sort_key: None,
+            actions: Vec::new(),
+        }
+    }
+
+    /// Set the partition key value.
+    pub fn partition_key(mut self, value: impl Into<Value>) -> Self {
+        self.partition_key = Some(value.into());
+        self
+    }
+
+    /// Set the sort key value (for tables with a sort key).
+    pub fn sort_key(mut self, value: impl Into<Value>) -> Self {
+        self.sort_key = Some(value.into());
+        self
+    }
+
+    /// Add a SET action: set the attribute at `path` to `value`.
+    ///
+    /// Dot-separated paths navigate into nested objects (e.g. `"address.city"`).
+    /// Intermediate objects are created if they don't exist.
+    pub fn set(mut self, path: &str, value: impl Into<Value>) -> Self {
+        self.actions.push(UpdateAction::Set {
+            path: path.to_string(),
+            value: value.into(),
+        });
+        self
+    }
+
+    /// Add a REMOVE action: remove the attribute at `path`.
+    ///
+    /// Dot-separated paths navigate into nested objects. Silent no-op if the
+    /// path doesn't exist.
+    pub fn remove(mut self, path: &str) -> Self {
+        self.actions.push(UpdateAction::Remove {
+            path: path.to_string(),
+        });
+        self
+    }
+
+    /// Execute the update operation.
+    pub fn execute(self) -> Result<(), Error> {
+        let pk_val = self.partition_key.ok_or(QueryError::PartitionKeyRequired)?;
+        let sk_val = self.sort_key;
+        let table = self.table;
+        let actions = self.actions;
+
+        self.db
+            .transact(move |txn| txn.update_item(&table, &pk_val, sk_val.as_ref(), &actions))
     }
 }
 

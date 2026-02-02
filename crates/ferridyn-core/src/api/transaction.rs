@@ -8,6 +8,7 @@ use crate::types::{PageId, TxnId, VersionedItem};
 
 use super::key_utils;
 use super::page_store::BufferedPageStore;
+use super::update::{self, UpdateAction};
 
 /// Validate a document against its matching partition schema (if any).
 ///
@@ -453,6 +454,116 @@ impl Transaction {
             None, // delete: no new document
         )?;
 
+        if updated.data_root_page != entry.data_root_page || updated.indexes != entry.indexes {
+            self.update_catalog_entry(table, &updated)?;
+        }
+
+        Ok(())
+    }
+
+    /// Partially update an item by applying a list of update actions.
+    ///
+    /// If the item doesn't exist, an upsert creates it with the key
+    /// attributes plus the SET values.
+    pub fn update_item(
+        &mut self,
+        table: &str,
+        partition_key: &Value,
+        sort_key: Option<&Value>,
+        actions: &[UpdateAction],
+    ) -> Result<(), Error> {
+        // 1. Look up table schema.
+        let entry = catalog::ops::get_table(&self.store, self.catalog_root, table)?;
+        let schema = &entry.schema;
+
+        // 2. Convert pk/sk to KeyValue, validate sizes, encode composite key.
+        let pk = key_utils::json_to_key_value(
+            partition_key,
+            schema.partition_key.key_type,
+            &schema.partition_key.name,
+        )?;
+        key_utils::validate_partition_key_size(&pk)?;
+
+        let sk = match (&schema.sort_key, sort_key) {
+            (Some(sk_def), Some(sk_val)) => {
+                let sk = key_utils::json_to_key_value(sk_val, sk_def.key_type, &sk_def.name)?;
+                key_utils::validate_sort_key_size(&sk)?;
+                Some(sk)
+            }
+            (Some(_), None) => None,
+            (None, Some(_)) => return Err(QueryError::SortKeyNotSupported.into()),
+            (None, None) => None,
+        };
+
+        let composite_key = composite::encode_composite(&pk, sk.as_ref())?;
+
+        // 3. Validate no key attribute updates.
+        let sk_name = schema.sort_key.as_ref().map(|sk| sk.name.as_str());
+        update::validate_no_key_updates(actions, &schema.partition_key.name, sk_name)?;
+
+        // 4. Read existing document.
+        let existing_bytes = mvcc_ops::mvcc_get(
+            &self.store,
+            entry.data_root_page,
+            &composite_key,
+            self.txn_id,
+        )?;
+
+        let (old_doc, mut document) = match existing_bytes {
+            Some(bytes) => {
+                let val: Value = rmp_serde::from_slice(&bytes).map_err(|e| {
+                    StorageError::CorruptedPage(format!("failed to deserialize document: {e}"))
+                })?;
+                (Some(val.clone()), val)
+            }
+            None => {
+                // 5. Upsert: create base document with key attributes.
+                let mut base = serde_json::Map::new();
+                base.insert(schema.partition_key.name.clone(), partition_key.clone());
+                if let (Some(sk_def), Some(sk_val)) = (&schema.sort_key, sort_key) {
+                    base.insert(sk_def.name.clone(), sk_val.clone());
+                }
+                (None, Value::Object(base))
+            }
+        };
+
+        // 6. Apply update actions.
+        update::apply_updates(&mut document, actions)?;
+
+        // 7. Validate against partition schema (on final document).
+        if let Some(prefix) = key_utils::extract_pk_prefix(&pk)
+            && let Some(ps) = entry
+                .partition_schemas
+                .iter()
+                .find(|ps| ps.prefix == prefix)
+        {
+            validate_against_partition_schema(&document, ps)?;
+        }
+
+        // 8. Validate document size.
+        let doc_bytes = key_utils::validate_document_size(&document)?;
+
+        // 9. Write with MVCC versioning.
+        let new_data_root = mvcc_ops::mvcc_put(
+            &mut self.store,
+            entry.data_root_page,
+            &composite_key,
+            &doc_bytes,
+            self.txn_id,
+        )?;
+
+        // 10. Maintain indexes.
+        let mut updated = entry.clone();
+        updated.data_root_page = new_data_root;
+        updated = maintain_indexes(
+            &mut self.store,
+            &updated,
+            &pk,
+            old_doc.as_ref(),
+            Some(&document),
+        )?;
+
+        // 11. Write catalog if anything changed.
         if updated.data_root_page != entry.data_root_page || updated.indexes != entry.indexes {
             self.update_catalog_entry(table, &updated)?;
         }
