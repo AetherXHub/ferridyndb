@@ -110,6 +110,9 @@ pub enum Command {
         limit: Option<usize>,
         desc: bool,
     },
+    Use {
+        table: Option<String>, // None = clear
+    },
     Help(Option<String>),
     Exit,
 }

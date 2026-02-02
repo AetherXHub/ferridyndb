@@ -151,6 +151,14 @@ pub fn render(result: &CommandResult, mode: &OutputMode) -> bool {
                 );
             }
         },
+        CommandResult::Use(Some(name)) => match mode {
+            OutputMode::Pretty => println!("Using table '{name}'."),
+            OutputMode::Json => println!("{}", json!({"ok": true, "active_table": name})),
+        },
+        CommandResult::Use(None) => match mode {
+            OutputMode::Pretty => println!("Cleared active table."),
+            OutputMode::Json => println!("{}", json!({"ok": true, "active_table": null})),
+        },
         CommandResult::Help(topic) => match mode {
             OutputMode::Pretty => render_help_pretty(topic.as_deref()),
             OutputMode::Json => render_help_json(topic.as_deref()),
@@ -357,6 +365,7 @@ fn topic_keys(cmd: &CommandHelp) -> Vec<&'static str> {
         "QUERY" => vec!["query"],
         "SCAN" => vec!["scan"],
         "HELP" => vec!["help"],
+        "USE" => vec!["use"],
         "EXIT / QUIT" => vec!["exit", "quit"],
         _ => vec![],
     }
@@ -581,6 +590,26 @@ LIMIT restricts the number of results. DESC reverses sort order.",
         examples: &["HELP", "HELP QUERY", "HELP CREATE TABLE"],
     },
     CommandHelp {
+        name: "USE",
+        summary: "Set or clear the active table for the session",
+        syntax: "USE [table]",
+        details: "\
+Sets a default table so you can omit the table name from commands. \
+With no argument, clears the active table.
+
+When a table is active, the prompt changes to show it (e.g., ferridyn:data>). \
+You can still specify a table explicitly on any command to override the default.
+
+Works in REPL, pipe, and exec modes.",
+        examples: &[
+            "USE data",
+            "SCAN LIMIT 5",
+            "GET pk=alice",
+            "SCAN other LIMIT 10",
+            "USE",
+        ],
+    },
+    CommandHelp {
         name: "EXIT / QUIT",
         summary: "Exit the console",
         syntax: "EXIT  (or QUIT)",
@@ -640,6 +669,9 @@ fn print_help_overview() {
     println!("    LIST INDEXES   List secondary indexes for a table");
     println!("    DESCRIBE INDEX Show details of a secondary index");
     println!("    QUERY INDEX    Find items by secondary index value");
+    println!();
+    println!("  Session");
+    println!("    USE [table]    Set or clear the active table for the session");
     println!();
     println!("  Other");
     println!("    HELP [command] Show this overview, or detailed help for a command");

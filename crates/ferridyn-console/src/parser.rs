@@ -176,7 +176,7 @@ fn parse_kv_pair(token: &str) -> Result<(&str, Value), String> {
 }
 
 /// Parse an input line into a [`Command`].
-pub fn parse(input: &str) -> Result<Command, String> {
+pub fn parse(input: &str, default_table: Option<&str>) -> Result<Command, String> {
     let tokens = tokenize(input)?;
     if tokens.is_empty() {
         return Err("Empty command".to_string());
@@ -189,9 +189,9 @@ pub fn parse(input: &str) -> Result<Command, String> {
                 return Err("Expected TABLE, SCHEMA, or INDEX after CREATE".to_string());
             }
             match tokens[1].to_uppercase().as_str() {
-                "TABLE" => parse_create_table(&tokens),
-                "SCHEMA" => parse_create_schema(&tokens),
-                "INDEX" => parse_create_index(&tokens),
+                "TABLE" => parse_create_table(&tokens, default_table),
+                "SCHEMA" => parse_create_schema(&tokens, default_table),
+                "INDEX" => parse_create_index(&tokens, default_table),
                 _ => Err("Expected TABLE, SCHEMA, or INDEX after CREATE".to_string()),
             }
         }
@@ -200,35 +200,36 @@ pub fn parse(input: &str) -> Result<Command, String> {
                 return Err("Expected TABLE, SCHEMA, or INDEX after DROP".to_string());
             }
             match tokens[1].to_uppercase().as_str() {
-                "TABLE" => parse_drop_table(&tokens),
-                "SCHEMA" => parse_drop_schema(&tokens),
-                "INDEX" => parse_drop_index(&tokens),
+                "TABLE" => parse_drop_table(&tokens, default_table),
+                "SCHEMA" => parse_drop_schema(&tokens, default_table),
+                "INDEX" => parse_drop_index(&tokens, default_table),
                 _ => Err("Expected TABLE, SCHEMA, or INDEX after DROP".to_string()),
             }
         }
-        "LIST" => parse_list(&tokens),
+        "LIST" => parse_list(&tokens, default_table),
         "DESCRIBE" => {
             if tokens.len() < 2 {
                 return Err("Expected TABLE, SCHEMA, or INDEX after DESCRIBE".to_string());
             }
             match tokens[1].to_uppercase().as_str() {
-                "TABLE" => parse_describe_table(&tokens),
-                "SCHEMA" => parse_describe_schema(&tokens),
-                "INDEX" => parse_describe_index(&tokens),
+                "TABLE" => parse_describe_table(&tokens, default_table),
+                "SCHEMA" => parse_describe_schema(&tokens, default_table),
+                "INDEX" => parse_describe_index(&tokens, default_table),
                 _ => Err("Expected TABLE, SCHEMA, or INDEX after DESCRIBE".to_string()),
             }
         }
-        "PUT" => parse_put(&tokens),
-        "GET" => parse_get(&tokens),
-        "DELETE" => parse_delete(&tokens),
+        "USE" => parse_use(&tokens),
+        "PUT" => parse_put(&tokens, default_table),
+        "GET" => parse_get(&tokens, default_table),
+        "DELETE" => parse_delete(&tokens, default_table),
         "QUERY" => {
             if tokens.len() > 1 && tokens[1].to_uppercase() == "INDEX" {
-                parse_query_index(&tokens)
+                parse_query_index(&tokens, default_table)
             } else {
-                parse_query(&tokens)
+                parse_query(&tokens, default_table)
             }
         }
-        "SCAN" => parse_scan(&tokens),
+        "SCAN" => parse_scan(&tokens, default_table),
         "HELP" => {
             let topic = if tokens.len() > 1 {
                 Some(tokens[1..].join(" "))
@@ -242,8 +243,19 @@ pub fn parse(input: &str) -> Result<Command, String> {
     }
 }
 
+/// USE [table]
+fn parse_use(tokens: &[String]) -> Result<Command, String> {
+    if tokens.len() < 2 {
+        Ok(Command::Use { table: None })
+    } else {
+        Ok(Command::Use {
+            table: Some(tokens[1].clone()),
+        })
+    }
+}
+
 /// CREATE TABLE <name> PK <attr> <type> [SK <attr> <type>]
-fn parse_create_table(tokens: &[String]) -> Result<Command, String> {
+fn parse_create_table(tokens: &[String], _default_table: Option<&str>) -> Result<Command, String> {
     if tokens.len() < 5 {
         return Err(
             "Usage: CREATE TABLE <name> PK <attr> <STRING|NUMBER|BINARY> [SK <attr> <type>] [TTL <attr>]  (Type HELP CREATE TABLE for details)"
@@ -298,7 +310,7 @@ fn parse_create_table(tokens: &[String]) -> Result<Command, String> {
 }
 
 /// DROP TABLE <name>
-fn parse_drop_table(tokens: &[String]) -> Result<Command, String> {
+fn parse_drop_table(tokens: &[String], _default_table: Option<&str>) -> Result<Command, String> {
     if tokens.len() < 3 {
         return Err("Usage: DROP TABLE <name>  (Type HELP DROP TABLE for details)".to_string());
     }
@@ -310,20 +322,20 @@ fn parse_drop_table(tokens: &[String]) -> Result<Command, String> {
     })
 }
 
-/// LIST TABLES | LIST KEYS <table> [LIMIT <n>]
-fn parse_list(tokens: &[String]) -> Result<Command, String> {
+/// LIST TABLES | LIST KEYS [table] [LIMIT <n>]
+fn parse_list(tokens: &[String], default_table: Option<&str>) -> Result<Command, String> {
     if tokens.len() < 2 {
         return Err(
-            "Usage: LIST TABLES | LIST KEYS <table> | LIST PREFIXES <table> pk=<val>  (Type HELP LIST for details)"
+            "Usage: LIST TABLES | LIST KEYS [table] | LIST PREFIXES [table] pk=<val>  (Type HELP LIST for details)"
                 .to_string(),
         );
     }
     match tokens[1].to_uppercase().as_str() {
         "TABLES" => Ok(Command::ListTables),
-        "KEYS" => parse_list_keys(tokens),
-        "PREFIXES" => parse_list_prefixes(tokens),
-        "SCHEMAS" => parse_list_schemas(tokens),
-        "INDEXES" => parse_list_indexes(tokens),
+        "KEYS" => parse_list_keys(tokens, default_table),
+        "PREFIXES" => parse_list_prefixes(tokens, default_table),
+        "SCHEMAS" => parse_list_schemas(tokens, default_table),
+        "INDEXES" => parse_list_indexes(tokens, default_table),
         _ => Err(format!(
             "Expected TABLES, KEYS, PREFIXES, SCHEMAS, or INDEXES after LIST, got '{}'",
             tokens[1]
@@ -331,116 +343,153 @@ fn parse_list(tokens: &[String]) -> Result<Command, String> {
     }
 }
 
-/// LIST KEYS <table> [LIMIT <n>]
-fn parse_list_keys(tokens: &[String]) -> Result<Command, String> {
-    if tokens.len() < 3 {
-        return Err(
-            "Usage: LIST KEYS <table> [LIMIT <n>]  (Type HELP LIST KEYS for details)".to_string(),
-        );
-    }
-    let table = tokens[2].clone();
+/// LIST KEYS [table] [LIMIT <n>]
+fn parse_list_keys(tokens: &[String], default_table: Option<&str>) -> Result<Command, String> {
+    // Detect: tokens[2] is table if it exists AND is NOT "LIMIT"
+    let (table, offset) = if tokens.len() < 3 || tokens[2].to_uppercase() == "LIMIT" {
+        (resolve_table(None, default_table)?, 2)
+    } else {
+        (tokens[2].clone(), 3)
+    };
     let mut limit = None;
 
-    if tokens.len() > 3 {
-        if tokens[3].to_uppercase() == "LIMIT" {
-            if tokens.len() < 5 {
+    if tokens.len() > offset {
+        if tokens[offset].to_uppercase() == "LIMIT" {
+            if tokens.len() < offset + 2 {
                 return Err("LIMIT requires a number".to_string());
             }
             limit = Some(
-                tokens[4]
+                tokens[offset + 1]
                     .parse::<usize>()
-                    .map_err(|_| format!("Invalid LIMIT value '{}'", tokens[4]))?,
+                    .map_err(|_| format!("Invalid LIMIT value '{}'", tokens[offset + 1]))?,
             );
         } else {
-            return Err(format!("Unexpected token '{}' in LIST KEYS", tokens[3]));
+            return Err(format!(
+                "Unexpected token '{}' in LIST KEYS",
+                tokens[offset]
+            ));
         }
     }
 
     Ok(Command::ListKeys { table, limit })
 }
 
-/// LIST PREFIXES <table> pk=<value> [LIMIT <n>]
-fn parse_list_prefixes(tokens: &[String]) -> Result<Command, String> {
-    if tokens.len() < 4 {
+/// LIST PREFIXES [table] pk=<value> [LIMIT <n>]
+fn parse_list_prefixes(tokens: &[String], default_table: Option<&str>) -> Result<Command, String> {
+    if tokens.len() < 3 {
         return Err(
-            "Usage: LIST PREFIXES <table> pk=<value> [LIMIT <n>]  (Type HELP LIST PREFIXES for details)"
+            "Usage: LIST PREFIXES [table] pk=<value> [LIMIT <n>]  (Type HELP LIST PREFIXES for details)"
                 .to_string(),
         );
     }
-    let table = tokens[2].clone();
+    // Detect: tokens[2] is table if it does NOT contain '='
+    let (table, offset) = if tokens[2].contains('=') {
+        (resolve_table(None, default_table)?, 2)
+    } else {
+        if tokens.len() < 4 {
+            return Err(
+                "Usage: LIST PREFIXES [table] pk=<value> [LIMIT <n>]  (Type HELP LIST PREFIXES for details)"
+                    .to_string(),
+            );
+        }
+        (tokens[2].clone(), 3)
+    };
 
-    let (key_name, pk) = parse_kv_pair(&tokens[3])?;
+    let (key_name, pk) = parse_kv_pair(&tokens[offset])?;
     if key_name.to_uppercase() != "PK" {
-        return Err(format!("Expected pk=<value>, got '{}'", tokens[3]));
+        return Err(format!("Expected pk=<value>, got '{}'", tokens[offset]));
     }
 
     let mut limit = None;
-    if tokens.len() > 4 {
-        if tokens[4].to_uppercase() == "LIMIT" {
-            if tokens.len() < 6 {
+    if tokens.len() > offset + 1 {
+        if tokens[offset + 1].to_uppercase() == "LIMIT" {
+            if tokens.len() < offset + 3 {
                 return Err("LIMIT requires a number".to_string());
             }
             limit = Some(
-                tokens[5]
+                tokens[offset + 2]
                     .parse::<usize>()
-                    .map_err(|_| format!("Invalid LIMIT value '{}'", tokens[5]))?,
+                    .map_err(|_| format!("Invalid LIMIT value '{}'", tokens[offset + 2]))?,
             );
         } else {
-            return Err(format!("Unexpected token '{}' in LIST PREFIXES", tokens[4]));
+            return Err(format!(
+                "Unexpected token '{}' in LIST PREFIXES",
+                tokens[offset + 1]
+            ));
         }
     }
 
     Ok(Command::ListPrefixes { table, pk, limit })
 }
 
-/// DESCRIBE TABLE <name>
-fn parse_describe_table(tokens: &[String]) -> Result<Command, String> {
-    if tokens.len() < 3 {
-        return Err(
-            "Usage: DESCRIBE TABLE <name>  (Type HELP DESCRIBE TABLE for details)".to_string(),
-        );
-    }
+/// DESCRIBE TABLE [name]
+fn parse_describe_table(tokens: &[String], default_table: Option<&str>) -> Result<Command, String> {
     if tokens[1].to_uppercase() != "TABLE" {
         return Err(format!(
             "Expected TABLE after DESCRIBE, got '{}'",
             tokens[1]
         ));
     }
-    Ok(Command::DescribeTable {
-        name: tokens[2].clone(),
-    })
+    let name = if tokens.len() >= 3 {
+        tokens[2].clone()
+    } else {
+        resolve_table(None, default_table)?
+    };
+    Ok(Command::DescribeTable { name })
 }
 
-/// PUT <table> {json}
-fn parse_put(tokens: &[String]) -> Result<Command, String> {
-    if tokens.len() < 3 {
-        return Err("Usage: PUT <table> {json}  (Type HELP PUT for details)".to_string());
+/// PUT [table] {json}
+fn parse_put(tokens: &[String], default_table: Option<&str>) -> Result<Command, String> {
+    if tokens.len() < 2 {
+        return Err("Usage: PUT [table] {json}  (Type HELP PUT for details)".to_string());
     }
-    let table = tokens[1].clone();
-    let json_str = &tokens[2];
+    // Detect: if tokens[1] starts with '{', no table name given
+    let (table, json_idx) = if tokens[1].starts_with('{') {
+        (resolve_table(None, default_table)?, 1)
+    } else {
+        if tokens.len() < 3 {
+            return Err("Usage: PUT [table] {json}  (Type HELP PUT for details)".to_string());
+        }
+        (tokens[1].clone(), 2)
+    };
+    let json_str = &tokens[json_idx];
     let document: Value =
         serde_json::from_str(json_str).map_err(|e| format!("Invalid JSON: {e}"))?;
     Ok(Command::Put { table, document })
 }
 
-/// GET <table> pk=<value> [sk=<value>]
-fn parse_get(tokens: &[String]) -> Result<Command, String> {
-    if tokens.len() < 3 {
+/// GET [table] pk=<value> [sk=<value>]
+fn parse_get(tokens: &[String], default_table: Option<&str>) -> Result<Command, String> {
+    if tokens.len() < 2 {
         return Err(
-            "Usage: GET <table> pk=<value> [sk=<value>]  (Type HELP GET for details)".to_string(),
+            "Usage: GET [table] pk=<value> [sk=<value>]  (Type HELP GET for details)".to_string(),
         );
     }
-    let table = tokens[1].clone();
+    // Detect: if tokens[1] contains '=', no table name given
+    let (table, offset) = if tokens[1].contains('=') {
+        (resolve_table(None, default_table)?, 1)
+    } else {
+        if tokens.len() < 3 {
+            return Err(
+                "Usage: GET [table] pk=<value> [sk=<value>]  (Type HELP GET for details)"
+                    .to_string(),
+            );
+        }
+        (tokens[1].clone(), 2)
+    };
 
-    let (key_name, pk) = parse_kv_pair(&tokens[2])?;
+    let (key_name, pk) = parse_kv_pair(&tokens[offset])?;
     if key_name.to_uppercase() != "PK" {
-        return Err(format!("Expected pk=<value>, got '{}'", tokens[2]));
+        return Err(format!("Expected pk=<value>, got '{}'", tokens[offset]));
     }
 
-    let sk = if tokens.len() > 3 {
-        let (sk_key, sk_val) = parse_kv_pair(&tokens[3])?;
+    let sk = if tokens.len() > offset + 1 {
+        let (sk_key, sk_val) = parse_kv_pair(&tokens[offset + 1])?;
         if sk_key.to_uppercase() != "SK" {
-            return Err(format!("Expected sk=<value>, got '{}'", tokens[3]));
+            return Err(format!(
+                "Expected sk=<value>, got '{}'",
+                tokens[offset + 1]
+            ));
         }
         Some(sk_val)
     } else {
@@ -450,25 +499,39 @@ fn parse_get(tokens: &[String]) -> Result<Command, String> {
     Ok(Command::Get { table, pk, sk })
 }
 
-/// DELETE <table> pk=<value> [sk=<value>]
-fn parse_delete(tokens: &[String]) -> Result<Command, String> {
-    if tokens.len() < 3 {
+/// DELETE [table] pk=<value> [sk=<value>]
+fn parse_delete(tokens: &[String], default_table: Option<&str>) -> Result<Command, String> {
+    if tokens.len() < 2 {
         return Err(
-            "Usage: DELETE <table> pk=<value> [sk=<value>]  (Type HELP DELETE for details)"
+            "Usage: DELETE [table] pk=<value> [sk=<value>]  (Type HELP DELETE for details)"
                 .to_string(),
         );
     }
-    let table = tokens[1].clone();
+    // Detect: if tokens[1] contains '=', no table name given
+    let (table, offset) = if tokens[1].contains('=') {
+        (resolve_table(None, default_table)?, 1)
+    } else {
+        if tokens.len() < 3 {
+            return Err(
+                "Usage: DELETE [table] pk=<value> [sk=<value>]  (Type HELP DELETE for details)"
+                    .to_string(),
+            );
+        }
+        (tokens[1].clone(), 2)
+    };
 
-    let (key_name, pk) = parse_kv_pair(&tokens[2])?;
+    let (key_name, pk) = parse_kv_pair(&tokens[offset])?;
     if key_name.to_uppercase() != "PK" {
-        return Err(format!("Expected pk=<value>, got '{}'", tokens[2]));
+        return Err(format!("Expected pk=<value>, got '{}'", tokens[offset]));
     }
 
-    let sk = if tokens.len() > 3 {
-        let (sk_key, sk_val) = parse_kv_pair(&tokens[3])?;
+    let sk = if tokens.len() > offset + 1 {
+        let (sk_key, sk_val) = parse_kv_pair(&tokens[offset + 1])?;
         if sk_key.to_uppercase() != "SK" {
-            return Err(format!("Expected sk=<value>, got '{}'", tokens[3]));
+            return Err(format!(
+                "Expected sk=<value>, got '{}'",
+                tokens[offset + 1]
+            ));
         }
         Some(sk_val)
     } else {
@@ -478,25 +541,35 @@ fn parse_delete(tokens: &[String]) -> Result<Command, String> {
     Ok(Command::Delete { table, pk, sk })
 }
 
-/// QUERY <table> pk=<value> [SK <op> <value>] [BETWEEN <lo> AND <hi>]
+/// QUERY [table] pk=<value> [SK <op> <value>] [BETWEEN <lo> AND <hi>]
 /// [BEGINS_WITH <prefix>] [LIMIT <n>] [DESC]
-fn parse_query(tokens: &[String]) -> Result<Command, String> {
-    if tokens.len() < 3 {
+fn parse_query(tokens: &[String], default_table: Option<&str>) -> Result<Command, String> {
+    if tokens.len() < 2 {
         return Err(
-            "Usage: QUERY <table> pk=<value> [SK <op> <val>] [LIMIT <n>] [DESC]  (Type HELP QUERY for details)".to_string(),
+            "Usage: QUERY [table] pk=<value> [SK <op> <val>] [LIMIT <n>] [DESC]  (Type HELP QUERY for details)".to_string(),
         );
     }
-    let table = tokens[1].clone();
+    // Detect: tokens[1] is table if it does NOT contain '=' and is not "INDEX"
+    let (table, offset) = if tokens[1].contains('=') {
+        (resolve_table(None, default_table)?, 1)
+    } else {
+        if tokens.len() < 3 {
+            return Err(
+                "Usage: QUERY [table] pk=<value> [SK <op> <val>] [LIMIT <n>] [DESC]  (Type HELP QUERY for details)".to_string(),
+            );
+        }
+        (tokens[1].clone(), 2)
+    };
 
-    let (key_name, pk) = parse_kv_pair(&tokens[2])?;
+    let (key_name, pk) = parse_kv_pair(&tokens[offset])?;
     if key_name.to_uppercase() != "PK" {
-        return Err(format!("Expected pk=<value>, got '{}'", tokens[2]));
+        return Err(format!("Expected pk=<value>, got '{}'", tokens[offset]));
     }
 
     let mut sort_condition: Option<SortClause> = None;
     let mut limit: Option<usize> = None;
     let mut desc = false;
-    let mut i = 3;
+    let mut i = offset + 1;
 
     while i < tokens.len() {
         let upper = tokens[i].to_uppercase();
@@ -571,26 +644,30 @@ fn parse_query(tokens: &[String]) -> Result<Command, String> {
     })
 }
 
-/// SCAN <table> [LIMIT <n>]
-fn parse_scan(tokens: &[String]) -> Result<Command, String> {
-    if tokens.len() < 2 {
-        return Err("Usage: SCAN <table> [LIMIT <n>]  (Type HELP SCAN for details)".to_string());
-    }
-    let table = tokens[1].clone();
+/// SCAN [table] [LIMIT <n>]
+fn parse_scan(tokens: &[String], default_table: Option<&str>) -> Result<Command, String> {
+    // Detect: tokens[1] is table if it exists AND is NOT "LIMIT" (case-insensitive)
+    let (table, offset) = if tokens.len() < 2
+        || tokens[1].to_uppercase() == "LIMIT"
+    {
+        (resolve_table(None, default_table)?, 1)
+    } else {
+        (tokens[1].clone(), 2)
+    };
     let mut limit = None;
 
-    if tokens.len() > 2 {
-        if tokens[2].to_uppercase() == "LIMIT" {
-            if tokens.len() < 4 {
+    if tokens.len() > offset {
+        if tokens[offset].to_uppercase() == "LIMIT" {
+            if tokens.len() < offset + 2 {
                 return Err("LIMIT requires a number".to_string());
             }
             limit = Some(
-                tokens[3]
+                tokens[offset + 1]
                     .parse::<usize>()
-                    .map_err(|_| format!("Invalid LIMIT value '{}'", tokens[3]))?,
+                    .map_err(|_| format!("Invalid LIMIT value '{}'", tokens[offset + 1]))?,
             );
         } else {
-            return Err(format!("Unexpected token '{}' in SCAN", tokens[2]));
+            return Err(format!("Unexpected token '{}' in SCAN", tokens[offset]));
         }
     }
 
@@ -606,6 +683,12 @@ fn strip_quotes(s: &str) -> String {
     }
 }
 
+fn resolve_table(explicit: Option<String>, default: Option<&str>) -> Result<String, String> {
+    explicit
+        .or_else(|| default.map(String::from))
+        .ok_or_else(|| "No table specified. Set a default with: USE <table>".to_string())
+}
+
 /// Parse an attribute type token: STRING, NUMBER, or BOOLEAN (case-insensitive).
 fn parse_attr_type(s: &str) -> Result<AttrType, String> {
     match s.to_uppercase().as_str() {
@@ -618,29 +701,41 @@ fn parse_attr_type(s: &str) -> Result<AttrType, String> {
     }
 }
 
-/// CREATE SCHEMA <table> PREFIX <prefix> [DESCRIPTION "text"]
+/// CREATE SCHEMA [table] PREFIX <prefix> [DESCRIPTION "text"]
 ///   [ATTR <name> <STRING|NUMBER|BOOLEAN> [REQUIRED]]... [VALIDATE]
-fn parse_create_schema(tokens: &[String]) -> Result<Command, String> {
-    // Minimum: CREATE SCHEMA <table> PREFIX <prefix> = 5 tokens
-    if tokens.len() < 5 {
+fn parse_create_schema(tokens: &[String], default_table: Option<&str>) -> Result<Command, String> {
+    // Minimum: CREATE SCHEMA PREFIX <prefix> = 4 tokens (without table)
+    if tokens.len() < 4 {
         return Err(
-            "Usage: CREATE SCHEMA <table> PREFIX <prefix> [DESCRIPTION \"text\"] [ATTR <name> <type> [REQUIRED]]... [VALIDATE]  (Type HELP CREATE SCHEMA for details)"
+            "Usage: CREATE SCHEMA [table] PREFIX <prefix> [DESCRIPTION \"text\"] [ATTR <name> <type> [REQUIRED]]... [VALIDATE]  (Type HELP CREATE SCHEMA for details)"
                 .to_string(),
         );
     }
-    let table = tokens[2].clone();
-    if tokens[3].to_uppercase() != "PREFIX" {
+    // Detect: tokens[2] is table if it is NOT "PREFIX" (case-insensitive)
+    let (table, offset) = if tokens[2].to_uppercase() == "PREFIX" {
+        (resolve_table(None, default_table)?, 0)
+    } else {
+        if tokens.len() < 5 {
+            return Err(
+                "Usage: CREATE SCHEMA [table] PREFIX <prefix> [DESCRIPTION \"text\"] [ATTR <name> <type> [REQUIRED]]... [VALIDATE]  (Type HELP CREATE SCHEMA for details)"
+                    .to_string(),
+            );
+        }
+        (tokens[2].clone(), 1)
+    };
+    // PREFIX keyword is at 2+offset (i.e., 3 with table, 2 without)
+    if tokens[2 + offset].to_uppercase() != "PREFIX" {
         return Err(format!(
             "Expected PREFIX after table name, got '{}'",
-            tokens[3]
+            tokens[2 + offset]
         ));
     }
-    let prefix = tokens[4].clone();
+    let prefix = tokens[3 + offset].clone();
 
     let mut description = None;
     let mut attributes = Vec::new();
     let mut validate = false;
-    let mut i = 5;
+    let mut i = 4 + offset;
 
     while i < tokens.len() {
         let upper = tokens[i].to_uppercase();
@@ -687,26 +782,38 @@ fn parse_create_schema(tokens: &[String]) -> Result<Command, String> {
     })
 }
 
-/// CREATE INDEX <table> <name> SCHEMA <prefix> KEY <attr> <type>
-fn parse_create_index(tokens: &[String]) -> Result<Command, String> {
-    // Exactly 9 tokens: CREATE INDEX <table> <name> SCHEMA <prefix> KEY <attr> <type>
-    if tokens.len() < 9 {
+/// CREATE INDEX [table] <name> SCHEMA <prefix> KEY <attr> <type>
+fn parse_create_index(tokens: &[String], default_table: Option<&str>) -> Result<Command, String> {
+    // Without table: CREATE INDEX <name> SCHEMA <prefix> KEY <attr> <type> = 8 tokens
+    // With table:    CREATE INDEX <table> <name> SCHEMA <prefix> KEY <attr> <type> = 9 tokens
+    if tokens.len() < 8 {
         return Err(
-            "Usage: CREATE INDEX <table> <name> SCHEMA <prefix> KEY <attr> <STRING|NUMBER|BINARY>  (Type HELP CREATE INDEX for details)"
+            "Usage: CREATE INDEX [table] <name> SCHEMA <prefix> KEY <attr> <STRING|NUMBER|BINARY>  (Type HELP CREATE INDEX for details)"
                 .to_string(),
         );
     }
-    let table = tokens[2].clone();
-    let name = tokens[3].clone();
-    if tokens[4].to_uppercase() != "SCHEMA" {
-        return Err(format!("Expected SCHEMA, got '{}'", tokens[4]));
+    // Detect: if tokens[3] == "SCHEMA", no table given (tokens[2] is index name)
+    let (table, name, offset) = if tokens[3].to_uppercase() == "SCHEMA" {
+        (resolve_table(None, default_table)?, tokens[2].clone(), 0)
+    } else {
+        if tokens.len() < 9 {
+            return Err(
+                "Usage: CREATE INDEX [table] <name> SCHEMA <prefix> KEY <attr> <STRING|NUMBER|BINARY>  (Type HELP CREATE INDEX for details)"
+                    .to_string(),
+            );
+        }
+        (tokens[2].clone(), tokens[3].clone(), 1)
+    };
+    // SCHEMA keyword at 3+offset
+    if tokens[3 + offset].to_uppercase() != "SCHEMA" {
+        return Err(format!("Expected SCHEMA, got '{}'", tokens[3 + offset]));
     }
-    let schema_prefix = tokens[5].clone();
-    if tokens[6].to_uppercase() != "KEY" {
-        return Err(format!("Expected KEY, got '{}'", tokens[6]));
+    let schema_prefix = tokens[4 + offset].clone();
+    if tokens[5 + offset].to_uppercase() != "KEY" {
+        return Err(format!("Expected KEY, got '{}'", tokens[5 + offset]));
     }
-    let key_attr = tokens[7].clone();
-    let key_type = parse_key_type(&tokens[8])?;
+    let key_attr = tokens[6 + offset].clone();
+    let key_type = parse_key_type(&tokens[7 + offset])?;
 
     Ok(Command::CreateIndex {
         table,
@@ -717,104 +824,127 @@ fn parse_create_index(tokens: &[String]) -> Result<Command, String> {
     })
 }
 
-/// DROP SCHEMA <table> <prefix>
-fn parse_drop_schema(tokens: &[String]) -> Result<Command, String> {
-    if tokens.len() < 4 {
-        return Err(
-            "Usage: DROP SCHEMA <table> <prefix>  (Type HELP DROP SCHEMA for details)".to_string(),
-        );
-    }
-    Ok(Command::DropSchema {
-        table: tokens[2].clone(),
-        prefix: tokens[3].clone(),
-    })
-}
-
-/// DROP INDEX <table> <name>
-fn parse_drop_index(tokens: &[String]) -> Result<Command, String> {
-    if tokens.len() < 4 {
-        return Err(
-            "Usage: DROP INDEX <table> <name>  (Type HELP DROP INDEX for details)".to_string(),
-        );
-    }
-    Ok(Command::DropIndex {
-        table: tokens[2].clone(),
-        name: tokens[3].clone(),
-    })
-}
-
-/// DESCRIBE SCHEMA <table> <prefix>
-fn parse_describe_schema(tokens: &[String]) -> Result<Command, String> {
-    if tokens.len() < 4 {
-        return Err(
-            "Usage: DESCRIBE SCHEMA <table> <prefix>  (Type HELP DESCRIBE SCHEMA for details)"
-                .to_string(),
-        );
-    }
-    Ok(Command::DescribeSchema {
-        table: tokens[2].clone(),
-        prefix: tokens[3].clone(),
-    })
-}
-
-/// DESCRIBE INDEX <table> <name>
-fn parse_describe_index(tokens: &[String]) -> Result<Command, String> {
-    if tokens.len() < 4 {
-        return Err(
-            "Usage: DESCRIBE INDEX <table> <name>  (Type HELP DESCRIBE INDEX for details)"
-                .to_string(),
-        );
-    }
-    Ok(Command::DescribeIndex {
-        table: tokens[2].clone(),
-        name: tokens[3].clone(),
-    })
-}
-
-/// LIST SCHEMAS <table>
-fn parse_list_schemas(tokens: &[String]) -> Result<Command, String> {
+/// DROP SCHEMA [table] <prefix>
+fn parse_drop_schema(tokens: &[String], default_table: Option<&str>) -> Result<Command, String> {
     if tokens.len() < 3 {
         return Err(
-            "Usage: LIST SCHEMAS <table>  (Type HELP LIST SCHEMAS for details)".to_string(),
+            "Usage: DROP SCHEMA [table] <prefix>  (Type HELP DROP SCHEMA for details)".to_string(),
         );
     }
-    Ok(Command::ListSchemas {
-        table: tokens[2].clone(),
-    })
+    // If tokens.len() == 3, only prefix given -> no table -> use default
+    // If tokens.len() >= 4, tokens[2] is table and tokens[3] is prefix
+    let (table, prefix) = if tokens.len() == 3 {
+        (resolve_table(None, default_table)?, tokens[2].clone())
+    } else {
+        (tokens[2].clone(), tokens[3].clone())
+    };
+    Ok(Command::DropSchema { table, prefix })
 }
 
-/// LIST INDEXES <table>
-fn parse_list_indexes(tokens: &[String]) -> Result<Command, String> {
+/// DROP INDEX [table] <name>
+fn parse_drop_index(tokens: &[String], default_table: Option<&str>) -> Result<Command, String> {
     if tokens.len() < 3 {
         return Err(
-            "Usage: LIST INDEXES <table>  (Type HELP LIST INDEXES for details)".to_string(),
+            "Usage: DROP INDEX [table] <name>  (Type HELP DROP INDEX for details)".to_string(),
         );
     }
-    Ok(Command::ListIndexes {
-        table: tokens[2].clone(),
-    })
+    // If tokens.len() == 3, only name given -> no table -> use default
+    // If tokens.len() >= 4, tokens[2] is table and tokens[3] is name
+    let (table, name) = if tokens.len() == 3 {
+        (resolve_table(None, default_table)?, tokens[2].clone())
+    } else {
+        (tokens[2].clone(), tokens[3].clone())
+    };
+    Ok(Command::DropIndex { table, name })
 }
 
-/// QUERY INDEX <table> <index_name> key=<value> [LIMIT <n>] [DESC]
-fn parse_query_index(tokens: &[String]) -> Result<Command, String> {
-    // Minimum: QUERY INDEX <table> <index_name> key=<value> = 5 tokens
-    if tokens.len() < 5 {
+/// DESCRIBE SCHEMA [table] <prefix>
+fn parse_describe_schema(tokens: &[String], default_table: Option<&str>) -> Result<Command, String> {
+    if tokens.len() < 3 {
         return Err(
-            "Usage: QUERY INDEX <table> <index_name> key=<value> [LIMIT <n>] [DESC]  (Type HELP QUERY INDEX for details)"
+            "Usage: DESCRIBE SCHEMA [table] <prefix>  (Type HELP DESCRIBE SCHEMA for details)"
                 .to_string(),
         );
     }
-    let table = tokens[2].clone();
-    let index_name = tokens[3].clone();
+    // If tokens.len() == 3, only prefix given -> no table -> use default
+    // If tokens.len() >= 4, tokens[2] is table and tokens[3] is prefix
+    let (table, prefix) = if tokens.len() == 3 {
+        (resolve_table(None, default_table)?, tokens[2].clone())
+    } else {
+        (tokens[2].clone(), tokens[3].clone())
+    };
+    Ok(Command::DescribeSchema { table, prefix })
+}
 
-    let (key_name, key_value) = parse_kv_pair(&tokens[4])?;
+/// DESCRIBE INDEX [table] <name>
+fn parse_describe_index(tokens: &[String], default_table: Option<&str>) -> Result<Command, String> {
+    if tokens.len() < 3 {
+        return Err(
+            "Usage: DESCRIBE INDEX [table] <name>  (Type HELP DESCRIBE INDEX for details)"
+                .to_string(),
+        );
+    }
+    // If tokens.len() == 3, only name given -> no table -> use default
+    // If tokens.len() >= 4, tokens[2] is table and tokens[3] is name
+    let (table, name) = if tokens.len() == 3 {
+        (resolve_table(None, default_table)?, tokens[2].clone())
+    } else {
+        (tokens[2].clone(), tokens[3].clone())
+    };
+    Ok(Command::DescribeIndex { table, name })
+}
+
+/// LIST SCHEMAS [table]
+fn parse_list_schemas(tokens: &[String], default_table: Option<&str>) -> Result<Command, String> {
+    let table = if tokens.len() < 3 {
+        resolve_table(None, default_table)?
+    } else {
+        tokens[2].clone()
+    };
+    Ok(Command::ListSchemas { table })
+}
+
+/// LIST INDEXES [table]
+fn parse_list_indexes(tokens: &[String], default_table: Option<&str>) -> Result<Command, String> {
+    let table = if tokens.len() < 3 {
+        resolve_table(None, default_table)?
+    } else {
+        tokens[2].clone()
+    };
+    Ok(Command::ListIndexes { table })
+}
+
+/// QUERY INDEX [table] <index_name> key=<value> [LIMIT <n>] [DESC]
+fn parse_query_index(tokens: &[String], default_table: Option<&str>) -> Result<Command, String> {
+    // Without table: QUERY INDEX <index_name> key=<value> = 4 tokens
+    // With table:    QUERY INDEX <table> <index_name> key=<value> = 5 tokens
+    if tokens.len() < 4 {
+        return Err(
+            "Usage: QUERY INDEX [table] <index_name> key=<value> [LIMIT <n>] [DESC]  (Type HELP QUERY INDEX for details)"
+                .to_string(),
+        );
+    }
+    // Detect: if tokens[3] contains '=', tokens[2] is the index name (no table)
+    let (table, index_name, key_idx) = if tokens[3].contains('=') {
+        (resolve_table(None, default_table)?, tokens[2].clone(), 3)
+    } else {
+        if tokens.len() < 5 {
+            return Err(
+                "Usage: QUERY INDEX [table] <index_name> key=<value> [LIMIT <n>] [DESC]  (Type HELP QUERY INDEX for details)"
+                    .to_string(),
+            );
+        }
+        (tokens[2].clone(), tokens[3].clone(), 4)
+    };
+
+    let (key_name, key_value) = parse_kv_pair(&tokens[key_idx])?;
     if key_name.to_uppercase() != "KEY" {
-        return Err(format!("Expected key=<value>, got '{}'", tokens[4]));
+        return Err(format!("Expected key=<value>, got '{}'", tokens[key_idx]));
     }
 
     let mut limit = None;
     let mut desc = false;
-    let mut i = 5;
+    let mut i = key_idx + 1;
 
     while i < tokens.len() {
         let upper = tokens[i].to_uppercase();
@@ -860,7 +990,7 @@ mod tests {
 
     #[test]
     fn test_create_table_pk_only() {
-        let cmd = parse("CREATE TABLE users PK user_id STRING").unwrap();
+        let cmd = parse("CREATE TABLE users PK user_id STRING", None).unwrap();
         match cmd {
             Command::CreateTable {
                 name,
@@ -881,7 +1011,7 @@ mod tests {
 
     #[test]
     fn test_create_table_with_sort_key() {
-        let cmd = parse("CREATE TABLE events PK user_id STRING SK timestamp NUMBER").unwrap();
+        let cmd = parse("CREATE TABLE events PK user_id STRING SK timestamp NUMBER", None).unwrap();
         match cmd {
             Command::CreateTable {
                 name,
@@ -904,7 +1034,7 @@ mod tests {
 
     #[test]
     fn test_create_table_case_insensitive() {
-        let cmd = parse("create table Items pk id string").unwrap();
+        let cmd = parse("create table Items pk id string", None).unwrap();
         match cmd {
             Command::CreateTable {
                 name, pk_type, ttl, ..
@@ -919,7 +1049,7 @@ mod tests {
 
     #[test]
     fn test_create_table_binary_key() {
-        let cmd = parse("CREATE TABLE blobs PK hash BINARY").unwrap();
+        let cmd = parse("CREATE TABLE blobs PK hash BINARY", None).unwrap();
         match cmd {
             Command::CreateTable { pk_type, ttl, .. } => {
                 assert_eq!(pk_type, KeyType::Binary);
@@ -931,7 +1061,7 @@ mod tests {
 
     #[test]
     fn test_create_table_with_ttl() {
-        let cmd = parse("CREATE TABLE cache PK key STRING TTL expires").unwrap();
+        let cmd = parse("CREATE TABLE cache PK key STRING TTL expires", None).unwrap();
         match cmd {
             Command::CreateTable { name, ttl, sk, .. } => {
                 assert_eq!(name, "cache");
@@ -944,7 +1074,7 @@ mod tests {
 
     #[test]
     fn test_create_table_with_sk_and_ttl() {
-        let cmd = parse("CREATE TABLE cache PK key STRING SK sort NUMBER TTL expires").unwrap();
+        let cmd = parse("CREATE TABLE cache PK key STRING SK sort NUMBER TTL expires", None).unwrap();
         match cmd {
             Command::CreateTable { sk, ttl, .. } => {
                 assert!(sk.is_some());
@@ -956,7 +1086,7 @@ mod tests {
 
     #[test]
     fn test_create_table_ttl_missing_attr_name() {
-        let result = parse("CREATE TABLE cache PK key STRING TTL");
+        let result = parse("CREATE TABLE cache PK key STRING TTL", None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("TTL requires"));
     }
@@ -967,7 +1097,7 @@ mod tests {
 
     #[test]
     fn test_put_with_json() {
-        let cmd = parse(r#"PUT users {"user_id": "alice", "name": "Alice"}"#).unwrap();
+        let cmd = parse(r#"PUT users {"user_id": "alice", "name": "Alice"}"#, None).unwrap();
         match cmd {
             Command::Put { table, document } => {
                 assert_eq!(table, "users");
@@ -980,7 +1110,7 @@ mod tests {
 
     #[test]
     fn test_put_with_nested_json() {
-        let cmd = parse(r#"PUT items {"id": "x", "meta": {"nested": true, "count": 5}}"#).unwrap();
+        let cmd = parse(r#"PUT items {"id": "x", "meta": {"nested": true, "count": 5}}"#, None).unwrap();
         match cmd {
             Command::Put { document, .. } => {
                 assert_eq!(document["meta"]["nested"], true);
@@ -992,7 +1122,7 @@ mod tests {
 
     #[test]
     fn test_put_bad_json() {
-        let result = parse("PUT users {not valid json}");
+        let result = parse("PUT users {not valid json}", None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Invalid JSON"));
     }
@@ -1003,7 +1133,7 @@ mod tests {
 
     #[test]
     fn test_get_pk_only() {
-        let cmd = parse("GET users pk=alice").unwrap();
+        let cmd = parse("GET users pk=alice", None).unwrap();
         match cmd {
             Command::Get { table, pk, sk } => {
                 assert_eq!(table, "users");
@@ -1016,7 +1146,7 @@ mod tests {
 
     #[test]
     fn test_get_pk_and_sk() {
-        let cmd = parse("GET events pk=alice sk=100").unwrap();
+        let cmd = parse("GET events pk=alice sk=100", None).unwrap();
         match cmd {
             Command::Get { table, pk, sk } => {
                 assert_eq!(table, "events");
@@ -1029,7 +1159,7 @@ mod tests {
 
     #[test]
     fn test_get_quoted_value() {
-        let cmd = parse(r#"GET users pk="hello world""#).unwrap();
+        let cmd = parse(r#"GET users pk="hello world""#, None).unwrap();
         match cmd {
             Command::Get { pk, .. } => {
                 assert_eq!(pk, json!("hello world"));
@@ -1044,7 +1174,7 @@ mod tests {
 
     #[test]
     fn test_delete_pk_only() {
-        let cmd = parse("DELETE users pk=alice").unwrap();
+        let cmd = parse("DELETE users pk=alice", None).unwrap();
         match cmd {
             Command::Delete { table, pk, sk } => {
                 assert_eq!(table, "users");
@@ -1057,7 +1187,7 @@ mod tests {
 
     #[test]
     fn test_delete_pk_and_sk() {
-        let cmd = parse("DELETE events pk=alice sk=100").unwrap();
+        let cmd = parse("DELETE events pk=alice sk=100", None).unwrap();
         match cmd {
             Command::Delete { table, pk, sk } => {
                 assert_eq!(table, "events");
@@ -1074,7 +1204,7 @@ mod tests {
 
     #[test]
     fn test_query_pk_only() {
-        let cmd = parse("QUERY events pk=alice").unwrap();
+        let cmd = parse("QUERY events pk=alice", None).unwrap();
         match cmd {
             Command::Query {
                 table,
@@ -1095,7 +1225,7 @@ mod tests {
 
     #[test]
     fn test_query_sk_eq() {
-        let cmd = parse("QUERY events pk=alice SK = 100").unwrap();
+        let cmd = parse("QUERY events pk=alice SK = 100", None).unwrap();
         match cmd {
             Command::Query { sort_condition, .. } => match sort_condition.unwrap() {
                 SortClause::Eq(v) => assert_eq!(v, json!(100.0)),
@@ -1107,7 +1237,7 @@ mod tests {
 
     #[test]
     fn test_query_sk_lt() {
-        let cmd = parse("QUERY events pk=alice SK < 50").unwrap();
+        let cmd = parse("QUERY events pk=alice SK < 50", None).unwrap();
         match cmd {
             Command::Query { sort_condition, .. } => match sort_condition.unwrap() {
                 SortClause::Lt(v) => assert_eq!(v, json!(50.0)),
@@ -1119,7 +1249,7 @@ mod tests {
 
     #[test]
     fn test_query_sk_le() {
-        let cmd = parse("QUERY events pk=alice SK <= 50").unwrap();
+        let cmd = parse("QUERY events pk=alice SK <= 50", None).unwrap();
         match cmd {
             Command::Query { sort_condition, .. } => match sort_condition.unwrap() {
                 SortClause::Le(v) => assert_eq!(v, json!(50.0)),
@@ -1131,7 +1261,7 @@ mod tests {
 
     #[test]
     fn test_query_sk_gt() {
-        let cmd = parse("QUERY events pk=alice SK > 200").unwrap();
+        let cmd = parse("QUERY events pk=alice SK > 200", None).unwrap();
         match cmd {
             Command::Query { sort_condition, .. } => match sort_condition.unwrap() {
                 SortClause::Gt(v) => assert_eq!(v, json!(200.0)),
@@ -1143,7 +1273,7 @@ mod tests {
 
     #[test]
     fn test_query_sk_ge() {
-        let cmd = parse("QUERY events pk=alice SK >= 200").unwrap();
+        let cmd = parse("QUERY events pk=alice SK >= 200", None).unwrap();
         match cmd {
             Command::Query { sort_condition, .. } => match sort_condition.unwrap() {
                 SortClause::Ge(v) => assert_eq!(v, json!(200.0)),
@@ -1155,7 +1285,7 @@ mod tests {
 
     #[test]
     fn test_query_between() {
-        let cmd = parse("QUERY events pk=alice BETWEEN 100 AND 500").unwrap();
+        let cmd = parse("QUERY events pk=alice BETWEEN 100 AND 500", None).unwrap();
         match cmd {
             Command::Query { sort_condition, .. } => match sort_condition.unwrap() {
                 SortClause::Between(lo, hi) => {
@@ -1170,7 +1300,7 @@ mod tests {
 
     #[test]
     fn test_query_begins_with() {
-        let cmd = parse(r#"QUERY events pk=alice BEGINS_WITH "abc""#).unwrap();
+        let cmd = parse(r#"QUERY events pk=alice BEGINS_WITH "abc""#, None).unwrap();
         match cmd {
             Command::Query { sort_condition, .. } => match sort_condition.unwrap() {
                 SortClause::BeginsWith(prefix) => assert_eq!(prefix, "abc"),
@@ -1182,7 +1312,7 @@ mod tests {
 
     #[test]
     fn test_query_begins_with_bare_word() {
-        let cmd = parse("QUERY events pk=alice BEGINS_WITH abc").unwrap();
+        let cmd = parse("QUERY events pk=alice BEGINS_WITH abc", None).unwrap();
         match cmd {
             Command::Query { sort_condition, .. } => match sort_condition.unwrap() {
                 SortClause::BeginsWith(prefix) => assert_eq!(prefix, "abc"),
@@ -1194,7 +1324,7 @@ mod tests {
 
     #[test]
     fn test_query_with_limit() {
-        let cmd = parse("QUERY events pk=alice LIMIT 10").unwrap();
+        let cmd = parse("QUERY events pk=alice LIMIT 10", None).unwrap();
         match cmd {
             Command::Query { limit, .. } => {
                 assert_eq!(limit, Some(10));
@@ -1205,7 +1335,7 @@ mod tests {
 
     #[test]
     fn test_query_with_desc() {
-        let cmd = parse("QUERY events pk=alice DESC").unwrap();
+        let cmd = parse("QUERY events pk=alice DESC", None).unwrap();
         match cmd {
             Command::Query { desc, .. } => {
                 assert!(desc);
@@ -1216,7 +1346,7 @@ mod tests {
 
     #[test]
     fn test_query_sk_limit_desc() {
-        let cmd = parse("QUERY events pk=alice SK >= 100 LIMIT 5 DESC").unwrap();
+        let cmd = parse("QUERY events pk=alice SK >= 100 LIMIT 5 DESC", None).unwrap();
         match cmd {
             Command::Query {
                 sort_condition,
@@ -1241,7 +1371,7 @@ mod tests {
 
     #[test]
     fn test_scan_no_limit() {
-        let cmd = parse("SCAN items").unwrap();
+        let cmd = parse("SCAN items", None).unwrap();
         match cmd {
             Command::Scan { table, limit } => {
                 assert_eq!(table, "items");
@@ -1253,7 +1383,7 @@ mod tests {
 
     #[test]
     fn test_scan_with_limit() {
-        let cmd = parse("SCAN items LIMIT 20").unwrap();
+        let cmd = parse("SCAN items LIMIT 20", None).unwrap();
         match cmd {
             Command::Scan { table, limit } => {
                 assert_eq!(table, "items");
@@ -1269,19 +1399,19 @@ mod tests {
 
     #[test]
     fn test_list_tables() {
-        let cmd = parse("LIST TABLES").unwrap();
+        let cmd = parse("LIST TABLES", None).unwrap();
         assert!(matches!(cmd, Command::ListTables));
     }
 
     #[test]
     fn test_list_tables_case_insensitive() {
-        let cmd = parse("list tables").unwrap();
+        let cmd = parse("list tables", None).unwrap();
         assert!(matches!(cmd, Command::ListTables));
     }
 
     #[test]
     fn test_list_keys() {
-        let cmd = parse("LIST KEYS mytable").unwrap();
+        let cmd = parse("LIST KEYS mytable", None).unwrap();
         match cmd {
             Command::ListKeys { table, limit } => {
                 assert_eq!(table, "mytable");
@@ -1293,7 +1423,7 @@ mod tests {
 
     #[test]
     fn test_list_keys_with_limit() {
-        let cmd = parse("LIST KEYS mytable LIMIT 10").unwrap();
+        let cmd = parse("LIST KEYS mytable LIMIT 10", None).unwrap();
         match cmd {
             Command::ListKeys { table, limit } => {
                 assert_eq!(table, "mytable");
@@ -1305,7 +1435,7 @@ mod tests {
 
     #[test]
     fn test_list_keys_case_insensitive() {
-        let cmd = parse("list keys mytable limit 5").unwrap();
+        let cmd = parse("list keys mytable limit 5", None).unwrap();
         match cmd {
             Command::ListKeys { table, limit } => {
                 assert_eq!(table, "mytable");
@@ -1317,20 +1447,20 @@ mod tests {
 
     #[test]
     fn test_list_keys_missing_table() {
-        let result = parse("LIST KEYS");
+        let result = parse("LIST KEYS", None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_list_keys_invalid_limit() {
-        let result = parse("LIST KEYS mytable LIMIT abc");
+        let result = parse("LIST KEYS mytable LIMIT abc", None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Invalid LIMIT"));
     }
 
     #[test]
     fn test_list_keys_unexpected_token() {
-        let result = parse("LIST KEYS mytable BADTOKEN");
+        let result = parse("LIST KEYS mytable BADTOKEN", None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unexpected token"));
     }
@@ -1341,7 +1471,7 @@ mod tests {
 
     #[test]
     fn test_list_prefixes() {
-        let cmd = parse("LIST PREFIXES mytable pk=alice").unwrap();
+        let cmd = parse("LIST PREFIXES mytable pk=alice", None).unwrap();
         match cmd {
             Command::ListPrefixes { table, pk, limit } => {
                 assert_eq!(table, "mytable");
@@ -1354,7 +1484,7 @@ mod tests {
 
     #[test]
     fn test_list_prefixes_with_limit() {
-        let cmd = parse("LIST PREFIXES mytable pk=alice LIMIT 5").unwrap();
+        let cmd = parse("LIST PREFIXES mytable pk=alice LIMIT 5", None).unwrap();
         match cmd {
             Command::ListPrefixes { table, pk, limit } => {
                 assert_eq!(table, "mytable");
@@ -1367,7 +1497,7 @@ mod tests {
 
     #[test]
     fn test_list_prefixes_case_insensitive() {
-        let cmd = parse("list prefixes mytable pk=alice limit 3").unwrap();
+        let cmd = parse("list prefixes mytable pk=alice limit 3", None).unwrap();
         match cmd {
             Command::ListPrefixes { table, pk, limit } => {
                 assert_eq!(table, "mytable");
@@ -1380,27 +1510,27 @@ mod tests {
 
     #[test]
     fn test_list_prefixes_missing_pk() {
-        let result = parse("LIST PREFIXES mytable");
+        let result = parse("LIST PREFIXES mytable", None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_list_prefixes_invalid_limit() {
-        let result = parse("LIST PREFIXES mytable pk=alice LIMIT abc");
+        let result = parse("LIST PREFIXES mytable pk=alice LIMIT abc", None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Invalid LIMIT"));
     }
 
     #[test]
     fn test_list_prefixes_unexpected_token() {
-        let result = parse("LIST PREFIXES mytable pk=alice BADTOKEN");
+        let result = parse("LIST PREFIXES mytable pk=alice BADTOKEN", None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unexpected token"));
     }
 
     #[test]
     fn test_describe_table() {
-        let cmd = parse("DESCRIBE TABLE users").unwrap();
+        let cmd = parse("DESCRIBE TABLE users", None).unwrap();
         match cmd {
             Command::DescribeTable { name } => assert_eq!(name, "users"),
             _ => panic!("Expected DescribeTable"),
@@ -1413,13 +1543,13 @@ mod tests {
 
     #[test]
     fn test_help() {
-        let cmd = parse("HELP").unwrap();
+        let cmd = parse("HELP", None).unwrap();
         assert!(matches!(cmd, Command::Help(None)));
     }
 
     #[test]
     fn test_help_with_topic() {
-        let cmd = parse("HELP QUERY").unwrap();
+        let cmd = parse("HELP QUERY", None).unwrap();
         match cmd {
             Command::Help(Some(topic)) => assert_eq!(topic, "QUERY"),
             _ => panic!("Expected Help with topic"),
@@ -1428,7 +1558,7 @@ mod tests {
 
     #[test]
     fn test_help_with_multi_word_topic() {
-        let cmd = parse("HELP CREATE TABLE").unwrap();
+        let cmd = parse("HELP CREATE TABLE", None).unwrap();
         match cmd {
             Command::Help(Some(topic)) => assert_eq!(topic, "CREATE TABLE"),
             _ => panic!("Expected Help with topic"),
@@ -1437,13 +1567,13 @@ mod tests {
 
     #[test]
     fn test_exit() {
-        let cmd = parse("EXIT").unwrap();
+        let cmd = parse("EXIT", None).unwrap();
         assert!(matches!(cmd, Command::Exit));
     }
 
     #[test]
     fn test_quit() {
-        let cmd = parse("QUIT").unwrap();
+        let cmd = parse("QUIT", None).unwrap();
         assert!(matches!(cmd, Command::Exit));
     }
 
@@ -1453,84 +1583,84 @@ mod tests {
 
     #[test]
     fn test_unknown_command() {
-        let result = parse("FOOBAR");
+        let result = parse("FOOBAR", None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unknown command"));
     }
 
     #[test]
     fn test_empty_input() {
-        let result = parse("");
+        let result = parse("", None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_create_missing_args() {
-        let result = parse("CREATE TABLE");
+        let result = parse("CREATE TABLE", None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_get_missing_pk() {
-        let result = parse("GET users");
+        let result = parse("GET users", None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_drop_missing_table_name() {
-        let result = parse("DROP TABLE");
+        let result = parse("DROP TABLE", None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_query_invalid_limit() {
-        let result = parse("QUERY events pk=alice LIMIT abc");
+        let result = parse("QUERY events pk=alice LIMIT abc", None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Invalid LIMIT"));
     }
 
     #[test]
     fn test_between_missing_and() {
-        let result = parse("QUERY events pk=alice BETWEEN 10 NOPE 20");
+        let result = parse("QUERY events pk=alice BETWEEN 10 NOPE 20", None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("AND"));
     }
 
     #[test]
     fn test_scan_invalid_limit() {
-        let result = parse("SCAN items LIMIT xyz");
+        let result = parse("SCAN items LIMIT xyz", None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_unterminated_json() {
-        let result = parse("PUT users {\"id\": \"x\"");
+        let result = parse("PUT users {\"id\": \"x\"", None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unterminated JSON"));
     }
 
     #[test]
     fn test_unterminated_string() {
-        let result = parse(r#"GET users pk="hello"#);
+        let result = parse(r#"GET users pk="hello"#, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unterminated quoted string"));
     }
 
     #[test]
     fn test_describe_missing_table_keyword() {
-        let result = parse("DESCRIBE users");
+        let result = parse("DESCRIBE users", None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_list_missing_subcommand() {
-        let result = parse("LIST");
+        let result = parse("LIST", None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_list_invalid_subcommand() {
-        let result = parse("LIST FOOBAR");
+        let result = parse("LIST FOOBAR", None);
         assert!(result.is_err());
         assert!(
             result
@@ -1583,40 +1713,40 @@ mod tests {
 
     #[test]
     fn test_query_unexpected_token() {
-        let result = parse("QUERY events pk=alice BADTOKEN");
+        let result = parse("QUERY events pk=alice BADTOKEN", None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unexpected token"));
     }
 
     #[test]
     fn test_scan_unexpected_token() {
-        let result = parse("SCAN items BADTOKEN");
+        let result = parse("SCAN items BADTOKEN", None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unexpected token"));
     }
 
     #[test]
     fn test_create_table_bad_keyword_after_create() {
-        let result = parse("CREATE WRONG name PK id STRING");
+        let result = parse("CREATE WRONG name PK id STRING", None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Expected TABLE"));
     }
 
     #[test]
     fn test_sk_missing_value() {
-        let result = parse("QUERY events pk=alice SK >=");
+        let result = parse("QUERY events pk=alice SK >=", None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_begins_with_missing_prefix() {
-        let result = parse("QUERY events pk=alice BEGINS_WITH");
+        let result = parse("QUERY events pk=alice BEGINS_WITH", None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_between_missing_values() {
-        let result = parse("QUERY events pk=alice BETWEEN 10");
+        let result = parse("QUERY events pk=alice BETWEEN 10", None);
         assert!(result.is_err());
     }
 
@@ -1626,7 +1756,7 @@ mod tests {
 
     #[test]
     fn test_create_schema_basic() {
-        let cmd = parse("CREATE SCHEMA data PREFIX CONTACT").unwrap();
+        let cmd = parse("CREATE SCHEMA data PREFIX CONTACT", None).unwrap();
         match cmd {
             Command::CreateSchema {
                 table,
@@ -1647,9 +1777,7 @@ mod tests {
 
     #[test]
     fn test_create_schema_full() {
-        let cmd = parse(
-            "CREATE SCHEMA data PREFIX CONTACT DESCRIPTION \"People\" ATTR email STRING REQUIRED ATTR age NUMBER VALIDATE",
-        )
+        let cmd = parse("CREATE SCHEMA data PREFIX CONTACT DESCRIPTION \"People\" ATTR email STRING REQUIRED ATTR age NUMBER VALIDATE", None)
         .unwrap();
         match cmd {
             Command::CreateSchema {
@@ -1677,13 +1805,13 @@ mod tests {
 
     #[test]
     fn test_create_schema_missing_prefix() {
-        let result = parse("CREATE SCHEMA data");
+        let result = parse("CREATE SCHEMA data", None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_create_schema_bad_keyword() {
-        let result = parse("CREATE SCHEMA data WRONG CONTACT");
+        let result = parse("CREATE SCHEMA data WRONG CONTACT", None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("PREFIX"));
     }
@@ -1694,7 +1822,7 @@ mod tests {
 
     #[test]
     fn test_drop_schema() {
-        let cmd = parse("DROP SCHEMA data CONTACT").unwrap();
+        let cmd = parse("DROP SCHEMA data CONTACT", None).unwrap();
         match cmd {
             Command::DropSchema { table, prefix } => {
                 assert_eq!(table, "data");
@@ -1706,7 +1834,7 @@ mod tests {
 
     #[test]
     fn test_drop_schema_missing_prefix() {
-        let result = parse("DROP SCHEMA data");
+        let result = parse("DROP SCHEMA data", None);
         assert!(result.is_err());
     }
 
@@ -1716,7 +1844,7 @@ mod tests {
 
     #[test]
     fn test_list_schemas() {
-        let cmd = parse("LIST SCHEMAS data").unwrap();
+        let cmd = parse("LIST SCHEMAS data", None).unwrap();
         match cmd {
             Command::ListSchemas { table } => {
                 assert_eq!(table, "data");
@@ -1727,13 +1855,13 @@ mod tests {
 
     #[test]
     fn test_list_schemas_missing_table() {
-        let result = parse("LIST SCHEMAS");
+        let result = parse("LIST SCHEMAS", None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_list_indexes() {
-        let cmd = parse("LIST INDEXES data").unwrap();
+        let cmd = parse("LIST INDEXES data", None).unwrap();
         match cmd {
             Command::ListIndexes { table } => {
                 assert_eq!(table, "data");
@@ -1748,7 +1876,7 @@ mod tests {
 
     #[test]
     fn test_describe_schema() {
-        let cmd = parse("DESCRIBE SCHEMA data CONTACT").unwrap();
+        let cmd = parse("DESCRIBE SCHEMA data CONTACT", None).unwrap();
         match cmd {
             Command::DescribeSchema { table, prefix } => {
                 assert_eq!(table, "data");
@@ -1760,13 +1888,13 @@ mod tests {
 
     #[test]
     fn test_describe_schema_missing_prefix() {
-        let result = parse("DESCRIBE SCHEMA data");
+        let result = parse("DESCRIBE SCHEMA data", None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_describe_index() {
-        let cmd = parse("DESCRIBE INDEX data email-idx").unwrap();
+        let cmd = parse("DESCRIBE INDEX data email-idx", None).unwrap();
         match cmd {
             Command::DescribeIndex { table, name } => {
                 assert_eq!(table, "data");
@@ -1782,7 +1910,7 @@ mod tests {
 
     #[test]
     fn test_create_index() {
-        let cmd = parse("CREATE INDEX data email-idx SCHEMA CONTACT KEY email STRING").unwrap();
+        let cmd = parse("CREATE INDEX data email-idx SCHEMA CONTACT KEY email STRING", None).unwrap();
         match cmd {
             Command::CreateIndex {
                 table,
@@ -1803,7 +1931,7 @@ mod tests {
 
     #[test]
     fn test_create_index_number_key() {
-        let cmd = parse("CREATE INDEX data price-idx SCHEMA PRODUCT KEY price NUMBER").unwrap();
+        let cmd = parse("CREATE INDEX data price-idx SCHEMA PRODUCT KEY price NUMBER", None).unwrap();
         match cmd {
             Command::CreateIndex { key_type, .. } => {
                 assert_eq!(key_type, KeyType::Number);
@@ -1814,7 +1942,7 @@ mod tests {
 
     #[test]
     fn test_create_index_missing_args() {
-        let result = parse("CREATE INDEX data email-idx");
+        let result = parse("CREATE INDEX data email-idx", None);
         assert!(result.is_err());
     }
 
@@ -1824,7 +1952,7 @@ mod tests {
 
     #[test]
     fn test_drop_index() {
-        let cmd = parse("DROP INDEX data email-idx").unwrap();
+        let cmd = parse("DROP INDEX data email-idx", None).unwrap();
         match cmd {
             Command::DropIndex { table, name } => {
                 assert_eq!(table, "data");
@@ -1840,7 +1968,7 @@ mod tests {
 
     #[test]
     fn test_query_index_basic() {
-        let cmd = parse("QUERY INDEX data email-idx key=alice").unwrap();
+        let cmd = parse("QUERY INDEX data email-idx key=alice", None).unwrap();
         match cmd {
             Command::QueryIndex {
                 table,
@@ -1861,7 +1989,7 @@ mod tests {
 
     #[test]
     fn test_query_index_with_limit_desc() {
-        let cmd = parse("QUERY INDEX data email-idx key=\"alice@test.com\" LIMIT 5 DESC").unwrap();
+        let cmd = parse("QUERY INDEX data email-idx key=\"alice@test.com\" LIMIT 5 DESC", None).unwrap();
         match cmd {
             Command::QueryIndex {
                 table,
@@ -1882,13 +2010,13 @@ mod tests {
 
     #[test]
     fn test_query_index_missing_key() {
-        let result = parse("QUERY INDEX data email-idx");
+        let result = parse("QUERY INDEX data email-idx", None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_query_index_wrong_key_name() {
-        let result = parse("QUERY INDEX data email-idx pk=alice");
+        let result = parse("QUERY INDEX data email-idx pk=alice", None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("key="));
     }
@@ -1899,13 +2027,268 @@ mod tests {
 
     #[test]
     fn test_create_schema_case_insensitive() {
-        let cmd = parse("create schema data prefix CONTACT").unwrap();
+        let cmd = parse("create schema data prefix CONTACT", None).unwrap();
         assert!(matches!(cmd, Command::CreateSchema { .. }));
     }
 
     #[test]
     fn test_query_index_case_insensitive() {
-        let cmd = parse("query index data email-idx key=alice").unwrap();
+        let cmd = parse("query index data email-idx key=alice", None).unwrap();
         assert!(matches!(cmd, Command::QueryIndex { .. }));
+    }
+
+    // -----------------------------------------------------------------------
+    // USE command
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_use_set() {
+        let cmd = parse("USE data", None).unwrap();
+        match cmd {
+            Command::Use { table } => assert_eq!(table, Some("data".to_string())),
+            _ => panic!("Expected Use"),
+        }
+    }
+
+    #[test]
+    fn test_use_clear() {
+        let cmd = parse("USE", None).unwrap();
+        match cmd {
+            Command::Use { table } => assert!(table.is_none()),
+            _ => panic!("Expected Use"),
+        }
+    }
+
+    #[test]
+    fn test_use_case_insensitive() {
+        let cmd = parse("use mytable", None).unwrap();
+        match cmd {
+            Command::Use { table } => assert_eq!(table, Some("mytable".to_string())),
+            _ => panic!("Expected Use"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Table-optional commands (with default_table)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_put_without_table() {
+        let cmd = parse(r#"PUT {"pk":"a","name":"Alice"}"#, Some("data")).unwrap();
+        match cmd {
+            Command::Put { table, document } => {
+                assert_eq!(table, "data");
+                assert_eq!(document["pk"], "a");
+            }
+            _ => panic!("Expected Put"),
+        }
+    }
+
+    #[test]
+    fn test_get_without_table() {
+        let cmd = parse("GET pk=alice", Some("data")).unwrap();
+        match cmd {
+            Command::Get { table, pk, .. } => {
+                assert_eq!(table, "data");
+                assert_eq!(pk, json!("alice"));
+            }
+            _ => panic!("Expected Get"),
+        }
+    }
+
+    #[test]
+    fn test_delete_without_table() {
+        let cmd = parse("DELETE pk=alice", Some("data")).unwrap();
+        match cmd {
+            Command::Delete { table, pk, .. } => {
+                assert_eq!(table, "data");
+                assert_eq!(pk, json!("alice"));
+            }
+            _ => panic!("Expected Delete"),
+        }
+    }
+
+    #[test]
+    fn test_query_without_table() {
+        let cmd = parse("QUERY pk=alice", Some("data")).unwrap();
+        match cmd {
+            Command::Query { table, pk, .. } => {
+                assert_eq!(table, "data");
+                assert_eq!(pk, json!("alice"));
+            }
+            _ => panic!("Expected Query"),
+        }
+    }
+
+    #[test]
+    fn test_scan_without_table() {
+        let cmd = parse("SCAN LIMIT 5", Some("data")).unwrap();
+        match cmd {
+            Command::Scan { table, limit } => {
+                assert_eq!(table, "data");
+                assert_eq!(limit, Some(5));
+            }
+            _ => panic!("Expected Scan"),
+        }
+    }
+
+    #[test]
+    fn test_scan_bare_without_table() {
+        let cmd = parse("SCAN", Some("data")).unwrap();
+        match cmd {
+            Command::Scan { table, limit } => {
+                assert_eq!(table, "data");
+                assert!(limit.is_none());
+            }
+            _ => panic!("Expected Scan"),
+        }
+    }
+
+    #[test]
+    fn test_list_schemas_without_table() {
+        let cmd = parse("LIST SCHEMAS", Some("data")).unwrap();
+        match cmd {
+            Command::ListSchemas { table } => assert_eq!(table, "data"),
+            _ => panic!("Expected ListSchemas"),
+        }
+    }
+
+    #[test]
+    fn test_list_indexes_without_table() {
+        let cmd = parse("LIST INDEXES", Some("data")).unwrap();
+        match cmd {
+            Command::ListIndexes { table } => assert_eq!(table, "data"),
+            _ => panic!("Expected ListIndexes"),
+        }
+    }
+
+    #[test]
+    fn test_list_keys_without_table() {
+        let cmd = parse("LIST KEYS", Some("data")).unwrap();
+        match cmd {
+            Command::ListKeys { table, .. } => assert_eq!(table, "data"),
+            _ => panic!("Expected ListKeys"),
+        }
+    }
+
+    #[test]
+    fn test_describe_table_without_name() {
+        let cmd = parse("DESCRIBE TABLE", Some("data")).unwrap();
+        match cmd {
+            Command::DescribeTable { name } => assert_eq!(name, "data"),
+            _ => panic!("Expected DescribeTable"),
+        }
+    }
+
+    #[test]
+    fn test_create_schema_without_table() {
+        let cmd = parse("CREATE SCHEMA PREFIX CONTACT", Some("data")).unwrap();
+        match cmd {
+            Command::CreateSchema { table, prefix, .. } => {
+                assert_eq!(table, "data");
+                assert_eq!(prefix, "CONTACT");
+            }
+            _ => panic!("Expected CreateSchema"),
+        }
+    }
+
+    #[test]
+    fn test_drop_schema_without_table() {
+        let cmd = parse("DROP SCHEMA CONTACT", Some("data")).unwrap();
+        match cmd {
+            Command::DropSchema { table, prefix } => {
+                assert_eq!(table, "data");
+                assert_eq!(prefix, "CONTACT");
+            }
+            _ => panic!("Expected DropSchema"),
+        }
+    }
+
+    #[test]
+    fn test_describe_schema_without_table() {
+        let cmd = parse("DESCRIBE SCHEMA CONTACT", Some("data")).unwrap();
+        match cmd {
+            Command::DescribeSchema { table, prefix } => {
+                assert_eq!(table, "data");
+                assert_eq!(prefix, "CONTACT");
+            }
+            _ => panic!("Expected DescribeSchema"),
+        }
+    }
+
+    #[test]
+    fn test_create_index_without_table() {
+        let cmd = parse(
+            "CREATE INDEX email-idx SCHEMA CONTACT KEY email STRING",
+            Some("data"),
+        )
+        .unwrap();
+        match cmd {
+            Command::CreateIndex {
+                table,
+                name,
+                schema_prefix,
+                ..
+            } => {
+                assert_eq!(table, "data");
+                assert_eq!(name, "email-idx");
+                assert_eq!(schema_prefix, "CONTACT");
+            }
+            _ => panic!("Expected CreateIndex"),
+        }
+    }
+
+    #[test]
+    fn test_drop_index_without_table() {
+        let cmd = parse("DROP INDEX email-idx", Some("data")).unwrap();
+        match cmd {
+            Command::DropIndex { table, name } => {
+                assert_eq!(table, "data");
+                assert_eq!(name, "email-idx");
+            }
+            _ => panic!("Expected DropIndex"),
+        }
+    }
+
+    #[test]
+    fn test_describe_index_without_table() {
+        let cmd = parse("DESCRIBE INDEX email-idx", Some("data")).unwrap();
+        match cmd {
+            Command::DescribeIndex { table, name } => {
+                assert_eq!(table, "data");
+                assert_eq!(name, "email-idx");
+            }
+            _ => panic!("Expected DescribeIndex"),
+        }
+    }
+
+    #[test]
+    fn test_query_index_without_table() {
+        let cmd = parse("QUERY INDEX email-idx key=alice", Some("data")).unwrap();
+        match cmd {
+            Command::QueryIndex {
+                table, index_name, ..
+            } => {
+                assert_eq!(table, "data");
+                assert_eq!(index_name, "email-idx");
+            }
+            _ => panic!("Expected QueryIndex"),
+        }
+    }
+
+    #[test]
+    fn test_no_table_no_default_errors() {
+        let result = parse("SCAN", None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("No table specified"));
+    }
+
+    #[test]
+    fn test_explicit_table_overrides_default() {
+        let cmd = parse("SCAN other", Some("data")).unwrap();
+        match cmd {
+            Command::Scan { table, .. } => assert_eq!(table, "other"),
+            _ => panic!("Expected Scan"),
+        }
     }
 }

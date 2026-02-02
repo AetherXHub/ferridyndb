@@ -155,8 +155,10 @@ fn run_exec_mode(
         OutputMode::Pretty
     };
 
+    let mut default_table: Option<String> = None;
+
     for cmd_str in commands {
-        let cmd = match parser::parse(cmd_str) {
+        let cmd = match parser::parse(cmd_str, default_table.as_deref()) {
             Ok(cmd) => cmd,
             Err(e) => {
                 display::render_error(&e, &mode);
@@ -166,6 +168,9 @@ fn run_exec_mode(
 
         match executor::execute(client, rt, cmd) {
             Ok(result) => {
+                if let executor::CommandResult::Use(ref t) = result {
+                    default_table = t.clone();
+                }
                 display::render(&result, &mode);
             }
             Err(e) => {
@@ -188,6 +193,8 @@ fn run_pipe_mode(client: &mut FerridynClient, rt: &Runtime, json_mode: bool) -> 
         OutputMode::Pretty
     };
 
+    let mut default_table: Option<String> = None;
+
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
         let line = match line {
@@ -203,7 +210,7 @@ fn run_pipe_mode(client: &mut FerridynClient, rt: &Runtime, json_mode: bool) -> 
             continue;
         }
 
-        let cmd = match parser::parse(trimmed) {
+        let cmd = match parser::parse(trimmed, default_table.as_deref()) {
             Ok(cmd) => cmd,
             Err(e) => {
                 display::render_error(&e, &mode);
@@ -213,6 +220,9 @@ fn run_pipe_mode(client: &mut FerridynClient, rt: &Runtime, json_mode: bool) -> 
 
         match executor::execute(client, rt, cmd) {
             Ok(result) => {
+                if let executor::CommandResult::Use(ref t) = result {
+                    default_table = t.clone();
+                }
                 if !display::render(&result, &mode) {
                     return 0; // EXIT command
                 }
@@ -233,9 +243,14 @@ fn run_repl(client: &mut FerridynClient, rt: &Runtime) {
     println!("Type HELP for available commands.\n");
 
     let mut rl = DefaultEditor::new().expect("failed to initialize line editor");
+    let mut current_table: Option<String> = None;
 
     loop {
-        match rl.readline("ferridyn> ") {
+        let prompt = match &current_table {
+            Some(t) => format!("ferridyn:{t}> "),
+            None => "ferridyn> ".to_string(),
+        };
+        match rl.readline(&prompt) {
             Ok(line) => {
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
@@ -243,7 +258,7 @@ fn run_repl(client: &mut FerridynClient, rt: &Runtime) {
                 }
                 let _ = rl.add_history_entry(trimmed);
 
-                let cmd = match parser::parse(trimmed) {
+                let cmd = match parser::parse(trimmed, current_table.as_deref()) {
                     Ok(cmd) => cmd,
                     Err(e) => {
                         display::print_error(&e);
@@ -253,6 +268,9 @@ fn run_repl(client: &mut FerridynClient, rt: &Runtime) {
 
                 match executor::execute(client, rt, cmd) {
                     Ok(result) => {
+                        if let executor::CommandResult::Use(ref t) = result {
+                            current_table = t.clone();
+                        }
                         if !display::render(&result, &OutputMode::Pretty) {
                             break; // EXIT command
                         }
@@ -427,5 +445,21 @@ mod tests {
         let (_dir, rt, mut client) = test_setup();
         let code = run_exec_mode(&mut client, &rt, &["SCAN nonexistent".to_string()], true);
         assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn test_exec_use_persists() {
+        let (_dir, rt, mut client) = test_setup();
+        let code = run_exec_mode(
+            &mut client,
+            &rt,
+            &[
+                "CREATE TABLE data PK pk STRING".to_string(),
+                "USE data".to_string(),
+                "LIST SCHEMAS".to_string(),
+            ],
+            false,
+        );
+        assert_eq!(code, 0);
     }
 }

@@ -32,6 +32,8 @@ pub enum CommandResult {
     IndexList(Vec<IndexInfo>),
     /// Index detail (DESCRIBE INDEX).
     IndexDetail(IndexInfo),
+    /// Active table changed (Some = set, None = cleared).
+    Use(Option<String>),
     /// Help text (optional topic for per-command help).
     Help(Option<String>),
     /// Exit signal.
@@ -115,6 +117,7 @@ pub fn execute(
             limit,
             desc,
         } => exec_query_index(client, rt, &table, &index_name, key_value, limit, desc),
+        Command::Use { table } => Ok(CommandResult::Use(table)),
         Command::Help(topic) => Ok(CommandResult::Help(topic)),
         Command::Exit => Ok(CommandResult::Exit),
     }
