@@ -1,7 +1,7 @@
 # PRD: UpdateItem Support
 
 **Priority:** 1
-**Status:** Approved
+**Status:** In Progress (Phase 1 complete)
 **Proposal:** [docs/proposals/accepted/update-item.md](../proposals/accepted/update-item.md)
 
 ## Summary
