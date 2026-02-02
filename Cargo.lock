@@ -329,10 +329,13 @@ name = "ferridyn-console"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "dirs",
  "ferridyn-core",
+ "ferridyn-server",
  "rustyline",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

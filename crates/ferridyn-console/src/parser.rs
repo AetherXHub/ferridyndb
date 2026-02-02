@@ -1,7 +1,6 @@
-use ferridyn_core::types::{AttrType, KeyType};
 use serde_json::Value;
 
-use crate::commands::{Command, SortClause};
+use crate::commands::{AttrType, Command, KeyType, SortClause};
 
 /// Tokenize an input line into a vector of string tokens.
 ///

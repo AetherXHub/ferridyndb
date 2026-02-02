@@ -1,5 +1,4 @@
-use ferridyn_core::api::QueryResult;
-use ferridyn_core::types::{IndexDefinition, KeyType, PartitionSchema, TableSchema};
+use ferridyn_server::client::{IndexInfo, PartitionSchemaInfo, QueryResult, TableSchema};
 use serde_json::{Value, json};
 
 use crate::executor::CommandResult;
@@ -60,19 +59,17 @@ pub fn render(result: &CommandResult, mode: &OutputMode) -> bool {
         CommandResult::TableSchema(schema) => match mode {
             OutputMode::Pretty => print_table_schema(schema),
             OutputMode::Json => {
-                let sk = schema.sort_key.as_ref().map(|sk| {
-                    json!({
-                        "name": sk.name,
-                        "type": format_key_type(sk.key_type),
-                    })
-                });
+                let sk = match (&schema.sort_key_name, &schema.sort_key_type) {
+                    (Some(name), Some(typ)) => Some(json!({"name": name, "type": typ})),
+                    _ => None,
+                };
                 println!(
                     "{}",
                     json!({
                         "name": schema.name,
                         "partition_key": {
-                            "name": schema.partition_key.name,
-                            "type": format_key_type(schema.partition_key.key_type),
+                            "name": schema.partition_key_name,
+                            "type": schema.partition_key_type,
                         },
                         "sort_key": sk,
                         "ttl_attribute": schema.ttl_attribute,
@@ -91,7 +88,7 @@ pub fn render(result: &CommandResult, mode: &OutputMode) -> bool {
                             "description": s.description,
                             "attributes": s.attributes.iter().map(|a| json!({
                                 "name": a.name,
-                                "type": format!("{:?}", a.attr_type),
+                                "type": a.attr_type,
                                 "required": a.required,
                             })).collect::<Vec<_>>(),
                             "validate": s.validate,
@@ -111,7 +108,7 @@ pub fn render(result: &CommandResult, mode: &OutputMode) -> bool {
                         "description": schema.description,
                         "attributes": schema.attributes.iter().map(|a| json!({
                             "name": a.name,
-                            "type": format!("{:?}", a.attr_type),
+                            "type": a.attr_type,
                             "required": a.required,
                         })).collect::<Vec<Value>>(),
                         "validate": schema.validate,
@@ -129,8 +126,8 @@ pub fn render(result: &CommandResult, mode: &OutputMode) -> bool {
                             "name": idx.name,
                             "partition_schema": idx.partition_schema,
                             "index_key": {
-                                "name": idx.index_key.name,
-                                "type": format_key_type(idx.index_key.key_type),
+                                "name": idx.index_key_name,
+                                "type": idx.index_key_type,
                             },
                         })
                     })
@@ -147,8 +144,8 @@ pub fn render(result: &CommandResult, mode: &OutputMode) -> bool {
                         "name": index.name,
                         "partition_schema": index.partition_schema,
                         "index_key": {
-                            "name": index.index_key.name,
-                            "type": format_key_type(index.index_key.key_type),
+                            "name": index.index_key_name,
+                            "type": index.index_key_type,
                         },
                     })
                 );
@@ -173,7 +170,7 @@ pub fn render_error(err: &dyn std::fmt::Display, mode: &OutputMode) {
     }
 }
 
-// ---- Pretty-print helpers (unchanged from original) ----
+// ---- Pretty-print helpers ----
 
 /// Pretty-print a single item with 2-space indentation.
 pub fn print_item(item: &Value) {
@@ -216,20 +213,11 @@ pub fn print_table_schema(schema: &TableSchema) {
     println!("Table: {}", schema.name);
     println!(
         "  Partition key: {} ({})",
-        schema.partition_key.name,
-        format_key_type(schema.partition_key.key_type)
+        schema.partition_key_name, schema.partition_key_type
     );
-    match &schema.sort_key {
-        Some(sk) => {
-            println!(
-                "  Sort key:      {} ({})",
-                sk.name,
-                format_key_type(sk.key_type)
-            );
-        }
-        None => {
-            println!("  Sort key:      (none)");
-        }
+    match (&schema.sort_key_name, &schema.sort_key_type) {
+        (Some(name), Some(typ)) => println!("  Sort key:      {} ({})", name, typ),
+        _ => println!("  Sort key:      (none)"),
     }
     match &schema.ttl_attribute {
         Some(attr) => println!("  TTL attribute: {attr}"),
@@ -270,7 +258,7 @@ pub fn print_sort_key_prefixes(prefixes: &[Value]) {
 }
 
 /// Print a list of partition schemas.
-fn print_schema_list(schemas: &[PartitionSchema]) {
+fn print_schema_list(schemas: &[PartitionSchemaInfo]) {
     if schemas.is_empty() {
         println!("No partition schemas.");
     } else {
@@ -282,7 +270,7 @@ fn print_schema_list(schemas: &[PartitionSchema]) {
 }
 
 /// Print details of a single partition schema.
-fn print_schema_detail(schema: &PartitionSchema) {
+fn print_schema_detail(schema: &PartitionSchemaInfo) {
     println!("Partition schema: {}", schema.prefix);
     println!("  Description: {}", schema.description);
     println!("  Validate:    {}", schema.validate);
@@ -292,23 +280,20 @@ fn print_schema_detail(schema: &PartitionSchema) {
         println!("  Attributes:");
         for attr in &schema.attributes {
             let req = if attr.required { " (required)" } else { "" };
-            println!("    {} {:?}{}", attr.name, attr.attr_type, req);
+            println!("    {} {}{}", attr.name, attr.attr_type, req);
         }
     }
 }
 
 /// Print a list of secondary indexes.
-fn print_index_list(indexes: &[IndexDefinition]) {
+fn print_index_list(indexes: &[IndexInfo]) {
     if indexes.is_empty() {
         println!("No indexes.");
     } else {
         for idx in indexes {
             println!(
                 "  {} \u{2014} schema: {}, key: {} ({})",
-                idx.name,
-                idx.partition_schema,
-                idx.index_key.name,
-                format_key_type(idx.index_key.key_type)
+                idx.name, idx.partition_schema, idx.index_key_name, idx.index_key_type
             );
         }
         println!("({} index(es))", indexes.len());
@@ -316,13 +301,12 @@ fn print_index_list(indexes: &[IndexDefinition]) {
 }
 
 /// Print details of a single secondary index.
-fn print_index_detail(index: &IndexDefinition) {
+fn print_index_detail(index: &IndexInfo) {
     println!("Index: {}", index.name);
     println!("  Partition schema: {}", index.partition_schema);
     println!(
         "  Index key:        {} ({})",
-        index.index_key.name,
-        format_key_type(index.index_key.key_type)
+        index.index_key_name, index.index_key_type
     );
 }
 
@@ -719,14 +703,5 @@ fn render_help_json(topic: Option<&str>) {
                 eprintln!("{}", json!({"error": format!("Unknown help topic '{t}'")}));
             }
         },
-    }
-}
-
-/// Format a key type as a human-readable string.
-pub fn format_key_type(kt: KeyType) -> &'static str {
-    match kt {
-        KeyType::String => "String",
-        KeyType::Number => "Number",
-        KeyType::Binary => "Binary",
     }
 }

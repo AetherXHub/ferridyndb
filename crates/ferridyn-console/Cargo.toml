@@ -4,10 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ferridyn-core = { path = "../ferridyn-core" }
+ferridyn-server = { path = "../ferridyn-server" }
 serde_json = "1"
 rustyline = "15"
 clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net"] }
+dirs = "6"
 
 [dev-dependencies]
 tempfile = "3"
+ferridyn-core = { path = "../ferridyn-core" }

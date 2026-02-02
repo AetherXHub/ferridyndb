@@ -15,7 +15,7 @@ DynamoDB's API is simple and effective for key-value and document workloads, but
 This is a Cargo workspace. Build/test from the repository root:
 
 - `cargo build` — compile all crates
-- `cargo test` — run all tests across the workspace (436 tests)
+- `cargo test` — run all tests across the workspace (441 tests)
 - `cargo test -p ferridyn-core` — test only the core crate
 - `cargo test -p ferridyn-core <test_name>` — run a single test by name
 - `cargo clippy --workspace -- -D warnings` — lint all crates (zero warnings required)
@@ -58,13 +58,13 @@ crates/
       client.rs        # FerridynClient — async client for multi-process access
       protocol.rs      # Wire protocol (JSON over length-prefixed frames)
     tests/
-      integration.rs   # Server integration tests (8 tests)
-  ferridyn-console/    # Interactive REPL for exploring databases
+      integration.rs   # Server integration tests (13 tests)
+  ferridyn-console/    # Interactive CLI client (connects to server via Unix socket)
     src/
       parser.rs        # SQL-like command parser
-      executor.rs      # Command execution against FerridynDB
-      commands.rs      # Command definitions
-      display.rs       # Output formatting
+      executor.rs      # Command execution via FerridynClient + tokio Runtime
+      commands.rs      # Command and type definitions (local KeyType/AttrType enums)
+      display.rs       # Output formatting (pretty and JSON modes)
 ```
 
 ## Key Design Decisions
@@ -98,5 +98,9 @@ crates/
 - `dirs` — XDG directory resolution
 
 ### ferridyn-console
+- `ferridyn-server` — Client library for server communication
+- `tokio` — Async runtime (bridged to sync via `block_on`)
 - `rustyline` — Line editing and history for the REPL
 - `clap` — CLI argument parsing
+- `dirs` — Default socket/data path resolution
+- `ferridyn-core` (dev) — Test helpers for in-process server setup

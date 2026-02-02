@@ -1,5 +1,20 @@
-use ferridyn_core::types::{AttrType, KeyType};
 use serde_json::Value;
+
+/// Key type for partition and sort keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyType {
+    String,
+    Number,
+    Binary,
+}
+
+/// Attribute type for partition schema attributes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttrType {
+    String,
+    Number,
+    Boolean,
+}
 
 /// A parsed console command.
 #[derive(Debug)]

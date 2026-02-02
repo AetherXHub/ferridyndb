@@ -114,7 +114,7 @@ assert_eq!(result.items[0]["name"], "Alice");
 # Compile all crates
 cargo build
 
-# Run all tests (436 tests across workspace)
+# Run all tests (441 tests across workspace)
 cargo test
 
 # Run tests for a specific crate
@@ -191,13 +191,38 @@ loop {
 }
 ```
 
+## Console
+
+The console connects to a running server over a Unix socket. If no server is running at the default socket, it auto-starts one.
+
+```bash
+# Connect to default server (auto-starts if needed)
+ferridyn-console
+
+# Connect to a specific server socket
+ferridyn-console --socket /tmp/my-server.sock
+
+# Execute commands non-interactively
+ferridyn-console -e "CREATE TABLE users PK user_id STRING" -e "LIST TABLES"
+
+# JSON output for scripting
+ferridyn-console -j -e "SCAN users"
+
+# Pipe mode
+echo "LIST TABLES" | ferridyn-console
+```
+
+The console supports table management, partition schemas, secondary indexes, and all query operations through a SQL-like command syntax. Type `HELP` in the REPL for a full command reference.
+
+Because the console and server are separate processes, multiple clients (console sessions, agents, MCP servers) can access the same database concurrently without file lock conflicts.
+
 ## Workspace Layout
 
 | Crate | Description |
 |-------|-------------|
 | `ferridyn-core` | Core database engine (storage, B+Tree, MVCC, public API) |
 | `ferridyn-server` | Unix socket server + async client library for multi-process access |
-| `ferridyn-console` | Interactive REPL for exploring and manipulating FerridynDB databases |
+| `ferridyn-console` | Interactive CLI client — connects to server via Unix socket with auto-start |
 
 ## Development
 
