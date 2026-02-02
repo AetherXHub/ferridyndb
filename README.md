@@ -4,7 +4,7 @@ A local, embedded, DynamoDB-style document database written in Rust with single-
 
 ## Features
 
-- **DynamoDB-compatible API** — Builder-pattern methods for `put_item`, `get_item`, `delete_item`, `query`, and `scan`
+- **DynamoDB-compatible API** — Builder-pattern methods for `put_item`, `get_item`, `delete_item`, `update_item`, `query`, and `scan`
 - **Single-file storage** — Copy-on-write pages with atomic double-buffered header commits (no WAL)
 - **MVCC snapshot isolation** — Single writer, unlimited concurrent readers with version chains
 - **B+Tree indexing** — Efficient range scans with slotted pages and overflow support
@@ -56,6 +56,16 @@ db.create_table("events")
 let results = db.query("events")
     .partition_key("device_123")
     .sort_key_between(100.0, 200.0)
+    .execute()
+    .unwrap();
+
+// Atomic partial updates (upserts if item doesn't exist)
+db.update_item("users")
+    .partition_key("alice")
+    .set("email", "alice@example.com")
+    .set("address.city", "NYC")
+    .remove("old_field")
+    .add("login_count", 1)
     .execute()
     .unwrap();
 ```
@@ -114,7 +124,7 @@ assert_eq!(result.items[0]["name"], "Alice");
 # Compile all crates
 cargo build
 
-# Run all tests (441 tests across workspace)
+# Run all tests (511 tests across workspace)
 cargo test
 
 # Run tests for a specific crate
@@ -156,6 +166,13 @@ let mut client = FerridynClient::connect("/tmp/ferridyn.sock").await?;
 // Regular operations
 client.put_item("users", json!({"user_id": "bob", "name": "Bob"})).await?;
 let item = client.get_item("users", json!("bob"), None).await?;
+
+// Atomic partial updates
+use ferridyn_server::client::UpdateActionInput;
+client.update_item("users", json!("bob"), None, &[
+    UpdateActionInput { action: "set".into(), path: "email".into(), value: Some(json!("bob@example.com")) },
+    UpdateActionInput { action: "add".into(), path: "login_count".into(), value: Some(json!(1)) },
+]).await?;
 
 // Version-aware reads for optimistic concurrency
 let versioned = client.get_item_versioned("users", json!("bob"), None).await?;
@@ -225,6 +242,8 @@ ferridyn:data> PUT {"pk": "CONTACT#alice", "email": "alice@example.com", "name":
 OK
 ferridyn:data> GET pk=CONTACT#alice
 { "pk": "CONTACT#alice", "email": "alice@example.com", "name": "Alice" }
+ferridyn:data> UPDATE pk=CONTACT#alice SET name="Alice Smith" ADD login_count=1
+OK
 ferridyn:data> SCAN LIMIT 5
 ...
 ferridyn:data> SCAN other_table LIMIT 10   ← explicit table overrides the default
