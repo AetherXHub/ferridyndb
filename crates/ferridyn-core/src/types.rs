@@ -59,8 +59,58 @@ pub struct TableSchema {
 }
 
 /// A key attribute definition (name + type).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyDefinition {
     pub name: String,
     pub key_type: KeyType,
+}
+
+/// The type of a document attribute (for partition schema validation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AttrType {
+    String,
+    Number,
+    Boolean,
+}
+
+/// A document attribute definition within a partition schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttributeDef {
+    pub name: String,
+    pub attr_type: AttrType,
+    pub required: bool,
+}
+
+/// A declared partition schema describing an entity type within a single-table design.
+///
+/// Documents are matched to a partition schema by extracting the prefix from the
+/// partition key (everything before the first `#`). Only String partition keys
+/// support prefix matching.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PartitionSchema {
+    /// The prefix to match (e.g., `"CONTACT"` matches `"CONTACT#toby"`).
+    pub prefix: String,
+    /// Human/agent-readable description of this entity type.
+    pub description: String,
+    /// Attribute definitions for documents under this prefix.
+    pub attributes: Vec<AttributeDef>,
+    /// When true, `put_item` validates documents against these attributes.
+    pub validate: bool,
+}
+
+/// A secondary index definition scoped to a partition schema.
+///
+/// Each index maintains a separate B+Tree keyed by
+/// `encode_composite(indexed_value, primary_key_as_binary)`.
+/// V1 supports single-attribute indexes with KeysOnly projection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IndexDefinition {
+    /// Unique index name (e.g., `"contact-email-index"`).
+    pub name: String,
+    /// The partition schema prefix this index is scoped to.
+    pub partition_schema: String,
+    /// The document attribute to index on.
+    pub index_key: KeyDefinition,
+    /// B+Tree root page for this index.
+    pub root_page: PageId,
 }

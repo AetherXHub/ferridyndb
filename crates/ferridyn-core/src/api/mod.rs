@@ -9,7 +9,10 @@ pub mod query;
 pub mod transaction;
 
 pub use batch::{BatchOp, SyncMode, WriteBatch};
-pub use builders::{DeleteItemBuilder, GetItemBuilder, QueryBuilder, ScanBuilder, TableBuilder};
+pub use builders::{
+    CreateIndexBuilder, DeleteItemBuilder, GetItemBuilder, IndexQueryBuilder,
+    PartitionSchemaBuilder, QueryBuilder, ScanBuilder, TableBuilder,
+};
 pub use database::FerridynDB;
 pub use query::{QueryResult, SortCondition};
 pub use transaction::Transaction;

@@ -9,19 +9,20 @@ use serde_json::Value;
 
 use crate::btree::ops as btree_ops;
 use crate::catalog;
-use crate::error::{Error, QueryError, StorageError};
+use crate::error::{Error, QueryError, SchemaError, StorageError};
 use crate::mvcc::ops as mvcc_ops;
 use crate::storage::file::FileManager;
 use crate::storage::header::FileHeader;
 use crate::storage::lock::FileLock;
 use crate::storage::pending_free::PendingFreeList;
 use crate::storage::snapshot::SnapshotTracker;
-use crate::types::{PAGE_SIZE, PageId};
+use crate::types::{IndexDefinition, PAGE_SIZE, PageId, PartitionSchema};
 
 use super::batch::{SyncMode, WriteBatch};
 use super::builders::{
-    DeleteItemBuilder, GetItemBuilder, GetItemVersionedBuilder, ListPartitionKeysBuilder,
-    ListSortKeyPrefixesBuilder, QueryBuilder, ScanBuilder, TableBuilder,
+    CreateIndexBuilder, DeleteItemBuilder, GetItemBuilder, GetItemVersionedBuilder,
+    IndexQueryBuilder, ListPartitionKeysBuilder, ListSortKeyPrefixesBuilder,
+    PartitionSchemaBuilder, QueryBuilder, ScanBuilder, TableBuilder,
 };
 use super::page_store::{BufferedPageStore, FilePageStore};
 use super::transaction::Transaction;
@@ -227,6 +228,107 @@ impl FerridynDB {
     /// List distinct sort key prefixes (split on `#`) for a given partition key.
     pub fn list_sort_key_prefixes(&self, table: &str) -> ListSortKeyPrefixesBuilder<'_> {
         ListSortKeyPrefixesBuilder::new(self, table.to_string())
+    }
+
+    /// Query items via a secondary index.
+    pub fn query_index(&self, table: &str, index_name: &str) -> IndexQueryBuilder<'_> {
+        IndexQueryBuilder::new(self, table.to_string(), index_name.to_string())
+    }
+
+    // -----------------------------------------------------------------------
+    // Partition schema management
+    // -----------------------------------------------------------------------
+
+    /// Create a partition schema on a table.
+    pub fn create_partition_schema(&self, table: &str) -> PartitionSchemaBuilder<'_> {
+        PartitionSchemaBuilder::new(self, table.to_string())
+    }
+
+    /// Drop a partition schema from a table.
+    ///
+    /// Fails if any indexes reference the partition schema.
+    pub fn drop_partition_schema(&self, table: &str, prefix: &str) -> Result<(), Error> {
+        let table = table.to_string();
+        let prefix = prefix.to_string();
+        self.transact(move |txn| {
+            let new_root = catalog::ops::drop_partition_schema(
+                &mut txn.store,
+                txn.catalog_root,
+                &table,
+                &prefix,
+            )?;
+            txn.catalog_root = new_root;
+            Ok(())
+        })
+    }
+
+    /// List all partition schemas for a table.
+    pub fn list_partition_schemas(&self, table: &str) -> Result<Vec<PartitionSchema>, Error> {
+        let state = self.inner.state.read();
+        let store = self.read_store(&state)?;
+        catalog::ops::list_partition_schemas(&store, state.header.catalog_root_page, table)
+    }
+
+    /// Describe a specific partition schema by prefix.
+    pub fn describe_partition_schema(
+        &self,
+        table: &str,
+        prefix: &str,
+    ) -> Result<PartitionSchema, Error> {
+        let state = self.inner.state.read();
+        let store = self.read_store(&state)?;
+        let entry = self.cached_get_table(&store, state.header.catalog_root_page, table)?;
+        entry
+            .partition_schemas
+            .into_iter()
+            .find(|ps| ps.prefix == prefix)
+            .ok_or_else(|| SchemaError::PartitionSchemaNotFound(prefix.to_string()).into())
+    }
+
+    // -----------------------------------------------------------------------
+    // Index management
+    // -----------------------------------------------------------------------
+
+    /// Create a secondary index on a table.
+    ///
+    /// The index is scoped to a partition schema (prefix) and indexes a
+    /// specific attribute. If the table already has data, a synchronous
+    /// backfill is performed.
+    pub fn create_index(&self, table: &str) -> CreateIndexBuilder<'_> {
+        CreateIndexBuilder::new(self, table.to_string())
+    }
+
+    /// Drop a secondary index from a table.
+    ///
+    /// The index B+Tree pages are leaked (not reclaimed) in v1.
+    pub fn drop_index(&self, table: &str, index_name: &str) -> Result<(), Error> {
+        let table = table.to_string();
+        let index_name = index_name.to_string();
+        self.transact(move |txn| {
+            let new_root =
+                catalog::ops::drop_index(&mut txn.store, txn.catalog_root, &table, &index_name)?;
+            txn.catalog_root = new_root;
+            Ok(())
+        })
+    }
+
+    /// List all secondary indexes for a table.
+    pub fn list_indexes(&self, table: &str) -> Result<Vec<IndexDefinition>, Error> {
+        let state = self.inner.state.read();
+        let store = self.read_store(&state)?;
+        catalog::ops::list_indexes(&store, state.header.catalog_root_page, table)
+    }
+
+    /// Describe a specific secondary index by name.
+    pub fn describe_index(&self, table: &str, index_name: &str) -> Result<IndexDefinition, Error> {
+        let state = self.inner.state.read();
+        let store = self.read_store(&state)?;
+        let entry = self.cached_get_table(&store, state.header.catalog_root_page, table)?;
+        entry
+            .indexes
+            .into_iter()
+            .find(|idx| idx.name == index_name)
+            .ok_or_else(|| SchemaError::IndexNotFound(index_name.to_string()).into())
     }
 
     /// Create a new write batch for batching multiple operations.
@@ -1755,5 +1857,1177 @@ mod list_sort_key_prefixes_tests {
 
         let result = db.list_sort_key_prefixes("items").execute();
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod partition_schema_and_index_tests {
+    use super::*;
+    use crate::types::{AttrType, KeyType};
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    fn create_test_db() -> (FerridynDB, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = FerridynDB::create(&db_path).unwrap();
+        (db, dir)
+    }
+
+    fn setup_single_table_with_index(db: &FerridynDB) {
+        // Create a single-table design with String PK (no sort key).
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        // Declare a CONTACT partition schema.
+        db.create_partition_schema("data")
+            .prefix("CONTACT")
+            .description("Contact entities")
+            .attribute("email", AttrType::String, true)
+            .attribute("age", AttrType::Number, false)
+            .validate(true)
+            .execute()
+            .unwrap();
+
+        // Create an index on email scoped to CONTACT.
+        db.create_index("data")
+            .name("email-idx")
+            .partition_schema("CONTACT")
+            .index_key("email", KeyType::String)
+            .execute()
+            .unwrap();
+    }
+
+    // -------------------------------------------------------------------
+    // End-to-end: schema + index + write + query
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_e2e_create_schema_index_put_query() {
+        let (db, _dir) = create_test_db();
+        setup_single_table_with_index(&db);
+
+        // Insert documents.
+        db.put_item(
+            "data",
+            json!({"pk": "CONTACT#alice", "email": "alice@example.com", "age": 30}),
+        )
+        .unwrap();
+        db.put_item(
+            "data",
+            json!({"pk": "CONTACT#bob", "email": "bob@example.com", "age": 25}),
+        )
+        .unwrap();
+        // A non-CONTACT document (no index entry created).
+        db.put_item("data", json!({"pk": "ORDER#100", "total": 42.0}))
+            .unwrap();
+
+        // Query by index.
+        let result = db
+            .query_index("data", "email-idx")
+            .key_value("alice@example.com")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["pk"], "CONTACT#alice");
+        assert_eq!(result.items[0]["email"], "alice@example.com");
+
+        let result = db
+            .query_index("data", "email-idx")
+            .key_value("bob@example.com")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["pk"], "CONTACT#bob");
+
+        // Query for a value that doesn't exist.
+        let result = db
+            .query_index("data", "email-idx")
+            .key_value("nonexistent@example.com")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 0);
+    }
+
+    // -------------------------------------------------------------------
+    // Partition schema introspection
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_list_partition_schemas() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_partition_schema("data")
+            .prefix("CONTACT")
+            .description("People")
+            .execute()
+            .unwrap();
+        db.create_partition_schema("data")
+            .prefix("ORDER")
+            .description("Orders")
+            .execute()
+            .unwrap();
+
+        let schemas = db.list_partition_schemas("data").unwrap();
+        assert_eq!(schemas.len(), 2);
+        let prefixes: Vec<&str> = schemas.iter().map(|s| s.prefix.as_str()).collect();
+        assert!(prefixes.contains(&"CONTACT"));
+        assert!(prefixes.contains(&"ORDER"));
+    }
+
+    #[test]
+    fn test_describe_partition_schema() {
+        let (db, _dir) = create_test_db();
+        setup_single_table_with_index(&db);
+
+        let schema = db.describe_partition_schema("data", "CONTACT").unwrap();
+        assert_eq!(schema.prefix, "CONTACT");
+        assert_eq!(schema.description, "Contact entities");
+        assert!(schema.validate);
+        assert_eq!(schema.attributes.len(), 2);
+    }
+
+    #[test]
+    fn test_describe_partition_schema_not_found() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        let result = db.describe_partition_schema("data", "NONEXISTENT");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_drop_partition_schema() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_partition_schema("data")
+            .prefix("TEMP")
+            .description("Temporary")
+            .execute()
+            .unwrap();
+
+        assert_eq!(db.list_partition_schemas("data").unwrap().len(), 1);
+
+        db.drop_partition_schema("data", "TEMP").unwrap();
+
+        assert_eq!(db.list_partition_schemas("data").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_drop_partition_schema_with_indexes_fails() {
+        let (db, _dir) = create_test_db();
+        setup_single_table_with_index(&db);
+
+        // Should fail because email-idx references CONTACT.
+        let result = db.drop_partition_schema("data", "CONTACT");
+        assert!(result.is_err());
+    }
+
+    // -------------------------------------------------------------------
+    // Index introspection
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_list_indexes() {
+        let (db, _dir) = create_test_db();
+        setup_single_table_with_index(&db);
+
+        let indexes = db.list_indexes("data").unwrap();
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes[0].name, "email-idx");
+        assert_eq!(indexes[0].partition_schema, "CONTACT");
+        assert_eq!(indexes[0].index_key.name, "email");
+    }
+
+    #[test]
+    fn test_describe_index() {
+        let (db, _dir) = create_test_db();
+        setup_single_table_with_index(&db);
+
+        let index = db.describe_index("data", "email-idx").unwrap();
+        assert_eq!(index.name, "email-idx");
+        assert_eq!(index.partition_schema, "CONTACT");
+    }
+
+    #[test]
+    fn test_describe_index_not_found() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        let result = db.describe_index("data", "nonexistent");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_drop_index() {
+        let (db, _dir) = create_test_db();
+        setup_single_table_with_index(&db);
+
+        assert_eq!(db.list_indexes("data").unwrap().len(), 1);
+
+        db.drop_index("data", "email-idx").unwrap();
+
+        assert_eq!(db.list_indexes("data").unwrap().len(), 0);
+    }
+
+    // -------------------------------------------------------------------
+    // Write validation
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_validation_rejects_missing_required_attr() {
+        let (db, _dir) = create_test_db();
+        setup_single_table_with_index(&db);
+
+        // Missing required "email" attribute.
+        let result = db.put_item("data", json!({"pk": "CONTACT#charlie", "age": 40}));
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("missing required"), "got: {err_msg}");
+    }
+
+    #[test]
+    fn test_validation_rejects_wrong_type() {
+        let (db, _dir) = create_test_db();
+        setup_single_table_with_index(&db);
+
+        // email should be String, not Number.
+        let result = db.put_item("data", json!({"pk": "CONTACT#charlie", "email": 12345}));
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("expected"), "got: {err_msg}");
+    }
+
+    #[test]
+    fn test_validation_passes_for_conforming_doc() {
+        let (db, _dir) = create_test_db();
+        setup_single_table_with_index(&db);
+
+        // Valid document with required email.
+        let result = db.put_item(
+            "data",
+            json!({"pk": "CONTACT#charlie", "email": "charlie@example.com"}),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validation_skipped_for_non_matching_prefix() {
+        let (db, _dir) = create_test_db();
+        setup_single_table_with_index(&db);
+
+        // ORDER prefix has no schema — should pass without validation.
+        let result = db.put_item("data", json!({"pk": "ORDER#100", "total": 42.0}));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validation_disabled_schema() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        // Schema with validate=false.
+        db.create_partition_schema("data")
+            .prefix("CONTACT")
+            .attribute("email", AttrType::String, true)
+            .validate(false) // disabled!
+            .execute()
+            .unwrap();
+
+        // Missing email but validation disabled — should pass.
+        let result = db.put_item("data", json!({"pk": "CONTACT#alice", "name": "Alice"}));
+        assert!(result.is_ok());
+    }
+
+    // -------------------------------------------------------------------
+    // Index maintenance on writes
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_index_updated_on_put_update() {
+        let (db, _dir) = create_test_db();
+        setup_single_table_with_index(&db);
+
+        db.put_item(
+            "data",
+            json!({"pk": "CONTACT#alice", "email": "old@example.com"}),
+        )
+        .unwrap();
+
+        // Verify queryable by old email.
+        let result = db
+            .query_index("data", "email-idx")
+            .key_value("old@example.com")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+
+        // Update email.
+        db.put_item(
+            "data",
+            json!({"pk": "CONTACT#alice", "email": "new@example.com"}),
+        )
+        .unwrap();
+
+        // Old email should return nothing.
+        let result = db
+            .query_index("data", "email-idx")
+            .key_value("old@example.com")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 0);
+
+        // New email should return the updated document.
+        let result = db
+            .query_index("data", "email-idx")
+            .key_value("new@example.com")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["email"], "new@example.com");
+    }
+
+    #[test]
+    fn test_index_cleaned_on_delete() {
+        let (db, _dir) = create_test_db();
+        setup_single_table_with_index(&db);
+
+        db.put_item(
+            "data",
+            json!({"pk": "CONTACT#alice", "email": "alice@example.com"}),
+        )
+        .unwrap();
+
+        // Delete the document.
+        db.delete_item("data")
+            .partition_key("CONTACT#alice")
+            .execute()
+            .unwrap();
+
+        // Index query should return nothing.
+        let result = db
+            .query_index("data", "email-idx")
+            .key_value("alice@example.com")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 0);
+    }
+
+    // -------------------------------------------------------------------
+    // Lazy GC: orphaned index entries
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_lazy_gc_orphaned_index_entries_skipped() {
+        let (db, _dir) = create_test_db();
+
+        // Create table and insert data BEFORE creating index.
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_partition_schema("data")
+            .prefix("CONTACT")
+            .description("People")
+            .execute()
+            .unwrap();
+
+        db.put_item(
+            "data",
+            json!({"pk": "CONTACT#alice", "email": "alice@example.com"}),
+        )
+        .unwrap();
+        db.put_item(
+            "data",
+            json!({"pk": "CONTACT#bob", "email": "bob@example.com"}),
+        )
+        .unwrap();
+
+        // Create index (backfill happens here — both docs get indexed).
+        db.create_index("data")
+            .name("email-idx")
+            .partition_schema("CONTACT")
+            .index_key("email", KeyType::String)
+            .execute()
+            .unwrap();
+
+        // Verify both are queryable.
+        let result = db
+            .query_index("data", "email-idx")
+            .key_value("alice@example.com")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+
+        // Delete alice — this removes the index entry via maintain_indexes.
+        db.delete_item("data")
+            .partition_key("CONTACT#alice")
+            .execute()
+            .unwrap();
+
+        // Query for alice's email should return nothing (properly cleaned).
+        let result = db
+            .query_index("data", "email-idx")
+            .key_value("alice@example.com")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 0);
+
+        // Bob should still be queryable.
+        let result = db
+            .query_index("data", "email-idx")
+            .key_value("bob@example.com")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+    }
+
+    // -------------------------------------------------------------------
+    // Index query with limit
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_index_query_with_limit() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_partition_schema("data")
+            .prefix("CONTACT")
+            .description("People")
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("status-idx")
+            .partition_schema("CONTACT")
+            .index_key("status", KeyType::String)
+            .execute()
+            .unwrap();
+
+        // Insert 10 contacts all with status "active".
+        for i in 0..10 {
+            db.put_item(
+                "data",
+                json!({
+                    "pk": format!("CONTACT#user{i}"),
+                    "status": "active",
+                    "name": format!("User {i}")
+                }),
+            )
+            .unwrap();
+        }
+
+        // Query with limit.
+        let result = db
+            .query_index("data", "status-idx")
+            .key_value("active")
+            .limit(3)
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 3);
+
+        // Without limit, all 10 should be returned.
+        let result = db
+            .query_index("data", "status-idx")
+            .key_value("active")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 10);
+    }
+
+    // -------------------------------------------------------------------
+    // Multiple indexes on same table
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_multiple_indexes_on_same_prefix() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_partition_schema("data")
+            .prefix("CONTACT")
+            .description("People")
+            .execute()
+            .unwrap();
+
+        // Two indexes on CONTACT.
+        db.create_index("data")
+            .name("email-idx")
+            .partition_schema("CONTACT")
+            .index_key("email", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("city-idx")
+            .partition_schema("CONTACT")
+            .index_key("city", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put_item(
+            "data",
+            json!({
+                "pk": "CONTACT#alice",
+                "email": "alice@example.com",
+                "city": "Paris"
+            }),
+        )
+        .unwrap();
+
+        // Query by email.
+        let result = db
+            .query_index("data", "email-idx")
+            .key_value("alice@example.com")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+
+        // Query by city.
+        let result = db
+            .query_index("data", "city-idx")
+            .key_value("Paris")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["pk"], "CONTACT#alice");
+    }
+
+    // -------------------------------------------------------------------
+    // Backfill on index creation
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_backfill_on_index_creation() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_partition_schema("data")
+            .prefix("CONTACT")
+            .description("People")
+            .execute()
+            .unwrap();
+
+        // Insert docs BEFORE creating the index.
+        for i in 0..5 {
+            db.put_item(
+                "data",
+                json!({
+                    "pk": format!("CONTACT#user{i}"),
+                    "email": format!("user{i}@example.com"),
+                }),
+            )
+            .unwrap();
+        }
+        // Also insert a non-CONTACT doc.
+        db.put_item(
+            "data",
+            json!({"pk": "ORDER#1", "email": "order@example.com"}),
+        )
+        .unwrap();
+
+        // Create index — should backfill the 5 CONTACT docs.
+        db.create_index("data")
+            .name("email-idx")
+            .partition_schema("CONTACT")
+            .index_key("email", KeyType::String)
+            .execute()
+            .unwrap();
+
+        // Verify all 5 CONTACT docs are queryable.
+        for i in 0..5 {
+            let result = db
+                .query_index("data", "email-idx")
+                .key_value(format!("user{i}@example.com"))
+                .execute()
+                .unwrap();
+            assert_eq!(result.items.len(), 1, "user{i} should be indexed");
+        }
+
+        // ORDER doc should NOT be in the index.
+        let result = db
+            .query_index("data", "email-idx")
+            .key_value("order@example.com")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 0, "ORDER should not be indexed");
+    }
+
+    // -------------------------------------------------------------------
+    // Persistence: schema and indexes survive reopen
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_schemas_and_indexes_persist_across_reopen() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+
+        // Create and populate.
+        {
+            let db = FerridynDB::create(&db_path).unwrap();
+            setup_single_table_with_index(&db);
+
+            db.put_item(
+                "data",
+                json!({"pk": "CONTACT#alice", "email": "alice@example.com"}),
+            )
+            .unwrap();
+        }
+
+        // Reopen and verify.
+        {
+            let db = FerridynDB::open(&db_path).unwrap();
+
+            // Schema survives.
+            let schemas = db.list_partition_schemas("data").unwrap();
+            assert_eq!(schemas.len(), 1);
+            assert_eq!(schemas[0].prefix, "CONTACT");
+
+            // Index survives.
+            let indexes = db.list_indexes("data").unwrap();
+            assert_eq!(indexes.len(), 1);
+            assert_eq!(indexes[0].name, "email-idx");
+
+            // Query works after reopen.
+            let result = db
+                .query_index("data", "email-idx")
+                .key_value("alice@example.com")
+                .execute()
+                .unwrap();
+            assert_eq!(result.items.len(), 1);
+            assert_eq!(result.items[0]["pk"], "CONTACT#alice");
+
+            // Continued writes work.
+            db.put_item(
+                "data",
+                json!({"pk": "CONTACT#bob", "email": "bob@example.com"}),
+            )
+            .unwrap();
+
+            let result = db
+                .query_index("data", "email-idx")
+                .key_value("bob@example.com")
+                .execute()
+                .unwrap();
+            assert_eq!(result.items.len(), 1);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Error cases
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_query_nonexistent_index_errors() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        let result = db
+            .query_index("data", "no-such-index")
+            .key_value("x")
+            .execute();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_query_index_without_key_value_errors() {
+        let (db, _dir) = create_test_db();
+        setup_single_table_with_index(&db);
+
+        let result = db.query_index("data", "email-idx").execute();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_duplicate_partition_schema_errors() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_partition_schema("data")
+            .prefix("CONTACT")
+            .execute()
+            .unwrap();
+
+        let result = db
+            .create_partition_schema("data")
+            .prefix("CONTACT")
+            .execute();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_duplicate_index_name_errors() {
+        let (db, _dir) = create_test_db();
+        setup_single_table_with_index(&db);
+
+        let result = db
+            .create_index("data")
+            .name("email-idx")
+            .partition_schema("CONTACT")
+            .index_key("age", KeyType::Number)
+            .execute();
+        assert!(result.is_err());
+    }
+
+    // -------------------------------------------------------------------
+    // Reverse scan (scan_forward(false))
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_index_query_reverse_scan() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_partition_schema("data")
+            .prefix("CONTACT")
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("status-idx")
+            .partition_schema("CONTACT")
+            .index_key("status", KeyType::String)
+            .execute()
+            .unwrap();
+
+        for c in ['a', 'b', 'c', 'd', 'e'] {
+            db.put_item(
+                "data",
+                json!({
+                    "pk": format!("CONTACT#{c}"),
+                    "status": "active",
+                }),
+            )
+            .unwrap();
+        }
+
+        let forward = db
+            .query_index("data", "status-idx")
+            .key_value("active")
+            .scan_forward(true)
+            .execute()
+            .unwrap();
+        assert_eq!(forward.items.len(), 5);
+
+        let reverse = db
+            .query_index("data", "status-idx")
+            .key_value("active")
+            .scan_forward(false)
+            .execute()
+            .unwrap();
+        assert_eq!(reverse.items.len(), 5);
+
+        // The two orderings should be exact mirrors of each other.
+        let forward_pks: Vec<&str> = forward
+            .items
+            .iter()
+            .map(|v| v["pk"].as_str().unwrap())
+            .collect();
+        let reverse_pks: Vec<&str> = reverse
+            .items
+            .iter()
+            .map(|v| v["pk"].as_str().unwrap())
+            .collect();
+
+        let mut expected_reverse = forward_pks.clone();
+        expected_reverse.reverse();
+        assert_eq!(reverse_pks, expected_reverse);
+    }
+
+    // -------------------------------------------------------------------
+    // Number index keys (end-to-end)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_index_query_number_key_type() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_partition_schema("data")
+            .prefix("PRODUCT")
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("price-idx")
+            .partition_schema("PRODUCT")
+            .index_key("price", KeyType::Number)
+            .execute()
+            .unwrap();
+
+        db.put_item("data", json!({"pk": "PRODUCT#apple", "price": 1.50}))
+            .unwrap();
+        db.put_item("data", json!({"pk": "PRODUCT#banana", "price": 0.75}))
+            .unwrap();
+        db.put_item("data", json!({"pk": "PRODUCT#cherry", "price": 1.50}))
+            .unwrap();
+        db.put_item("data", json!({"pk": "PRODUCT#date", "price": 3.00}))
+            .unwrap();
+
+        // Two items at price 1.50.
+        let result = db
+            .query_index("data", "price-idx")
+            .key_value(1.50_f64)
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 2);
+
+        // One item at price 0.75.
+        let result = db
+            .query_index("data", "price-idx")
+            .key_value(0.75_f64)
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["pk"], "PRODUCT#banana");
+
+        // No items at price 99.99.
+        let result = db
+            .query_index("data", "price-idx")
+            .key_value(99.99_f64)
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 0);
+    }
+
+    #[test]
+    fn test_index_query_number_key_ordering() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_partition_schema("data")
+            .prefix("PRODUCT")
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("price-idx")
+            .partition_schema("PRODUCT")
+            .index_key("price", KeyType::Number)
+            .execute()
+            .unwrap();
+
+        let prices: &[(f64, &str)] = &[
+            (10.0, "PRODUCT#ten"),
+            (-5.0, "PRODUCT#neg_five"),
+            (0.0, "PRODUCT#zero"),
+            (100.0, "PRODUCT#hundred"),
+            (-0.5, "PRODUCT#neg_half"),
+        ];
+
+        for (price, pk) in prices {
+            db.put_item("data", json!({"pk": pk, "price": price}))
+                .unwrap();
+        }
+
+        // Verify each price individually resolves to the correct item.
+        for (price, pk) in prices {
+            let result = db
+                .query_index("data", "price-idx")
+                .key_value(*price)
+                .execute()
+                .unwrap();
+            assert_eq!(
+                result.items.len(),
+                1,
+                "expected 1 item for price {price}, got {}",
+                result.items.len()
+            );
+            assert_eq!(result.items[0]["pk"], *pk, "wrong item for price {price}");
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Empty index query
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_index_query_empty_index() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_partition_schema("data")
+            .prefix("CONTACT")
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("email-idx")
+            .partition_schema("CONTACT")
+            .index_key("email", KeyType::String)
+            .execute()
+            .unwrap();
+
+        // No documents inserted — query should return empty results.
+        let result = db
+            .query_index("data", "email-idx")
+            .key_value("anything@test.com")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 0);
+        assert!(result.last_evaluated_key.is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // Large result set stress test
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_index_query_large_result_set() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_partition_schema("data")
+            .prefix("CONTACT")
+            .validate(false)
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("status-idx")
+            .partition_schema("CONTACT")
+            .index_key("status", KeyType::String)
+            .execute()
+            .unwrap();
+
+        for i in 0..200 {
+            db.put_item(
+                "data",
+                json!({
+                    "pk": format!("CONTACT#user{i:04}"),
+                    "status": "active",
+                }),
+            )
+            .unwrap();
+        }
+
+        // Without limit — all 200.
+        let result = db
+            .query_index("data", "status-idx")
+            .key_value("active")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 200);
+
+        // With limit — exactly 50.
+        let result = db
+            .query_index("data", "status-idx")
+            .key_value("active")
+            .limit(50)
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 50);
+
+        // Pagination not yet implemented — last_evaluated_key is always None.
+        assert!(result.last_evaluated_key.is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // TTL interaction with index queries
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_index_query_filters_ttl_expired_docs() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .ttl_attribute("expires")
+            .execute()
+            .unwrap();
+
+        db.create_partition_schema("data")
+            .prefix("CONTACT")
+            .validate(false)
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("email-idx")
+            .partition_schema("CONTACT")
+            .index_key("email", KeyType::String)
+            .execute()
+            .unwrap();
+
+        // Alive: TTL far in the future.
+        db.put_item(
+            "data",
+            json!({
+                "pk": "CONTACT#alive",
+                "email": "alive@test.com",
+                "expires": 9999999999.0
+            }),
+        )
+        .unwrap();
+
+        // Dead: TTL in the distant past.
+        db.put_item(
+            "data",
+            json!({
+                "pk": "CONTACT#dead",
+                "email": "dead@test.com",
+                "expires": 1000
+            }),
+        )
+        .unwrap();
+
+        // No TTL field: should be visible (never expires).
+        db.put_item(
+            "data",
+            json!({
+                "pk": "CONTACT#no_ttl",
+                "email": "nottl@test.com"
+            }),
+        )
+        .unwrap();
+
+        // alive@test.com → 1 result.
+        let result = db
+            .query_index("data", "email-idx")
+            .key_value("alive@test.com")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+
+        // dead@test.com → 0 results (filtered by TTL).
+        let result = db
+            .query_index("data", "email-idx")
+            .key_value("dead@test.com")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 0, "expired doc should be filtered");
+
+        // nottl@test.com → 1 result (no TTL field = never expires).
+        let result = db
+            .query_index("data", "email-idx")
+            .key_value("nottl@test.com")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+    }
+
+    // -------------------------------------------------------------------
+    // Pagination returns None (last_evaluated_key)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_index_query_last_evaluated_key_is_none() {
+        let (db, _dir) = create_test_db();
+        setup_single_table_with_index(&db);
+
+        db.put_item(
+            "data",
+            json!({"pk": "CONTACT#a", "email": "a@test.com", "age": 20}),
+        )
+        .unwrap();
+        db.put_item(
+            "data",
+            json!({"pk": "CONTACT#b", "email": "b@test.com", "age": 30}),
+        )
+        .unwrap();
+        db.put_item(
+            "data",
+            json!({"pk": "CONTACT#c", "email": "c@test.com", "age": 40}),
+        )
+        .unwrap();
+
+        // With limit(2): returns 2 items, but last_evaluated_key is None.
+        let result = db
+            .query_index("data", "email-idx")
+            .key_value("a@test.com")
+            .limit(2)
+            .execute()
+            .unwrap();
+        // Only 1 doc has email "a@test.com", so limit(2) doesn't truncate.
+        assert_eq!(result.items.len(), 1);
+        assert!(result.last_evaluated_key.is_none());
+
+        // Insert 2 more docs with the same email for limit testing.
+        db.put_item(
+            "data",
+            json!({"pk": "CONTACT#d", "email": "shared@test.com", "age": 50}),
+        )
+        .unwrap();
+        db.put_item(
+            "data",
+            json!({"pk": "CONTACT#e", "email": "shared@test.com", "age": 60}),
+        )
+        .unwrap();
+        db.put_item(
+            "data",
+            json!({"pk": "CONTACT#f", "email": "shared@test.com", "age": 70}),
+        )
+        .unwrap();
+
+        // limit(2) on 3 matching docs → 2 items returned.
+        let result = db
+            .query_index("data", "email-idx")
+            .key_value("shared@test.com")
+            .limit(2)
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 2);
+        assert!(
+            result.last_evaluated_key.is_none(),
+            "pagination not yet implemented"
+        );
+
+        // Without limit → all 3 matching docs.
+        let result = db
+            .query_index("data", "email-idx")
+            .key_value("shared@test.com")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 3);
+        assert!(result.last_evaluated_key.is_none());
     }
 }

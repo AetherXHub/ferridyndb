@@ -2,12 +2,120 @@ use serde_json::Value;
 
 use crate::catalog;
 use crate::encoding::composite;
-use crate::error::{Error, QueryError, StorageError};
+use crate::error::{Error, QueryError, SchemaError, StorageError};
 use crate::mvcc::ops as mvcc_ops;
 use crate::types::{PageId, TxnId, VersionedItem};
 
 use super::key_utils;
 use super::page_store::BufferedPageStore;
+
+/// Validate a document against its matching partition schema (if any).
+///
+/// Only runs if the matching schema has `validate: true`.
+fn validate_against_partition_schema(
+    doc: &Value,
+    schema: &crate::types::PartitionSchema,
+) -> Result<(), Error> {
+    if !schema.validate {
+        return Ok(());
+    }
+    let mut errors = Vec::new();
+    for attr in &schema.attributes {
+        match doc.get(&attr.name) {
+            None if attr.required => {
+                errors.push(format!("missing required attribute: {}", attr.name));
+            }
+            Some(val) => {
+                let type_ok = match attr.attr_type {
+                    crate::types::AttrType::String => val.is_string(),
+                    crate::types::AttrType::Number => val.is_number(),
+                    crate::types::AttrType::Boolean => val.is_boolean(),
+                };
+                if !type_ok {
+                    errors.push(format!(
+                        "attribute '{}' expected {:?}, got {:?}",
+                        attr.name, attr.attr_type, val
+                    ));
+                }
+            }
+            _ => {} // optional and missing = ok
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(SchemaError::ValidationFailed {
+            prefix: schema.prefix.clone(),
+            errors,
+        }
+        .into())
+    }
+}
+
+/// Maintain secondary indexes after a primary write.
+///
+/// For puts: removes old index entries (if old_doc exists) and adds new entries.
+/// For deletes: removes old index entries only.
+/// Returns the updated CatalogEntry with new index root pages.
+fn maintain_indexes(
+    store: &mut impl crate::btree::PageStore,
+    entry: &catalog::CatalogEntry,
+    pk: &crate::encoding::KeyValue,
+    old_doc: Option<&Value>,
+    new_doc: Option<&Value>,
+) -> Result<catalog::CatalogEntry, Error> {
+    // If no indexes exist, return entry unchanged.
+    if entry.indexes.is_empty() {
+        return Ok(entry.clone());
+    }
+
+    // Extract prefix - if None (non-String PK), no indexes can apply.
+    let prefix = match key_utils::extract_pk_prefix(pk) {
+        Some(p) => p,
+        None => return Ok(entry.clone()),
+    };
+
+    // Find indexes that match this prefix.
+    let relevant: Vec<usize> = entry
+        .indexes
+        .iter()
+        .enumerate()
+        .filter(|(_, idx)| idx.partition_schema == prefix)
+        .map(|(i, _)| i)
+        .collect();
+
+    if relevant.is_empty() {
+        return Ok(entry.clone());
+    }
+
+    let mut updated = entry.clone();
+
+    for &idx_pos in &relevant {
+        let index = &entry.indexes[idx_pos];
+        let mut current_root = updated.indexes[idx_pos].root_page;
+
+        // Remove old index entry if old_doc exists and has an indexable key.
+        if let Some(old) = old_doc
+            && let Some(old_key) = key_utils::build_index_key(index, old, &entry.schema)?
+        {
+            // Only delete if the key actually exists in the index.
+            if crate::btree::ops::search(store, current_root, &old_key)?.is_some() {
+                current_root = crate::btree::ops::delete(store, current_root, &old_key)?;
+            }
+        }
+
+        // Add new index entry if new_doc exists and has an indexable key.
+        if let Some(new) = new_doc
+            && let Some(new_key) = key_utils::build_index_key(index, new, &entry.schema)?
+        {
+            current_root = crate::btree::ops::insert(store, current_root, &new_key, &[])?;
+        }
+
+        updated.indexes[idx_pos].root_page = current_root;
+    }
+
+    Ok(updated)
+}
 
 /// A write transaction that buffers all changes until commit.
 ///
@@ -34,6 +142,16 @@ impl Transaction {
         let pk = key_utils::extract_key_from_doc(&document, &schema.partition_key)?;
         key_utils::validate_partition_key_size(&pk)?;
 
+        // 3a. Validate against partition schema if one matches.
+        if let Some(prefix) = key_utils::extract_pk_prefix(&pk)
+            && let Some(ps) = entry
+                .partition_schemas
+                .iter()
+                .find(|ps| ps.prefix == prefix)
+        {
+            validate_against_partition_schema(&document, ps)?;
+        }
+
         // 4. Extract and validate sort key if present.
         let sk = if let Some(ref sk_def) = schema.sort_key {
             let sk_val = key_utils::extract_key_from_doc(&document, sk_def)?;
@@ -46,6 +164,23 @@ impl Transaction {
         // 5. Encode composite key.
         let composite_key = composite::encode_composite(&pk, sk.as_ref())?;
 
+        // 5a. Read old document for index maintenance (before the write).
+        let old_doc: Option<Value> = if !entry.indexes.is_empty() {
+            mvcc_ops::mvcc_get(
+                &self.store,
+                entry.data_root_page,
+                &composite_key,
+                self.txn_id,
+            )?
+            .map(|bytes| rmp_serde::from_slice(&bytes))
+            .transpose()
+            .map_err(|e| {
+                StorageError::CorruptedPage(format!("failed to deserialize document: {e}"))
+            })?
+        } else {
+            None
+        };
+
         // 6. Put with MVCC versioning.
         let new_data_root = mvcc_ops::mvcc_put(
             &mut self.store,
@@ -55,9 +190,20 @@ impl Transaction {
             self.txn_id,
         )?;
 
-        // 7. Update catalog if data_root changed.
-        if new_data_root != entry.data_root_page {
-            self.update_catalog_data_root(table, &entry, new_data_root)?;
+        // 7. Update entry and maintain indexes.
+        let mut updated = entry.clone();
+        updated.data_root_page = new_data_root;
+        updated = maintain_indexes(
+            &mut self.store,
+            &updated,
+            &pk,
+            old_doc.as_ref(),
+            Some(&document),
+        )?;
+
+        // 8. Write catalog if anything changed.
+        if updated.data_root_page != entry.data_root_page || updated.indexes != entry.indexes {
+            self.update_catalog_entry(table, &updated)?;
         }
 
         Ok(())
@@ -82,6 +228,16 @@ impl Transaction {
         let pk = key_utils::extract_key_from_doc(&document, &schema.partition_key)?;
         key_utils::validate_partition_key_size(&pk)?;
 
+        // Validate against partition schema if one matches.
+        if let Some(prefix) = key_utils::extract_pk_prefix(&pk)
+            && let Some(ps) = entry
+                .partition_schemas
+                .iter()
+                .find(|ps| ps.prefix == prefix)
+        {
+            validate_against_partition_schema(&document, ps)?;
+        }
+
         let sk = if let Some(ref sk_def) = schema.sort_key {
             let sk_val = key_utils::extract_key_from_doc(&document, sk_def)?;
             key_utils::validate_sort_key_size(&sk_val)?;
@@ -92,6 +248,23 @@ impl Transaction {
 
         let composite_key = composite::encode_composite(&pk, sk.as_ref())?;
 
+        // Read old document for index maintenance.
+        let old_doc: Option<Value> = if !entry.indexes.is_empty() {
+            mvcc_ops::mvcc_get(
+                &self.store,
+                entry.data_root_page,
+                &composite_key,
+                self.txn_id,
+            )?
+            .map(|bytes| rmp_serde::from_slice(&bytes))
+            .transpose()
+            .map_err(|e| {
+                StorageError::CorruptedPage(format!("failed to deserialize document: {e}"))
+            })?
+        } else {
+            None
+        };
+
         let new_data_root = mvcc_ops::mvcc_put_conditional(
             &mut self.store,
             entry.data_root_page,
@@ -101,8 +274,18 @@ impl Transaction {
             expected_version,
         )?;
 
-        if new_data_root != entry.data_root_page {
-            self.update_catalog_data_root(table, &entry, new_data_root)?;
+        let mut updated = entry.clone();
+        updated.data_root_page = new_data_root;
+        updated = maintain_indexes(
+            &mut self.store,
+            &updated,
+            &pk,
+            old_doc.as_ref(),
+            Some(&document),
+        )?;
+
+        if updated.data_root_page != entry.data_root_page || updated.indexes != entry.indexes {
+            self.update_catalog_entry(table, &updated)?;
         }
 
         Ok(())
@@ -235,6 +418,24 @@ impl Transaction {
         };
 
         let composite_key = composite::encode_composite(&pk, sk.as_ref())?;
+
+        // Read document before delete for index maintenance.
+        let old_doc: Option<Value> = if !entry.indexes.is_empty() {
+            mvcc_ops::mvcc_get(
+                &self.store,
+                entry.data_root_page,
+                &composite_key,
+                self.txn_id,
+            )?
+            .map(|bytes| rmp_serde::from_slice(&bytes))
+            .transpose()
+            .map_err(|e| {
+                StorageError::CorruptedPage(format!("failed to deserialize document: {e}"))
+            })?
+        } else {
+            None
+        };
+
         let new_data_root = mvcc_ops::mvcc_delete(
             &mut self.store,
             entry.data_root_page,
@@ -242,26 +443,33 @@ impl Transaction {
             self.txn_id,
         )?;
 
-        if new_data_root != entry.data_root_page {
-            self.update_catalog_data_root(table, &entry, new_data_root)?;
+        let mut updated = entry.clone();
+        updated.data_root_page = new_data_root;
+        updated = maintain_indexes(
+            &mut self.store,
+            &updated,
+            &pk,
+            old_doc.as_ref(),
+            None, // delete: no new document
+        )?;
+
+        if updated.data_root_page != entry.data_root_page || updated.indexes != entry.indexes {
+            self.update_catalog_entry(table, &updated)?;
         }
 
         Ok(())
     }
 
-    /// Update the catalog entry's data_root_page after a B+Tree mutation.
-    fn update_catalog_data_root(
+    /// Update a catalog entry after a B+Tree mutation.
+    ///
+    /// Serializes the full entry (including partition_schemas and indexes)
+    /// and re-inserts it into the catalog B+Tree.
+    fn update_catalog_entry(
         &mut self,
         table_name: &str,
-        old_entry: &catalog::CatalogEntry,
-        new_data_root: PageId,
+        updated_entry: &catalog::CatalogEntry,
     ) -> Result<(), Error> {
-        let updated_entry = catalog::CatalogEntry {
-            schema: old_entry.schema.clone(),
-            data_root_page: new_data_root,
-        };
-
-        let json_bytes = serde_json::to_vec(&updated_entry).map_err(|e| {
+        let json_bytes = serde_json::to_vec(updated_entry).map_err(|e| {
             StorageError::CorruptedPage(format!("failed to serialize catalog entry: {e}"))
         })?;
 
@@ -283,7 +491,8 @@ mod tests {
     use super::*;
     use crate::btree::InMemoryPageStore;
     use crate::btree::ops as btree_ops;
-    use crate::types::{KeyDefinition, KeyType, TableSchema};
+    use crate::encoding::KeyValue;
+    use crate::types::{KeyDefinition, KeyType, PartitionSchema, TableSchema};
     use serde_json::json;
 
     /// Build a Transaction backed by an InMemoryPageStore (for unit tests
@@ -401,5 +610,350 @@ mod tests {
         assert!(data.is_some());
         let retrieved: Value = rmp_serde::from_slice(&data.unwrap()).unwrap();
         assert_eq!(retrieved["data"], "event1");
+    }
+
+    #[test]
+    fn test_validate_conforming_document() {
+        let schema = crate::types::PartitionSchema {
+            prefix: "CONTACT".to_string(),
+            description: "People".to_string(),
+            attributes: vec![
+                crate::types::AttributeDef {
+                    name: "email".to_string(),
+                    attr_type: crate::types::AttrType::String,
+                    required: true,
+                },
+                crate::types::AttributeDef {
+                    name: "age".to_string(),
+                    attr_type: crate::types::AttrType::Number,
+                    required: false,
+                },
+            ],
+            validate: true,
+        };
+        let doc = json!({"pk": "CONTACT#alice", "email": "alice@ex.com", "age": 30});
+        assert!(validate_against_partition_schema(&doc, &schema).is_ok());
+    }
+
+    #[test]
+    fn test_validate_missing_required_attribute() {
+        let schema = crate::types::PartitionSchema {
+            prefix: "CONTACT".to_string(),
+            description: "People".to_string(),
+            attributes: vec![crate::types::AttributeDef {
+                name: "email".to_string(),
+                attr_type: crate::types::AttrType::String,
+                required: true,
+            }],
+            validate: true,
+        };
+        let doc = json!({"pk": "CONTACT#alice", "name": "Alice"});
+        let result = validate_against_partition_schema(&doc, &schema);
+        assert!(result.is_err());
+        assert!(format!("{}", result.unwrap_err()).contains("missing required"));
+    }
+
+    #[test]
+    fn test_validate_wrong_type() {
+        let schema = crate::types::PartitionSchema {
+            prefix: "CONTACT".to_string(),
+            description: "People".to_string(),
+            attributes: vec![crate::types::AttributeDef {
+                name: "email".to_string(),
+                attr_type: crate::types::AttrType::String,
+                required: true,
+            }],
+            validate: true,
+        };
+        // email is a number instead of string
+        let doc = json!({"pk": "CONTACT#alice", "email": 42});
+        let result = validate_against_partition_schema(&doc, &schema);
+        assert!(result.is_err());
+        assert!(format!("{}", result.unwrap_err()).contains("expected"));
+    }
+
+    #[test]
+    fn test_validate_skipped_when_disabled() {
+        let schema = crate::types::PartitionSchema {
+            prefix: "CONTACT".to_string(),
+            description: "People".to_string(),
+            attributes: vec![crate::types::AttributeDef {
+                name: "email".to_string(),
+                attr_type: crate::types::AttrType::String,
+                required: true,
+            }],
+            validate: false, // disabled!
+        };
+        // Missing email but validate is false — should pass
+        let doc = json!({"pk": "CONTACT#alice"});
+        assert!(validate_against_partition_schema(&doc, &schema).is_ok());
+    }
+
+    #[test]
+    fn test_validate_optional_missing_ok() {
+        let schema = crate::types::PartitionSchema {
+            prefix: "CONTACT".to_string(),
+            description: "People".to_string(),
+            attributes: vec![crate::types::AttributeDef {
+                name: "nickname".to_string(),
+                attr_type: crate::types::AttrType::String,
+                required: false,
+            }],
+            validate: true,
+        };
+        // Missing optional attribute — should pass
+        let doc = json!({"pk": "CONTACT#alice"});
+        assert!(validate_against_partition_schema(&doc, &schema).is_ok());
+    }
+
+    #[test]
+    fn test_validate_multiple_errors() {
+        let schema = crate::types::PartitionSchema {
+            prefix: "CONTACT".to_string(),
+            description: "People".to_string(),
+            attributes: vec![
+                crate::types::AttributeDef {
+                    name: "email".to_string(),
+                    attr_type: crate::types::AttrType::String,
+                    required: true,
+                },
+                crate::types::AttributeDef {
+                    name: "active".to_string(),
+                    attr_type: crate::types::AttrType::Boolean,
+                    required: true,
+                },
+            ],
+            validate: true,
+        };
+        // Missing both required attributes
+        let doc = json!({"pk": "CONTACT#alice"});
+        let result = validate_against_partition_schema(&doc, &schema);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        // Both errors should be in the message (joined with "; ")
+        assert!(err_msg.contains("email"), "should mention email: {err_msg}");
+        assert!(
+            err_msg.contains("active"),
+            "should mention active: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_maintain_indexes_put_creates_entry() {
+        let mut store = InMemoryPageStore::new();
+        let (mut catalog_root, _entry) = setup_catalog_with_table(&mut store, "data", false);
+
+        // Add partition schema and index.
+        let ps = PartitionSchema {
+            prefix: "CONTACT".to_string(),
+            description: "People".to_string(),
+            attributes: vec![],
+            validate: false,
+        };
+        catalog_root =
+            catalog::ops::create_partition_schema(&mut store, catalog_root, "data", ps).unwrap();
+        catalog_root = catalog::ops::create_index(
+            &mut store,
+            catalog_root,
+            "data",
+            "email-idx".to_string(),
+            "CONTACT".to_string(),
+            KeyDefinition {
+                name: "email".to_string(),
+                key_type: KeyType::String,
+            },
+            1,
+        )
+        .unwrap();
+
+        let entry = catalog::ops::get_table(&store, catalog_root, "data").unwrap();
+        let pk = KeyValue::String("CONTACT#alice".to_string());
+        let doc = json!({"pk": "CONTACT#alice", "email": "alice@ex.com"});
+
+        let updated = maintain_indexes(&mut store, &entry, &pk, None, Some(&doc)).unwrap();
+
+        // Verify index entry was created.
+        let index_entries =
+            btree_ops::range_scan(&store, updated.indexes[0].root_page, None, None).unwrap();
+        assert_eq!(index_entries.len(), 1);
+    }
+
+    #[test]
+    fn test_maintain_indexes_delete_removes_entry() {
+        let mut store = InMemoryPageStore::new();
+        let (mut catalog_root, _entry) = setup_catalog_with_table(&mut store, "data", false);
+
+        let ps = PartitionSchema {
+            prefix: "CONTACT".to_string(),
+            description: "People".to_string(),
+            attributes: vec![],
+            validate: false,
+        };
+        catalog_root =
+            catalog::ops::create_partition_schema(&mut store, catalog_root, "data", ps).unwrap();
+        catalog_root = catalog::ops::create_index(
+            &mut store,
+            catalog_root,
+            "data",
+            "email-idx".to_string(),
+            "CONTACT".to_string(),
+            KeyDefinition {
+                name: "email".to_string(),
+                key_type: KeyType::String,
+            },
+            1,
+        )
+        .unwrap();
+
+        let entry = catalog::ops::get_table(&store, catalog_root, "data").unwrap();
+        let pk = KeyValue::String("CONTACT#alice".to_string());
+        let doc = json!({"pk": "CONTACT#alice", "email": "alice@ex.com"});
+
+        // First: add index entry.
+        let updated = maintain_indexes(&mut store, &entry, &pk, None, Some(&doc)).unwrap();
+
+        // Now: delete (old_doc = doc, new_doc = None).
+        let updated = maintain_indexes(&mut store, &updated, &pk, Some(&doc), None).unwrap();
+
+        let index_entries =
+            btree_ops::range_scan(&store, updated.indexes[0].root_page, None, None).unwrap();
+        assert_eq!(index_entries.len(), 0);
+    }
+
+    #[test]
+    fn test_maintain_indexes_update_changes_entry() {
+        let mut store = InMemoryPageStore::new();
+        let (mut catalog_root, _entry) = setup_catalog_with_table(&mut store, "data", false);
+
+        let ps = PartitionSchema {
+            prefix: "CONTACT".to_string(),
+            description: "People".to_string(),
+            attributes: vec![],
+            validate: false,
+        };
+        catalog_root =
+            catalog::ops::create_partition_schema(&mut store, catalog_root, "data", ps).unwrap();
+        catalog_root = catalog::ops::create_index(
+            &mut store,
+            catalog_root,
+            "data",
+            "email-idx".to_string(),
+            "CONTACT".to_string(),
+            KeyDefinition {
+                name: "email".to_string(),
+                key_type: KeyType::String,
+            },
+            1,
+        )
+        .unwrap();
+
+        let entry = catalog::ops::get_table(&store, catalog_root, "data").unwrap();
+        let pk = KeyValue::String("CONTACT#alice".to_string());
+        let old_doc = json!({"pk": "CONTACT#alice", "email": "old@ex.com"});
+        let new_doc = json!({"pk": "CONTACT#alice", "email": "new@ex.com"});
+
+        // Insert initial.
+        let updated = maintain_indexes(&mut store, &entry, &pk, None, Some(&old_doc)).unwrap();
+
+        // Update email.
+        let updated =
+            maintain_indexes(&mut store, &updated, &pk, Some(&old_doc), Some(&new_doc)).unwrap();
+
+        // Should still have exactly one index entry (old removed, new added).
+        let index_entries =
+            btree_ops::range_scan(&store, updated.indexes[0].root_page, None, None).unwrap();
+        assert_eq!(index_entries.len(), 1);
+    }
+
+    #[test]
+    fn test_maintain_indexes_no_indexes_noop() {
+        let mut store = InMemoryPageStore::new();
+        let (catalog_root, _entry) = setup_catalog_with_table(&mut store, "data", false);
+
+        let entry = catalog::ops::get_table(&store, catalog_root, "data").unwrap();
+        let pk = KeyValue::String("CONTACT#alice".to_string());
+        let doc = json!({"pk": "CONTACT#alice", "email": "alice@ex.com"});
+
+        // No indexes — should return entry unchanged.
+        let updated = maintain_indexes(&mut store, &entry, &pk, None, Some(&doc)).unwrap();
+        assert_eq!(updated.indexes.len(), 0);
+    }
+
+    #[test]
+    fn test_maintain_indexes_different_prefix_ignored() {
+        let mut store = InMemoryPageStore::new();
+        let (mut catalog_root, _entry) = setup_catalog_with_table(&mut store, "data", false);
+
+        let ps = PartitionSchema {
+            prefix: "CONTACT".to_string(),
+            description: "People".to_string(),
+            attributes: vec![],
+            validate: false,
+        };
+        catalog_root =
+            catalog::ops::create_partition_schema(&mut store, catalog_root, "data", ps).unwrap();
+        catalog_root = catalog::ops::create_index(
+            &mut store,
+            catalog_root,
+            "data",
+            "email-idx".to_string(),
+            "CONTACT".to_string(),
+            KeyDefinition {
+                name: "email".to_string(),
+                key_type: KeyType::String,
+            },
+            1,
+        )
+        .unwrap();
+
+        let entry = catalog::ops::get_table(&store, catalog_root, "data").unwrap();
+        // Different prefix — should NOT create index entry.
+        let pk = KeyValue::String("ORDER#123".to_string());
+        let doc = json!({"pk": "ORDER#123", "email": "order@ex.com"});
+
+        let updated = maintain_indexes(&mut store, &entry, &pk, None, Some(&doc)).unwrap();
+
+        let index_entries =
+            btree_ops::range_scan(&store, updated.indexes[0].root_page, None, None).unwrap();
+        assert_eq!(index_entries.len(), 0);
+    }
+
+    #[test]
+    fn test_maintain_indexes_missing_attribute_skipped() {
+        let mut store = InMemoryPageStore::new();
+        let (mut catalog_root, _entry) = setup_catalog_with_table(&mut store, "data", false);
+
+        let ps = PartitionSchema {
+            prefix: "CONTACT".to_string(),
+            description: "People".to_string(),
+            attributes: vec![],
+            validate: false,
+        };
+        catalog_root =
+            catalog::ops::create_partition_schema(&mut store, catalog_root, "data", ps).unwrap();
+        catalog_root = catalog::ops::create_index(
+            &mut store,
+            catalog_root,
+            "data",
+            "email-idx".to_string(),
+            "CONTACT".to_string(),
+            KeyDefinition {
+                name: "email".to_string(),
+                key_type: KeyType::String,
+            },
+            1,
+        )
+        .unwrap();
+
+        let entry = catalog::ops::get_table(&store, catalog_root, "data").unwrap();
+        let pk = KeyValue::String("CONTACT#alice".to_string());
+        // No email attribute.
+        let doc = json!({"pk": "CONTACT#alice", "name": "Alice"});
+
+        let updated = maintain_indexes(&mut store, &entry, &pk, None, Some(&doc)).unwrap();
+
+        let index_entries =
+            btree_ops::range_scan(&store, updated.indexes[0].root_page, None, None).unwrap();
+        assert_eq!(index_entries.len(), 0);
     }
 }

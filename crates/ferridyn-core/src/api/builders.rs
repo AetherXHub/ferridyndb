@@ -2,11 +2,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
+use crate::btree::ops as btree_ops;
 use crate::catalog;
 use crate::encoding::composite;
-use crate::error::{Error, QueryError, StorageError};
+use crate::error::{Error, QueryError, SchemaError, StorageError};
 use crate::mvcc::ops as mvcc_ops;
-use crate::types::{KeyDefinition, KeyType, TableSchema, VersionedItem};
+use crate::types::{AttrType, AttributeDef, KeyDefinition, KeyType, TableSchema, VersionedItem};
 
 use super::database::FerridynDB;
 use super::key_utils;
@@ -743,6 +744,300 @@ fn extract_prefix(kv: &crate::encoding::KeyValue) -> String {
         },
         crate::encoding::KeyValue::Number(n) => n.to_string(),
         crate::encoding::KeyValue::Binary(b) => format!("{b:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IndexQueryBuilder
+// ---------------------------------------------------------------------------
+
+/// Builder for querying a secondary index.
+///
+/// Scans the index B+Tree for entries matching `key_value` (the indexed
+/// attribute value), then fetches full documents from the primary table.
+/// Deleted or invisible documents are silently skipped (lazy GC).
+pub struct IndexQueryBuilder<'a> {
+    db: &'a FerridynDB,
+    table: String,
+    index_name: String,
+    key_value: Option<Value>,
+    limit: Option<usize>,
+    scan_forward: bool,
+}
+
+impl<'a> IndexQueryBuilder<'a> {
+    pub(crate) fn new(db: &'a FerridynDB, table: String, index_name: String) -> Self {
+        Self {
+            db,
+            table,
+            index_name,
+            key_value: None,
+            limit: None,
+            scan_forward: true,
+        }
+    }
+
+    /// Set the indexed attribute value to search for.
+    pub fn key_value(mut self, val: impl Into<Value>) -> Self {
+        self.key_value = Some(val.into());
+        self
+    }
+
+    /// Limit the number of results.
+    pub fn limit(mut self, n: usize) -> Self {
+        self.limit = Some(n);
+        self
+    }
+
+    /// Set scan direction (default: forward/ascending).
+    pub fn scan_forward(mut self, forward: bool) -> Self {
+        self.scan_forward = forward;
+        self
+    }
+
+    /// Execute the index query.
+    pub fn execute(self) -> Result<QueryResult, Error> {
+        let search_value = self.key_value.ok_or(QueryError::IndexKeyRequired)?;
+
+        self.db.read_snapshot(|store, catalog_root, snapshot_txn| {
+            let entry = self.db.cached_get_table(store, catalog_root, &self.table)?;
+
+            // Find the index definition.
+            let index = entry
+                .indexes
+                .iter()
+                .find(|idx| idx.name == self.index_name)
+                .ok_or_else(|| SchemaError::IndexNotFound(self.index_name.clone()))?;
+
+            // Convert the search value to a KeyValue.
+            let indexed_kv = key_utils::json_to_key_value(
+                &search_value,
+                index.index_key.key_type,
+                &index.index_key.name,
+            )?;
+
+            // Compute scan bounds for all entries with this indexed value.
+            // The index B+Tree keys start with the encoded indexed value as a
+            // "partition prefix", so compute_scan_bounds with no sort condition
+            // gives us the correct byte range.
+            let (start_key, end_key) = compute_scan_bounds(&indexed_kv, None, None)?;
+
+            // Scan the index B+Tree (plain B+Tree, no MVCC wrapping).
+            let index_entries = btree_ops::range_scan(
+                store,
+                index.root_page,
+                start_key.as_deref(),
+                end_key.as_deref(),
+            )?;
+
+            // Collect results by looking up each primary document via MVCC.
+            let mut items: Vec<Value> = Vec::new();
+            for (index_key, _empty_val) in &index_entries {
+                // Decode the primary composite key bytes from the index entry.
+                let primary_key_bytes = key_utils::decode_primary_key_from_index_entry(index_key)?;
+
+                // Fetch the full document from the primary table.
+                let doc_bytes = mvcc_ops::mvcc_get(
+                    store,
+                    entry.data_root_page,
+                    &primary_key_bytes,
+                    snapshot_txn,
+                )?;
+
+                match doc_bytes {
+                    Some(bytes) => {
+                        let val: Value = rmp_serde::from_slice(&bytes).map_err(|e| {
+                            StorageError::CorruptedPage(format!(
+                                "failed to deserialize document: {e}"
+                            ))
+                        })?;
+                        // Check TTL expiration.
+                        if is_ttl_expired(&val, &entry.schema) {
+                            continue;
+                        }
+                        items.push(val);
+                    }
+                    None => {
+                        // Document deleted or invisible — lazy GC skip.
+                        continue;
+                    }
+                }
+            }
+
+            // Apply scan direction.
+            if !self.scan_forward {
+                items.reverse();
+            }
+
+            // Apply limit.
+            if let Some(limit) = self.limit {
+                items.truncate(limit);
+            }
+
+            Ok(QueryResult {
+                items,
+                last_evaluated_key: None,
+            })
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PartitionSchemaBuilder
+// ---------------------------------------------------------------------------
+
+/// Builder for declaring a partition schema on a table.
+pub struct PartitionSchemaBuilder<'a> {
+    db: &'a FerridynDB,
+    table: String,
+    prefix: Option<String>,
+    description: Option<String>,
+    attributes: Vec<AttributeDef>,
+    validate: bool,
+}
+
+impl<'a> PartitionSchemaBuilder<'a> {
+    pub(crate) fn new(db: &'a FerridynDB, table: String) -> Self {
+        Self {
+            db,
+            table,
+            prefix: None,
+            description: None,
+            attributes: Vec::new(),
+            validate: false,
+        }
+    }
+
+    /// Set the partition key prefix (e.g. "CONTACT").
+    pub fn prefix(mut self, p: &str) -> Self {
+        self.prefix = Some(p.to_string());
+        self
+    }
+
+    /// Set a human-readable description.
+    pub fn description(mut self, d: &str) -> Self {
+        self.description = Some(d.to_string());
+        self
+    }
+
+    /// Declare an expected attribute with type and required flag.
+    pub fn attribute(mut self, name: &str, attr_type: AttrType, required: bool) -> Self {
+        self.attributes.push(AttributeDef {
+            name: name.to_string(),
+            attr_type,
+            required,
+        });
+        self
+    }
+
+    /// Enable or disable write validation for documents matching this prefix.
+    pub fn validate(mut self, v: bool) -> Self {
+        self.validate = v;
+        self
+    }
+
+    /// Execute the partition schema creation.
+    pub fn execute(self) -> Result<(), Error> {
+        let prefix = self.prefix.ok_or(QueryError::PartitionKeyRequired)?;
+        let schema = crate::types::PartitionSchema {
+            prefix,
+            description: self.description.unwrap_or_default(),
+            attributes: self.attributes,
+            validate: self.validate,
+        };
+        let table = self.table;
+        self.db.transact(move |txn| {
+            let new_root = catalog::ops::create_partition_schema(
+                &mut txn.store,
+                txn.catalog_root,
+                &table,
+                schema,
+            )?;
+            txn.catalog_root = new_root;
+            Ok(())
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CreateIndexBuilder
+// ---------------------------------------------------------------------------
+
+/// Builder for creating a secondary index on a table.
+///
+/// The index is scoped to a partition schema (prefix). Documents whose
+/// partition key starts with the prefix AND contain the indexed attribute
+/// will have entries in the index B+Tree.
+///
+/// If the table already has data matching the prefix, a synchronous backfill
+/// is performed within the transaction. This blocks all reads and writes
+/// for the duration.
+pub struct CreateIndexBuilder<'a> {
+    db: &'a FerridynDB,
+    table: String,
+    name: Option<String>,
+    partition_schema: Option<String>,
+    index_key: Option<(String, KeyType)>,
+}
+
+impl<'a> CreateIndexBuilder<'a> {
+    pub(crate) fn new(db: &'a FerridynDB, table: String) -> Self {
+        Self {
+            db,
+            table,
+            name: None,
+            partition_schema: None,
+            index_key: None,
+        }
+    }
+
+    /// Set the index name.
+    pub fn name(mut self, n: &str) -> Self {
+        self.name = Some(n.to_string());
+        self
+    }
+
+    /// Set the partition schema prefix this index is scoped to.
+    pub fn partition_schema(mut self, prefix: &str) -> Self {
+        self.partition_schema = Some(prefix.to_string());
+        self
+    }
+
+    /// Set the attribute to index and its key type.
+    pub fn index_key(mut self, attr_name: &str, key_type: KeyType) -> Self {
+        self.index_key = Some((attr_name.to_string(), key_type));
+        self
+    }
+
+    /// Execute the index creation (with synchronous backfill).
+    pub fn execute(self) -> Result<(), Error> {
+        let name = self.name.ok_or(QueryError::InvalidCondition(
+            "index name required".to_string(),
+        ))?;
+        let partition_schema = self.partition_schema.ok_or(QueryError::InvalidCondition(
+            "partition_schema required".to_string(),
+        ))?;
+        let (attr_name, key_type) = self.index_key.ok_or(QueryError::IndexKeyRequired)?;
+
+        let key_def = KeyDefinition {
+            name: attr_name,
+            key_type,
+        };
+        let table = self.table;
+
+        self.db.transact(move |txn| {
+            let new_root = catalog::ops::create_index(
+                &mut txn.store,
+                txn.catalog_root,
+                &table,
+                name,
+                partition_schema,
+                key_def,
+                txn.txn_id,
+            )?;
+            txn.catalog_root = new_root;
+            Ok(())
+        })
     }
 }
 

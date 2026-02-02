@@ -4,7 +4,8 @@ use crate::encoding::KeyValue;
 use crate::encoding::{binary, string};
 use crate::error::{EncodingError, Error, SchemaError};
 use crate::types::{
-    KeyDefinition, KeyType, MAX_DOCUMENT_SIZE, MAX_PARTITION_KEY_SIZE, MAX_SORT_KEY_SIZE,
+    IndexDefinition, KeyDefinition, KeyType, MAX_DOCUMENT_SIZE, MAX_PARTITION_KEY_SIZE,
+    MAX_SORT_KEY_SIZE, TableSchema,
 };
 
 /// Convert a [`serde_json::Value`] to a [`KeyValue`], given the expected [`KeyType`].
@@ -136,9 +137,146 @@ pub fn key_value_to_json(kv: &KeyValue) -> Value {
     }
 }
 
+/// Extract the prefix from a partition key by splitting on `#`.
+///
+/// Returns `Some(prefix)` for String keys, `None` for Number/Binary keys.
+/// - `KeyValue::String("CONTACT#toby")` → `Some("CONTACT")`
+/// - `KeyValue::String("simple")` → `Some("simple")` (no delimiter = entire key)
+/// - `KeyValue::Number(_)` → `None`
+/// - `KeyValue::Binary(_)` → `None`
+pub fn extract_pk_prefix(pk: &KeyValue) -> Option<String> {
+    match pk {
+        KeyValue::String(s) => {
+            if let Some(idx) = s.find('#') {
+                Some(s[..idx].to_string())
+            } else {
+                Some(s.clone())
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Build the B+Tree key for a secondary index entry.
+///
+/// The index key encodes: `(indexed_attribute_value, primary_composite_key_as_Binary)`.
+/// This ensures uniqueness and allows recovering the primary key from index scan results.
+///
+/// Returns `Ok(None)` if the document doesn't have the indexed attribute or the
+/// attribute's type doesn't match the index's declared `KeyType` (silently skipped).
+pub fn build_index_key(
+    index: &IndexDefinition,
+    doc: &Value,
+    table_schema: &TableSchema,
+) -> Result<Option<Vec<u8>>, Error> {
+    use crate::encoding::{binary, composite};
+
+    // Extract the indexed attribute value from the document.
+    let index_attr_val = match doc.get(&index.index_key.name) {
+        Some(val) => val,
+        None => return Ok(None), // Document lacks indexed attribute — skip.
+    };
+
+    // Try to convert to KeyValue; type mismatch → skip silently.
+    let index_kv = match json_to_key_value(
+        index_attr_val,
+        index.index_key.key_type,
+        &index.index_key.name,
+    ) {
+        Ok(kv) => kv,
+        Err(_) => return Ok(None), // Type mismatch — skip.
+    };
+
+    // Build the primary composite key bytes.
+    let pk = extract_key_from_doc(doc, &table_schema.partition_key)?;
+    let sk = match &table_schema.sort_key {
+        Some(sk_def) => Some(extract_key_from_doc(doc, sk_def)?),
+        None => None,
+    };
+    let primary_key_bytes = composite::encode_composite(&pk, sk.as_ref())?;
+
+    // Build the index key manually: indexed_value + TAG_BINARY + primary_key_bytes
+    // The primary key bytes are the LAST component, so we don't need a terminator.
+    let mut index_key = Vec::new();
+
+    // Part 1: encode the indexed attribute value
+    index_key.push(match &index_kv {
+        KeyValue::String(_) => composite::TAG_STRING,
+        KeyValue::Number(_) => composite::TAG_NUMBER,
+        KeyValue::Binary(_) => composite::TAG_BINARY,
+    });
+    index_key.extend(match &index_kv {
+        KeyValue::String(s) => crate::encoding::string::encode_string(s),
+        KeyValue::Number(n) => crate::encoding::number::encode_number(*n)?.to_vec(),
+        KeyValue::Binary(b) => binary::encode_binary(b),
+    });
+
+    // Part 2: append the TAG_BINARY and raw primary key bytes (no terminator needed - it's the last field)
+    index_key.push(composite::TAG_BINARY);
+    index_key.extend(&primary_key_bytes);
+
+    Ok(Some(index_key))
+}
+
+/// Decode the primary composite key bytes from an index entry's B+Tree key.
+///
+/// The index key is: indexed_value + TAG_BINARY + primary_key_bytes.
+/// This extracts the primary key bytes (everything after the TAG_BINARY).
+pub fn decode_primary_key_from_index_entry(index_key: &[u8]) -> Result<Vec<u8>, Error> {
+    use crate::encoding::composite;
+
+    if index_key.is_empty() {
+        return Err(crate::error::EncodingError::MalformedKey.into());
+    }
+
+    // Decode the first component (indexed value)
+    let first_tag = index_key[0];
+    let first_type = composite::tag_to_key_type(first_tag)?;
+
+    // Calculate how many bytes the first component consumed
+    let bytes_consumed = match first_type {
+        crate::types::KeyType::String => {
+            // Find the null terminator
+            let pos = index_key[1..]
+                .iter()
+                .position(|&b| b == 0x00)
+                .ok_or(crate::error::EncodingError::MalformedKey)?;
+            1 + pos + 1 // tag + string bytes + terminator
+        }
+        crate::types::KeyType::Number => {
+            1 + 8 // tag + 8 bytes for f64
+        }
+        crate::types::KeyType::Binary => {
+            // Find the null terminator
+            let pos = index_key[1..]
+                .iter()
+                .position(|&b| b == 0x00)
+                .ok_or(crate::error::EncodingError::MalformedKey)?;
+            1 + pos + 1 // tag + binary bytes + terminator
+        }
+    };
+
+    // The rest should be: TAG_BINARY + primary_key_bytes
+    if bytes_consumed >= index_key.len() {
+        return Err(crate::error::EncodingError::MalformedKey.into());
+    }
+
+    let remaining = &index_key[bytes_consumed..];
+    if remaining.is_empty() || remaining[0] != composite::TAG_BINARY {
+        return Err(crate::error::StorageError::CorruptedPage(
+            "index entry missing TAG_BINARY for primary key component".to_string(),
+        )
+        .into());
+    }
+
+    // Everything after the TAG_BINARY is the primary key bytes
+    Ok(remaining[1..].to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{IndexDefinition, TableSchema};
     use serde_json::json;
 
     #[test]
@@ -220,5 +358,167 @@ mod tests {
         let kv_bin = KeyValue::Binary(vec![1, 2, 3]);
         let json_val = key_value_to_json(&kv_bin);
         assert_eq!(json_val, json!([1, 2, 3]));
+    }
+
+    #[test]
+    fn test_extract_pk_prefix_with_hash() {
+        let pk = KeyValue::String("CONTACT#toby".to_string());
+        assert_eq!(extract_pk_prefix(&pk), Some("CONTACT".to_string()));
+    }
+
+    #[test]
+    fn test_extract_pk_prefix_no_hash() {
+        let pk = KeyValue::String("simple_key".to_string());
+        assert_eq!(extract_pk_prefix(&pk), Some("simple_key".to_string()));
+    }
+
+    #[test]
+    fn test_extract_pk_prefix_multiple_hashes() {
+        let pk = KeyValue::String("A#B#C".to_string());
+        assert_eq!(extract_pk_prefix(&pk), Some("A".to_string()));
+    }
+
+    #[test]
+    fn test_extract_pk_prefix_number() {
+        let pk = KeyValue::Number(42.0);
+        assert_eq!(extract_pk_prefix(&pk), None);
+    }
+
+    #[test]
+    fn test_extract_pk_prefix_binary() {
+        let pk = KeyValue::Binary(vec![1, 2, 3]);
+        assert_eq!(extract_pk_prefix(&pk), None);
+    }
+
+    #[test]
+    fn test_build_index_key_roundtrip() {
+        let table_schema = TableSchema {
+            name: "data".to_string(),
+            partition_key: KeyDefinition {
+                name: "pk".to_string(),
+                key_type: KeyType::String,
+            },
+            sort_key: Some(KeyDefinition {
+                name: "sk".to_string(),
+                key_type: KeyType::Number,
+            }),
+            ttl_attribute: None,
+        };
+        let index = IndexDefinition {
+            name: "email-index".to_string(),
+            partition_schema: "CONTACT".to_string(),
+            index_key: KeyDefinition {
+                name: "email".to_string(),
+                key_type: KeyType::String,
+            },
+            root_page: 0,
+        };
+        let doc = json!({
+            "pk": "CONTACT#alice",
+            "sk": 42.0,
+            "email": "alice@example.com",
+            "name": "Alice"
+        });
+
+        let index_key = build_index_key(&index, &doc, &table_schema).unwrap();
+        assert!(index_key.is_some());
+
+        let index_key = index_key.unwrap();
+        let primary_bytes = decode_primary_key_from_index_entry(&index_key).unwrap();
+
+        // Verify the primary key bytes match what encode_composite would produce
+        use crate::encoding::composite;
+        let expected_pk_bytes = composite::encode_composite(
+            &KeyValue::String("CONTACT#alice".to_string()),
+            Some(&KeyValue::Number(42.0)),
+        )
+        .unwrap();
+        assert_eq!(primary_bytes, expected_pk_bytes);
+    }
+
+    #[test]
+    fn test_build_index_key_missing_attribute() {
+        let table_schema = TableSchema {
+            name: "data".to_string(),
+            partition_key: KeyDefinition {
+                name: "pk".to_string(),
+                key_type: KeyType::String,
+            },
+            sort_key: None,
+            ttl_attribute: None,
+        };
+        let index = IndexDefinition {
+            name: "email-index".to_string(),
+            partition_schema: "CONTACT".to_string(),
+            index_key: KeyDefinition {
+                name: "email".to_string(),
+                key_type: KeyType::String,
+            },
+            root_page: 0,
+        };
+        let doc = json!({"pk": "CONTACT#alice", "name": "Alice"});
+
+        let result = build_index_key(&index, &doc, &table_schema).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_build_index_key_type_mismatch() {
+        let table_schema = TableSchema {
+            name: "data".to_string(),
+            partition_key: KeyDefinition {
+                name: "pk".to_string(),
+                key_type: KeyType::String,
+            },
+            sort_key: None,
+            ttl_attribute: None,
+        };
+        let index = IndexDefinition {
+            name: "email-index".to_string(),
+            partition_schema: "CONTACT".to_string(),
+            index_key: KeyDefinition {
+                name: "email".to_string(),
+                key_type: KeyType::String,
+            },
+            root_page: 0,
+        };
+        // email is a number, but index expects String
+        let doc = json!({"pk": "CONTACT#alice", "email": 42});
+
+        let result = build_index_key(&index, &doc, &table_schema).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_build_index_key_no_sort_key() {
+        let table_schema = TableSchema {
+            name: "data".to_string(),
+            partition_key: KeyDefinition {
+                name: "pk".to_string(),
+                key_type: KeyType::String,
+            },
+            sort_key: None,
+            ttl_attribute: None,
+        };
+        let index = IndexDefinition {
+            name: "email-index".to_string(),
+            partition_schema: "CONTACT".to_string(),
+            index_key: KeyDefinition {
+                name: "email".to_string(),
+                key_type: KeyType::String,
+            },
+            root_page: 0,
+        };
+        let doc = json!({"pk": "CONTACT#alice", "email": "alice@example.com"});
+
+        let index_key = build_index_key(&index, &doc, &table_schema).unwrap();
+        assert!(index_key.is_some());
+
+        let primary_bytes = decode_primary_key_from_index_entry(&index_key.unwrap()).unwrap();
+        use crate::encoding::composite;
+        let expected =
+            composite::encode_composite(&KeyValue::String("CONTACT#alice".to_string()), None)
+                .unwrap();
+        assert_eq!(primary_bytes, expected);
     }
 }

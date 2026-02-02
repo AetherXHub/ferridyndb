@@ -93,6 +93,30 @@ pub enum SchemaError {
 
     #[error("missing key attribute: {0}")]
     MissingKeyAttribute(String),
+
+    #[error("partition schema not found: {0}")]
+    PartitionSchemaNotFound(String),
+
+    #[error("partition schema already exists: {0}")]
+    PartitionSchemaAlreadyExists(String),
+
+    #[error("index not found: {0}")]
+    IndexNotFound(String),
+
+    #[error("index already exists: {0}")]
+    IndexAlreadyExists(String),
+
+    #[error("index '{index}' references missing attribute '{attribute}'")]
+    IndexKeyAttributeMissing { index: String, attribute: String },
+
+    #[error("validation failed for prefix '{prefix}': {}", errors.join("; "))]
+    ValidationFailed { prefix: String, errors: Vec<String> },
+
+    #[error("cannot drop partition schema '{prefix}': has associated indexes")]
+    PartitionSchemaHasIndexes { prefix: String },
+
+    #[error("partition schemas require a String partition key")]
+    PartitionSchemaRequiresStringKey,
 }
 
 #[derive(Debug, Error)]
@@ -105,6 +129,9 @@ pub enum QueryError {
 
     #[error("sort key not supported on this table")]
     SortKeyNotSupported,
+
+    #[error("index key value is required")]
+    IndexKeyRequired,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
