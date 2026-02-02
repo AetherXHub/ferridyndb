@@ -15,7 +15,7 @@ DynamoDB's API is simple and effective for key-value and document workloads, but
 This is a Cargo workspace. Build/test from the repository root:
 
 - `cargo build` — compile all crates
-- `cargo test` — run all tests across the workspace (348 tests)
+- `cargo test` — run all tests across the workspace (436 tests)
 - `cargo test -p ferridyn-core` — test only the core crate
 - `cargo test -p ferridyn-core <test_name>` — run a single test by name
 - `cargo clippy --workspace -- -D warnings` — lint all crates (zero warnings required)
@@ -32,10 +32,10 @@ Six-layer stack, bottom to top:
 2. **Page Manager** (`storage/`) — Page allocation, free list, copy-on-write. Never modifies pages in place; writes new pages then atomically updates the alternate header. Crash recovery = use last committed header. xxHash64 checksums on every page.
 3. **B+Tree Index** (`btree/`) — One tree per table, keyed by `(partition_key, sort_key)`. Slotted page layout. Internal nodes hold `[key, child_page_id]` pairs; leaf nodes hold `[key, document]` pairs with linked `next_leaf` pointers. Overflow pages for large documents.
 4. **Key Encoding** (`encoding/`) — Byte-ordered encoding for `memcmp`-comparable keys. Strings/binary use escaped-terminator scheme (`0x00` → `0x00 0xFF`, terminated with `0x00 0x00`). Numbers use byte-flipped IEEE 754.
-5. **Table Catalog** (`catalog/`) — Schema definitions (table name, partition key name+type, optional sort key name+type). Stored in its own B+Tree rooted from the header.
+5. **Table Catalog** (`catalog/`) — Schema definitions (table name, partition key name+type, optional sort key name+type), partition schemas (prefix-based entity type metadata with attributes), and secondary index definitions. Stored in its own B+Tree rooted from the header.
 6. **MVCC / Transactions** (`mvcc/`) — Snapshot isolation. Single writer, unlimited concurrent readers. Latest document version inline in B+Tree leaf, older versions in overflow chain. Each document carries `created_txn` and `deleted_txn` IDs. Visibility: `created_txn <= snapshot && (deleted_txn is None || deleted_txn > snapshot)`.
 
-Public API (`api/`) sits on top: `put/get/delete/query/scan/transact`.
+Public API (`api/`) sits on top: `put/get/delete/query/scan/query_index/transact`, plus introspection for partition schemas and indexes.
 
 Documents are stored on disk as MessagePack (via rmp-serde) for compactness. The public API accepts and returns `serde_json::Value`.
 
@@ -48,7 +48,7 @@ crates/
       storage/         # File I/O, page management, header, free list
       btree/           # B+Tree: node layout, ops, overflow
       mvcc/            # Transaction manager, snapshots, version chains, GC
-      catalog/         # Table schemas
+      catalog/         # Table schemas, partition schemas, secondary indexes
       api/             # Public API: FerridynDB, builders, batch, query
       encoding/        # Key encoding: string, number, binary, composite
     benches/           # Criterion benchmarks (ferridyn_bench, ferridyn_file_bench)
@@ -76,7 +76,7 @@ crates/
 - **4KB pages** — Matches OS page size
 - **Single writer, unlimited readers** — LMDB concurrency model
 - **Slotted pages** — Slot array grows forward, cell data grows backward
-- **No secondary indexes in v1**
+- **Partition schemas & scoped secondary indexes** — Prefix-based entity type metadata with attribute definitions, scoped secondary indexes backed by plain B+Tree lookups with lazy GC
 - **No B+Tree rebalancing in v1** — Mark-as-dead delete, reclaim fully empty pages
 
 ## Dependencies

@@ -8,7 +8,9 @@ A local, embedded, DynamoDB-style document database written in Rust with single-
 - **Single-file storage** — Copy-on-write pages with atomic double-buffered header commits (no WAL)
 - **MVCC snapshot isolation** — Single writer, unlimited concurrent readers with version chains
 - **B+Tree indexing** — Efficient range scans with slotted pages and overflow support
+- **Partition schemas & secondary indexes** — Declare entity types with prefix-based schemas, create scoped secondary indexes with automatic backfill, and query by indexed attribute values
 - **Byte-ordered key encoding** — Enables fast `memcmp`-based comparisons for partition and sort keys
+- **TTL support** — Optional time-to-live attributes with automatic expiry filtering
 - **Version-aware API** — Optimistic concurrency control with versioned reads and conditional writes
 - **Unix socket server** — Multi-process access with async client library
 
@@ -58,13 +60,61 @@ let results = db.query("events")
     .unwrap();
 ```
 
+### Secondary Indexes
+
+```rust
+use ferridyn_core::api::FerridynDB;
+use ferridyn_core::types::{AttrType, KeyType};
+use serde_json::json;
+
+let db = FerridynDB::create("contacts.db").unwrap();
+
+// Single-table design with partition key prefix convention
+db.create_table("data")
+    .partition_key("pk", KeyType::String)
+    .execute()
+    .unwrap();
+
+// Declare a partition schema for CONTACT entities
+db.create_partition_schema("data")
+    .prefix("CONTACT")
+    .description("Contact entities")
+    .attribute("email", AttrType::String, true)
+    .validate(true)
+    .execute()
+    .unwrap();
+
+// Create a secondary index on email
+db.create_index("data")
+    .name("email-idx")
+    .partition_schema("CONTACT")
+    .index_key("email", KeyType::String)
+    .execute()
+    .unwrap();
+
+// Insert documents — index is maintained automatically
+db.put_item("data", json!({
+    "pk": "CONTACT#alice",
+    "email": "alice@example.com",
+    "name": "Alice"
+})).unwrap();
+
+// Query by indexed attribute
+let result = db.query_index("data", "email-idx")
+    .key_value("alice@example.com")
+    .execute()
+    .unwrap();
+assert_eq!(result.items.len(), 1);
+assert_eq!(result.items[0]["name"], "Alice");
+```
+
 ### Build and Test
 
 ```bash
 # Compile all crates
 cargo build
 
-# Run all tests (367 tests across workspace)
+# Run all tests (436 tests across workspace)
 cargo test
 
 # Run tests for a specific crate
@@ -177,9 +227,9 @@ By default, benchmarks use tmpfs. Real NVMe benchmarks are dominated by fsync la
 
 FerridynDB uses copy-on-write semantics with double-buffered headers instead of a traditional WAL. This simplifies crash recovery (just use the last committed header) and eliminates the need for a separate log file.
 
-### mmap for Reads
+### Standard File I/O over mmap
 
-Memory-mapped I/O delegates page caching to the OS, reducing implementation complexity and leveraging kernel optimizations.
+Direct read/write with page-level buffering instead of memory-mapped I/O. Simpler to reason about, avoids mmap pitfalls with concurrent writes.
 
 ### B+Tree over LSM-Tree
 
@@ -193,9 +243,9 @@ Page size matches the OS page size for optimal mmap alignment and cache efficien
 
 FerridynDB follows the LMDB concurrency model: one writer at a time (via file lock), unlimited concurrent readers (via MVCC snapshots). This avoids the complexity of multi-writer coordination while providing excellent read scalability.
 
-### No Secondary Indexes (v1)
+### Partition Schemas & Secondary Indexes
 
-Version 1 focuses on core functionality. Secondary indexes and more complex query patterns are planned for future releases.
+Secondary indexes are scoped to partition schemas — prefix-based entity type declarations that define expected attributes. Indexes are backed by plain B+Tree lookups with lazy GC for orphaned entries. This enables efficient attribute-value queries without full table scans.
 
 ### No B+Tree Rebalancing (v1)
 
@@ -204,11 +254,11 @@ Deleted items are marked as dead but not immediately removed. Fully empty pages 
 ## Core Dependencies
 
 - **serde / serde_json** — JSON document serialization
-- **memmap2** — Memory-mapped file I/O
 - **parking_lot** — Fast read-write locks for concurrency
 - **thiserror** — Ergonomic error types
 - **bytes** — Efficient byte buffer manipulation
 - **xxhash-rust** — Fast page checksums
+- **rmp-serde** — MessagePack serialization for on-disk storage
 - **tokio** (server/client) — Async runtime for Unix socket server
 - **tempfile** (dev) — Test isolation
 - **criterion** (dev) — Statistical benchmarking
