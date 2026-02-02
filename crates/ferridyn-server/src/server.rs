@@ -12,9 +12,12 @@ use tracing::{error, info, warn};
 
 use ferridyn_core::api::FerridynDB;
 use ferridyn_core::error::{Error as DynError, SchemaError, TxnError};
-use ferridyn_core::types::{KeyType, TableSchema};
+use ferridyn_core::types::{AttrType, IndexDefinition, KeyType, PartitionSchema, TableSchema};
 
-use crate::protocol::{KeyDef, KeyDefWire, Request, Response, SortKeyCondition, TableSchemaWire};
+use crate::protocol::{
+    AttributeDefWire, IndexDefWire, KeyDef, KeyDefWire, PartitionSchemaWire, Request, Response,
+    SortKeyCondition, TableSchemaWire,
+};
 
 /// A FerridynDB server listening on a Unix socket.
 pub struct FerridynServer {
@@ -186,6 +189,41 @@ fn dispatch(db: &FerridynDB, req: Request) -> Response {
             partition_key,
             limit,
         } => handle_list_sort_key_prefixes(db, &table, partition_key, limit),
+
+        Request::CreateSchema {
+            table,
+            prefix,
+            description,
+            attributes,
+            validate,
+        } => handle_create_schema(db, &table, &prefix, description, attributes, validate),
+
+        Request::DropSchema { table, prefix } => handle_drop_schema(db, &table, &prefix),
+
+        Request::ListSchemas { table } => handle_list_schemas(db, &table),
+
+        Request::DescribeSchema { table, prefix } => handle_describe_schema(db, &table, &prefix),
+
+        Request::CreateIndex {
+            table,
+            name,
+            partition_schema,
+            index_key,
+        } => handle_create_index(db, &table, &name, &partition_schema, index_key),
+
+        Request::DropIndex { table, name } => handle_drop_index(db, &table, &name),
+
+        Request::ListIndexes { table } => handle_list_indexes(db, &table),
+
+        Request::DescribeIndex { table, name } => handle_describe_index(db, &table, &name),
+
+        Request::QueryIndex {
+            table,
+            index_name,
+            key_value,
+            limit,
+            scan_forward,
+        } => handle_query_index(db, &table, &index_name, key_value, limit, scan_forward),
     }
 }
 
@@ -411,6 +449,132 @@ fn handle_list_sort_key_prefixes(
     }
 }
 
+fn handle_create_schema(
+    db: &FerridynDB,
+    table: &str,
+    prefix: &str,
+    description: Option<String>,
+    attributes: Vec<AttributeDefWire>,
+    validate: bool,
+) -> Response {
+    let mut builder = db.create_partition_schema(table).prefix(prefix);
+    if let Some(desc) = description {
+        builder = builder.description(&desc);
+    }
+    for attr in attributes {
+        let attr_type = match parse_attr_type(&attr.attr_type) {
+            Some(t) => t,
+            None => {
+                return Response::error(
+                    "InvalidAttrType",
+                    format!("unknown attribute type: {}", attr.attr_type),
+                );
+            }
+        };
+        builder = builder.attribute(&attr.name, attr_type, attr.required);
+    }
+    if validate {
+        builder = builder.validate(true);
+    }
+    match builder.execute() {
+        Ok(()) => Response::ok_empty(),
+        Err(e) => dyn_error_to_response(e),
+    }
+}
+
+fn handle_drop_schema(db: &FerridynDB, table: &str, prefix: &str) -> Response {
+    match db.drop_partition_schema(table, prefix) {
+        Ok(()) => Response::ok_empty(),
+        Err(e) => dyn_error_to_response(e),
+    }
+}
+
+fn handle_list_schemas(db: &FerridynDB, table: &str) -> Response {
+    match db.list_partition_schemas(table) {
+        Ok(schemas) => {
+            Response::ok_partition_schemas(schemas.iter().map(partition_schema_to_wire).collect())
+        }
+        Err(e) => dyn_error_to_response(e),
+    }
+}
+
+fn handle_describe_schema(db: &FerridynDB, table: &str, prefix: &str) -> Response {
+    match db.describe_partition_schema(table, prefix) {
+        Ok(schema) => Response::ok_partition_schema(partition_schema_to_wire(&schema)),
+        Err(e) => dyn_error_to_response(e),
+    }
+}
+
+fn handle_create_index(
+    db: &FerridynDB,
+    table: &str,
+    name: &str,
+    partition_schema: &str,
+    index_key: KeyDef,
+) -> Response {
+    let key_type = match parse_key_type(&index_key.key_type) {
+        Some(t) => t,
+        None => {
+            return Response::error(
+                "InvalidKeyType",
+                format!("unknown key type: {}", index_key.key_type),
+            );
+        }
+    };
+    match db
+        .create_index(table)
+        .name(name)
+        .partition_schema(partition_schema)
+        .index_key(&index_key.name, key_type)
+        .execute()
+    {
+        Ok(()) => Response::ok_empty(),
+        Err(e) => dyn_error_to_response(e),
+    }
+}
+
+fn handle_drop_index(db: &FerridynDB, table: &str, name: &str) -> Response {
+    match db.drop_index(table, name) {
+        Ok(()) => Response::ok_empty(),
+        Err(e) => dyn_error_to_response(e),
+    }
+}
+
+fn handle_list_indexes(db: &FerridynDB, table: &str) -> Response {
+    match db.list_indexes(table) {
+        Ok(indexes) => Response::ok_indexes(indexes.iter().map(index_to_wire).collect()),
+        Err(e) => dyn_error_to_response(e),
+    }
+}
+
+fn handle_describe_index(db: &FerridynDB, table: &str, name: &str) -> Response {
+    match db.describe_index(table, name) {
+        Ok(index) => Response::ok_index(index_to_wire(&index)),
+        Err(e) => dyn_error_to_response(e),
+    }
+}
+
+fn handle_query_index(
+    db: &FerridynDB,
+    table: &str,
+    index_name: &str,
+    key_value: serde_json::Value,
+    limit: Option<usize>,
+    scan_forward: Option<bool>,
+) -> Response {
+    let mut builder = db.query_index(table, index_name).key_value(key_value);
+    if let Some(n) = limit {
+        builder = builder.limit(n);
+    }
+    if let Some(fwd) = scan_forward {
+        builder = builder.scan_forward(fwd);
+    }
+    match builder.execute() {
+        Ok(result) => Response::ok_items(result.items, result.last_evaluated_key),
+        Err(e) => dyn_error_to_response(e),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -429,6 +593,51 @@ fn key_type_str(kt: KeyType) -> &'static str {
         KeyType::String => "String",
         KeyType::Number => "Number",
         KeyType::Binary => "Binary",
+    }
+}
+
+fn parse_attr_type(s: &str) -> Option<AttrType> {
+    match s.to_lowercase().as_str() {
+        "string" | "s" => Some(AttrType::String),
+        "number" | "n" => Some(AttrType::Number),
+        "boolean" | "bool" | "b" => Some(AttrType::Boolean),
+        _ => None,
+    }
+}
+
+fn attr_type_str(at: AttrType) -> &'static str {
+    match at {
+        AttrType::String => "String",
+        AttrType::Number => "Number",
+        AttrType::Boolean => "Boolean",
+    }
+}
+
+fn partition_schema_to_wire(schema: &PartitionSchema) -> PartitionSchemaWire {
+    PartitionSchemaWire {
+        prefix: schema.prefix.clone(),
+        description: schema.description.clone(),
+        attributes: schema
+            .attributes
+            .iter()
+            .map(|a| AttributeDefWire {
+                name: a.name.clone(),
+                attr_type: attr_type_str(a.attr_type).to_string(),
+                required: a.required,
+            })
+            .collect(),
+        validate: schema.validate,
+    }
+}
+
+fn index_to_wire(index: &IndexDefinition) -> IndexDefWire {
+    IndexDefWire {
+        name: index.name.clone(),
+        partition_schema: index.partition_schema.clone(),
+        index_key: KeyDefWire {
+            name: index.index_key.name.clone(),
+            key_type: key_type_str(index.index_key.key_type).to_string(),
+        },
     }
 }
 

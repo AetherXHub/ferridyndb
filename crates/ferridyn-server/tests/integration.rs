@@ -5,7 +5,7 @@ use tempfile::tempdir;
 use tokio::time::{Duration, sleep};
 
 use ferridyn_core::api::FerridynDB;
-use ferridyn_server::client::FerridynClient;
+use ferridyn_server::client::{AttributeDefInput, FerridynClient};
 use ferridyn_server::protocol::KeyDef;
 use ferridyn_server::server::FerridynServer;
 
@@ -400,4 +400,300 @@ async fn test_error_table_already_exists() {
         )
         .await;
     assert!(result.is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Partition schema tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_partition_schema_crud() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    // Create table with sort key (schemas need a table).
+    client
+        .create_table(
+            "data",
+            KeyDef {
+                name: "pk".to_string(),
+                key_type: "String".to_string(),
+            },
+            Some(KeyDef {
+                name: "sk".to_string(),
+                key_type: "String".to_string(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Create schema.
+    client
+        .create_schema(
+            "data",
+            "CONTACT",
+            Some("People and contacts"),
+            &[
+                AttributeDefInput {
+                    name: "email".to_string(),
+                    attr_type: "String".to_string(),
+                    required: true,
+                },
+                AttributeDefInput {
+                    name: "age".to_string(),
+                    attr_type: "Number".to_string(),
+                    required: false,
+                },
+            ],
+            true,
+        )
+        .await
+        .unwrap();
+
+    // List schemas — should have 1.
+    let schemas = client.list_schemas("data").await.unwrap();
+    assert_eq!(schemas.len(), 1);
+    assert_eq!(schemas[0].prefix, "CONTACT");
+
+    // Describe schema.
+    let schema = client.describe_schema("data", "CONTACT").await.unwrap();
+    assert_eq!(schema.prefix, "CONTACT");
+    assert_eq!(schema.description, "People and contacts");
+    assert!(schema.validate);
+    assert_eq!(schema.attributes.len(), 2);
+    assert_eq!(schema.attributes[0].name, "email");
+    assert_eq!(schema.attributes[0].attr_type, "String");
+    assert!(schema.attributes[0].required);
+    assert_eq!(schema.attributes[1].name, "age");
+    assert_eq!(schema.attributes[1].attr_type, "Number");
+    assert!(!schema.attributes[1].required);
+
+    // Drop schema.
+    client.drop_schema("data", "CONTACT").await.unwrap();
+
+    // List schemas — should be empty.
+    let schemas = client.list_schemas("data").await.unwrap();
+    assert!(schemas.is_empty());
+}
+
+#[tokio::test]
+async fn test_index_crud() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    client
+        .create_table(
+            "data",
+            KeyDef {
+                name: "pk".to_string(),
+                key_type: "String".to_string(),
+            },
+            Some(KeyDef {
+                name: "sk".to_string(),
+                key_type: "String".to_string(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Create schema first (index requires a schema).
+    client
+        .create_schema(
+            "data",
+            "CONTACT",
+            Some("People"),
+            &[AttributeDefInput {
+                name: "email".to_string(),
+                attr_type: "String".to_string(),
+                required: true,
+            }],
+            false,
+        )
+        .await
+        .unwrap();
+
+    // Create index.
+    client
+        .create_index("data", "email-idx", "CONTACT", "email", "String")
+        .await
+        .unwrap();
+
+    // List indexes — should have 1.
+    let indexes = client.list_indexes("data").await.unwrap();
+    assert_eq!(indexes.len(), 1);
+    assert_eq!(indexes[0].name, "email-idx");
+    assert_eq!(indexes[0].partition_schema, "CONTACT");
+    assert_eq!(indexes[0].index_key_name, "email");
+    assert_eq!(indexes[0].index_key_type, "String");
+
+    // Describe index.
+    let index = client.describe_index("data", "email-idx").await.unwrap();
+    assert_eq!(index.name, "email-idx");
+    assert_eq!(index.partition_schema, "CONTACT");
+
+    // Drop index.
+    client.drop_index("data", "email-idx").await.unwrap();
+
+    // List indexes — should be empty.
+    let indexes = client.list_indexes("data").await.unwrap();
+    assert!(indexes.is_empty());
+}
+
+#[tokio::test]
+async fn test_query_index() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    client
+        .create_table(
+            "data",
+            KeyDef {
+                name: "pk".to_string(),
+                key_type: "String".to_string(),
+            },
+            Some(KeyDef {
+                name: "sk".to_string(),
+                key_type: "String".to_string(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+    client
+        .create_schema(
+            "data",
+            "CONTACT",
+            None,
+            &[AttributeDefInput {
+                name: "email".to_string(),
+                attr_type: "String".to_string(),
+                required: true,
+            }],
+            false,
+        )
+        .await
+        .unwrap();
+
+    client
+        .create_index("data", "email-idx", "CONTACT", "email", "String")
+        .await
+        .unwrap();
+
+    // Put items matching the schema prefix.
+    client
+        .put_item(
+            "data",
+            json!({"pk": "CONTACT#1", "sk": "profile", "email": "alice@example.com"}),
+        )
+        .await
+        .unwrap();
+    client
+        .put_item(
+            "data",
+            json!({"pk": "CONTACT#2", "sk": "profile", "email": "bob@example.com"}),
+        )
+        .await
+        .unwrap();
+    client
+        .put_item(
+            "data",
+            json!({"pk": "CONTACT#3", "sk": "profile", "email": "alice@example.com"}),
+        )
+        .await
+        .unwrap();
+
+    // Query index for alice — should get 2 items.
+    let result = client
+        .query_index("data", "email-idx", json!("alice@example.com"), None, None)
+        .await
+        .unwrap();
+    assert_eq!(result.items.len(), 2);
+
+    // Query index for bob — should get 1 item.
+    let result = client
+        .query_index("data", "email-idx", json!("bob@example.com"), None, None)
+        .await
+        .unwrap();
+    assert_eq!(result.items.len(), 1);
+    assert_eq!(result.items[0]["pk"], "CONTACT#2");
+
+    // Query index for nonexistent — should get 0 items.
+    let result = client
+        .query_index("data", "email-idx", json!("nobody@example.com"), None, None)
+        .await
+        .unwrap();
+    assert!(result.items.is_empty());
+}
+
+#[tokio::test]
+async fn test_create_schema_error_table_not_found() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    let result = client
+        .create_schema("nonexistent", "PREFIX", None, &[], false)
+        .await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_query_index_with_limit() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    client
+        .create_table(
+            "data",
+            KeyDef {
+                name: "pk".to_string(),
+                key_type: "String".to_string(),
+            },
+            Some(KeyDef {
+                name: "sk".to_string(),
+                key_type: "String".to_string(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+    client
+        .create_schema(
+            "data",
+            "ITEM",
+            None,
+            &[AttributeDefInput {
+                name: "status".to_string(),
+                attr_type: "String".to_string(),
+                required: false,
+            }],
+            false,
+        )
+        .await
+        .unwrap();
+
+    client
+        .create_index("data", "status-idx", "ITEM", "status", "String")
+        .await
+        .unwrap();
+
+    for i in 0..5 {
+        client
+            .put_item(
+                "data",
+                json!({"pk": format!("ITEM#{i}"), "sk": "info", "status": "active"}),
+            )
+            .await
+            .unwrap();
+    }
+
+    // Query with limit 2.
+    let result = client
+        .query_index("data", "status-idx", json!("active"), Some(2), None)
+        .await
+        .unwrap();
+    assert_eq!(result.items.len(), 2);
 }

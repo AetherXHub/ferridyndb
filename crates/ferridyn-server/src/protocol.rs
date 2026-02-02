@@ -78,6 +78,55 @@ pub enum Request {
         #[serde(default)]
         limit: Option<usize>,
     },
+    // -- Partition schema operations --
+    CreateSchema {
+        table: String,
+        prefix: String,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        attributes: Vec<AttributeDefWire>,
+        #[serde(default)]
+        validate: bool,
+    },
+    DropSchema {
+        table: String,
+        prefix: String,
+    },
+    ListSchemas {
+        table: String,
+    },
+    DescribeSchema {
+        table: String,
+        prefix: String,
+    },
+    // -- Secondary index operations --
+    CreateIndex {
+        table: String,
+        name: String,
+        partition_schema: String,
+        index_key: KeyDef,
+    },
+    DropIndex {
+        table: String,
+        name: String,
+    },
+    ListIndexes {
+        table: String,
+    },
+    DescribeIndex {
+        table: String,
+        name: String,
+    },
+    QueryIndex {
+        table: String,
+        index_name: String,
+        key_value: Value,
+        #[serde(default)]
+        limit: Option<usize>,
+        #[serde(default)]
+        scan_forward: Option<bool>,
+    },
 }
 
 /// Sort key condition for query requests.
@@ -99,6 +148,33 @@ pub struct KeyDef {
     pub name: String,
     #[serde(rename = "type")]
     pub key_type: String,
+}
+
+/// Attribute definition for partition schema (wire format).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AttributeDefWire {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub attr_type: String,
+    #[serde(default)]
+    pub required: bool,
+}
+
+/// Partition schema in wire format.
+#[derive(Debug, Serialize)]
+pub struct PartitionSchemaWire {
+    pub prefix: String,
+    pub description: String,
+    pub attributes: Vec<AttributeDefWire>,
+    pub validate: bool,
+}
+
+/// Index definition in wire format.
+#[derive(Debug, Serialize)]
+pub struct IndexDefWire {
+    pub name: String,
+    pub partition_schema: String,
+    pub index_key: KeyDefWire,
 }
 
 /// A response sent back to the client.
@@ -145,6 +221,22 @@ pub enum OkResponse {
     },
     Empty {
         ok: bool,
+    },
+    PartitionSchemas {
+        ok: bool,
+        schemas: Vec<PartitionSchemaWire>,
+    },
+    PartitionSchemaDetail {
+        ok: bool,
+        schema: PartitionSchemaWire,
+    },
+    Indexes {
+        ok: bool,
+        indexes: Vec<IndexDefWire>,
+    },
+    IndexDetail {
+        ok: bool,
+        index: IndexDefWire,
     },
 }
 
@@ -231,5 +323,21 @@ impl Response {
             expected: Some(expected),
             actual: Some(actual),
         })
+    }
+
+    pub fn ok_partition_schemas(schemas: Vec<PartitionSchemaWire>) -> Self {
+        Response::Ok(OkResponse::PartitionSchemas { ok: true, schemas })
+    }
+
+    pub fn ok_partition_schema(schema: PartitionSchemaWire) -> Self {
+        Response::Ok(OkResponse::PartitionSchemaDetail { ok: true, schema })
+    }
+
+    pub fn ok_indexes(indexes: Vec<IndexDefWire>) -> Self {
+        Response::Ok(OkResponse::Indexes { ok: true, indexes })
+    }
+
+    pub fn ok_index(index: IndexDefWire) -> Self {
+        Response::Ok(OkResponse::IndexDetail { ok: true, index })
     }
 }

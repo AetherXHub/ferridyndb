@@ -41,6 +41,40 @@ pub struct TableSchema {
     pub ttl_attribute: Option<String>,
 }
 
+/// Partition schema returned from server.
+#[derive(Debug, Clone)]
+pub struct PartitionSchemaInfo {
+    pub prefix: String,
+    pub description: String,
+    pub attributes: Vec<AttributeInfo>,
+    pub validate: bool,
+}
+
+/// Attribute definition returned from server.
+#[derive(Debug, Clone)]
+pub struct AttributeInfo {
+    pub name: String,
+    pub attr_type: String,
+    pub required: bool,
+}
+
+/// Index definition returned from server.
+#[derive(Debug, Clone)]
+pub struct IndexInfo {
+    pub name: String,
+    pub partition_schema: String,
+    pub index_key_name: String,
+    pub index_key_type: String,
+}
+
+/// Input for creating a partition schema attribute.
+#[derive(Debug, Clone)]
+pub struct AttributeDefInput {
+    pub name: String,
+    pub attr_type: String,
+    pub required: bool,
+}
+
 /// Client for a FerridynDB server.
 pub struct FerridynClient {
     reader: BufReader<OwnedReadHalf>,
@@ -299,6 +333,158 @@ impl FerridynClient {
         keys_from_response(&resp)
     }
 
+    // -- Partition schema operations --
+
+    /// Create a partition schema.
+    pub async fn create_schema(
+        &mut self,
+        table: &str,
+        prefix: &str,
+        description: Option<&str>,
+        attributes: &[AttributeDefInput],
+        validate: bool,
+    ) -> Result<()> {
+        let attrs: Vec<Value> = attributes
+            .iter()
+            .map(|a| {
+                serde_json::json!({
+                    "name": a.name,
+                    "type": a.attr_type,
+                    "required": a.required,
+                })
+            })
+            .collect();
+        let req = serde_json::json!({
+            "op": "create_schema",
+            "table": table,
+            "prefix": prefix,
+            "description": description,
+            "attributes": attrs,
+            "validate": validate,
+        });
+        let resp = self.send_request(&req).await?;
+        check_ok(&resp)
+    }
+
+    /// Drop a partition schema.
+    pub async fn drop_schema(&mut self, table: &str, prefix: &str) -> Result<()> {
+        let req = serde_json::json!({
+            "op": "drop_schema",
+            "table": table,
+            "prefix": prefix,
+        });
+        let resp = self.send_request(&req).await?;
+        check_ok(&resp)
+    }
+
+    /// List partition schemas for a table.
+    pub async fn list_schemas(&mut self, table: &str) -> Result<Vec<PartitionSchemaInfo>> {
+        let req = serde_json::json!({
+            "op": "list_schemas",
+            "table": table,
+        });
+        let resp = self.send_request(&req).await?;
+        partition_schemas_from_response(&resp)
+    }
+
+    /// Describe a partition schema.
+    pub async fn describe_schema(
+        &mut self,
+        table: &str,
+        prefix: &str,
+    ) -> Result<PartitionSchemaInfo> {
+        let req = serde_json::json!({
+            "op": "describe_schema",
+            "table": table,
+            "prefix": prefix,
+        });
+        let resp = self.send_request(&req).await?;
+        partition_schema_from_response(&resp)
+    }
+
+    // -- Secondary index operations --
+
+    /// Create a secondary index.
+    pub async fn create_index(
+        &mut self,
+        table: &str,
+        name: &str,
+        partition_schema: &str,
+        index_key_name: &str,
+        index_key_type: &str,
+    ) -> Result<()> {
+        let req = serde_json::json!({
+            "op": "create_index",
+            "table": table,
+            "name": name,
+            "partition_schema": partition_schema,
+            "index_key": {
+                "name": index_key_name,
+                "type": index_key_type,
+            },
+        });
+        let resp = self.send_request(&req).await?;
+        check_ok(&resp)
+    }
+
+    /// Drop a secondary index.
+    pub async fn drop_index(&mut self, table: &str, name: &str) -> Result<()> {
+        let req = serde_json::json!({
+            "op": "drop_index",
+            "table": table,
+            "name": name,
+        });
+        let resp = self.send_request(&req).await?;
+        check_ok(&resp)
+    }
+
+    /// List secondary indexes for a table.
+    pub async fn list_indexes(&mut self, table: &str) -> Result<Vec<IndexInfo>> {
+        let req = serde_json::json!({
+            "op": "list_indexes",
+            "table": table,
+        });
+        let resp = self.send_request(&req).await?;
+        indexes_from_response(&resp)
+    }
+
+    /// Describe a secondary index.
+    pub async fn describe_index(&mut self, table: &str, name: &str) -> Result<IndexInfo> {
+        let req = serde_json::json!({
+            "op": "describe_index",
+            "table": table,
+            "name": name,
+        });
+        let resp = self.send_request(&req).await?;
+        index_from_response(&resp)
+    }
+
+    /// Query a secondary index.
+    pub async fn query_index(
+        &mut self,
+        table: &str,
+        index_name: &str,
+        key_value: Value,
+        limit: Option<usize>,
+        scan_forward: Option<bool>,
+    ) -> Result<QueryResult> {
+        let mut req = serde_json::json!({
+            "op": "query_index",
+            "table": table,
+            "index_name": index_name,
+            "key_value": key_value,
+        });
+        let obj = req.as_object_mut().unwrap();
+        if let Some(n) = limit {
+            obj.insert("limit".to_string(), serde_json::json!(n));
+        }
+        if let Some(fwd) = scan_forward {
+            obj.insert("scan_forward".to_string(), serde_json::json!(fwd));
+        }
+        let resp = self.send_request(&req).await?;
+        items_from_response(&resp)
+    }
+
     // -----------------------------------------------------------------------
     // Internal
     // -----------------------------------------------------------------------
@@ -453,4 +639,104 @@ fn schema_from_response(resp: &Value) -> Result<TableSchema> {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
     })
+}
+
+fn partition_schemas_from_response(resp: &Value) -> Result<Vec<PartitionSchemaInfo>> {
+    check_error(resp)?;
+    let schemas = resp
+        .get("schemas")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().map(parse_schema_info).collect())
+        .unwrap_or_default();
+    Ok(schemas)
+}
+
+fn partition_schema_from_response(resp: &Value) -> Result<PartitionSchemaInfo> {
+    check_error(resp)?;
+    let schema = resp
+        .get("schema")
+        .ok_or_else(|| ClientError::Protocol("missing 'schema' in response".to_string()))?;
+    Ok(parse_schema_info(schema))
+}
+
+fn parse_schema_info(v: &Value) -> PartitionSchemaInfo {
+    PartitionSchemaInfo {
+        prefix: v
+            .get("prefix")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        description: v
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        attributes: v
+            .get("attributes")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|a| AttributeInfo {
+                        name: a
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        attr_type: a
+                            .get("type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        required: a.get("required").and_then(|v| v.as_bool()).unwrap_or(false),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        validate: v.get("validate").and_then(|v| v.as_bool()).unwrap_or(false),
+    }
+}
+
+fn indexes_from_response(resp: &Value) -> Result<Vec<IndexInfo>> {
+    check_error(resp)?;
+    let indexes = resp
+        .get("indexes")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().map(parse_index_info).collect())
+        .unwrap_or_default();
+    Ok(indexes)
+}
+
+fn index_from_response(resp: &Value) -> Result<IndexInfo> {
+    check_error(resp)?;
+    let index = resp
+        .get("index")
+        .ok_or_else(|| ClientError::Protocol("missing 'index' in response".to_string()))?;
+    Ok(parse_index_info(index))
+}
+
+fn parse_index_info(v: &Value) -> IndexInfo {
+    IndexInfo {
+        name: v
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        partition_schema: v
+            .get("partition_schema")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        index_key_name: v
+            .get("index_key")
+            .and_then(|v| v.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        index_key_type: v
+            .get("index_key")
+            .and_then(|v| v.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+    }
 }
