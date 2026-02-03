@@ -1594,14 +1594,22 @@ pub struct FerridynBenchWriteTransaction {
 }
 
 impl FerridynBenchWriteTransaction {
-    fn flush(&mut self) -> Result<(), ()> {
+    fn flush(&mut self, final_commit: bool) -> Result<(), ()> {
         if self.ops.is_empty() {
             return Ok(());
         }
+        // Intermediate flushes skip fsync; only the final commit syncs
+        let saved_mode = if !final_commit {
+            let mode = self.db.sync_mode();
+            self.db.set_sync_mode(SyncMode::None);
+            Some(mode)
+        } else {
+            None
+        };
         let ops = std::mem::take(&mut self.ops);
         let mut inserts = 0u64;
         let mut removes = 0u64;
-        self.db
+        let result = self.db
             .transact(|txn| {
                 for op in &ops {
                     match op {
@@ -1621,7 +1629,11 @@ impl FerridynBenchWriteTransaction {
                 }
                 Ok(())
             })
-            .map_err(|_| ())?;
+            .map_err(|_| ());
+        if let Some(mode) = saved_mode {
+            self.db.set_sync_mode(mode);
+        }
+        result?;
         self.count.fetch_add(inserts, Ordering::Relaxed);
         self.count.fetch_sub(removes, Ordering::Relaxed);
         Ok(())
@@ -1639,7 +1651,7 @@ impl BenchWriteTransaction for FerridynBenchWriteTransaction {
     }
 
     fn commit(mut self) -> Result<(), ()> {
-        self.flush()
+        self.flush(true)
     }
 }
 
@@ -1656,7 +1668,7 @@ impl BenchInserter for FerridynBenchInserter<'_> {
             value: value.to_vec(),
         });
         if self.txn.ops.len() >= FERRIDYN_MAX_WRITES_PER_TXN {
-            self.txn.flush()?;
+            self.txn.flush(false)?;
         }
         Ok(())
     }
@@ -1666,7 +1678,7 @@ impl BenchInserter for FerridynBenchInserter<'_> {
         k.copy_from_slice(key);
         self.txn.ops.push(FerridynBenchOp::Remove { key: k });
         if self.txn.ops.len() >= FERRIDYN_MAX_WRITES_PER_TXN {
-            self.txn.flush()?;
+            self.txn.flush(false)?;
         }
         Ok(())
     }
