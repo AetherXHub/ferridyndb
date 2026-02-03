@@ -313,6 +313,8 @@ Adapted from the [redb benchmark suite](https://github.com/cberner/redb/tree/mas
 | uncompacted size | 6.68 GiB | 2.63 GiB | **948.17 MiB** | 2.14 GiB | 1010.61 MiB | 1.10 GiB | 3.52 GiB |
 | compacted size | 1.64 GiB | 1.27 GiB | **459.18 MiB** | N/A | 1010.61 MiB | 562.31 MiB | N/A |
 
+Results collected on a Ryzen 9 9950X with Samsung 990 PRO NVMe, running inside a container (required for RocksDB's libclang dependency).
+
 ## Design Decisions
 
 ### Copy-on-write over Write-Ahead Log
