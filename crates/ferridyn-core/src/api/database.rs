@@ -24,7 +24,7 @@ use super::builders::{
     IndexQueryBuilder, ListPartitionKeysBuilder, ListSortKeyPrefixesBuilder,
     PartitionSchemaBuilder, QueryBuilder, ScanBuilder, TableBuilder, UpdateItemBuilder,
 };
-use super::page_store::{BufferedPageStore, FilePageStore};
+use super::page_store::{BufferedPageStore, CachedPageStore, PageCache, new_page_cache};
 use super::transaction::Transaction;
 
 pub(crate) struct DatabaseState {
@@ -46,6 +46,8 @@ struct DatabaseInner {
     /// Cache of catalog entries by table name. Cleared on every write commit
     /// since any put/delete may change a table's `data_root_page`.
     catalog_cache: Mutex<HashMap<String, catalog::CatalogEntry>>,
+    /// Lock-free concurrent page cache shared across all readers and writers.
+    page_cache: PageCache,
 }
 
 /// The main database handle.
@@ -111,6 +113,7 @@ impl FerridynDB {
                 path: path.to_path_buf(),
                 sync_mode: AtomicU8::new(SyncMode::Full as u8),
                 catalog_cache: Mutex::new(HashMap::new()),
+                page_cache: new_page_cache(),
             }),
         })
     }
@@ -137,6 +140,7 @@ impl FerridynDB {
                 path: path.to_path_buf(),
                 sync_mode: AtomicU8::new(SyncMode::Full as u8),
                 catalog_cache: Mutex::new(HashMap::new()),
+                page_cache: new_page_cache(),
             }),
         })
     }
@@ -451,7 +455,11 @@ impl FerridynDB {
             .file()
             .try_clone()
             .map_err(StorageError::from)?;
-        let store = BufferedPageStore::new(file, state.file_manager.total_page_count());
+        let store = BufferedPageStore::with_cache(
+            file,
+            state.file_manager.total_page_count(),
+            self.inner.page_cache.clone(),
+        );
 
         let mut txn = Transaction {
             store,
@@ -473,7 +481,7 @@ impl FerridynDB {
     /// Read-only helper: execute a closure with a read store and snapshot txn.
     pub(crate) fn read_snapshot<F, R>(&self, f: F) -> Result<R, Error>
     where
-        F: FnOnce(&FilePageStore, PageId, u64) -> Result<R, Error>,
+        F: FnOnce(&CachedPageStore, PageId, u64) -> Result<R, Error>,
     {
         let state = self.inner.state.read();
         let store = self.read_store(&state)?;
@@ -516,9 +524,10 @@ impl FerridynDB {
             state.file_manager.grow(new_total)?;
         }
 
-        // Write all overlay pages to disk.
+        // Write all overlay pages to disk and warm the page cache.
         for (&page_id, data) in store.overlay() {
             state.file_manager.write_page(page_id, data)?;
+            self.inner.page_cache.insert(page_id, *data);
         }
 
         // Write new header to alternate slot.
@@ -545,15 +554,16 @@ impl FerridynDB {
         Ok(())
     }
 
-    fn read_store(&self, state: &DatabaseState) -> Result<FilePageStore, Error> {
+    fn read_store(&self, state: &DatabaseState) -> Result<CachedPageStore, Error> {
         let file = state
             .file_manager
             .file()
             .try_clone()
             .map_err(StorageError::from)?;
-        Ok(FilePageStore::new(
+        Ok(CachedPageStore::new(
             file,
             state.file_manager.total_page_count(),
+            self.inner.page_cache.clone(),
         ))
     }
 }
