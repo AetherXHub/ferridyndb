@@ -23,3 +23,7 @@ tempfile = "3"
 [[bench]]
 name = "benchmark"
 harness = false
+
+[[bench]]
+name = "benchmark_ferridyndb"
+harness = false
