@@ -1621,8 +1621,7 @@ impl FerridynBenchWriteTransaction {
         let ops = std::mem::take(&mut self.ops);
         let mut inserts = 0u64;
         let mut removes = 0u64;
-        let result = self
-            .db
+        let result = self.db
             .transact(|txn| {
                 for op in &ops {
                     match op {
