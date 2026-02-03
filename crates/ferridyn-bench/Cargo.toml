@@ -1,0 +1,26 @@
+[package]
+name = "ferridyn-bench"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[dev-dependencies]
+ferridyn-core = { path = "../ferridyn-core" }
+redb = "2"
+sled = "0.34"
+heed = "0.22"
+rocksdb = { version = "0.22", default-features = false, features = ["lz4"] }
+fjall = "=2.11"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde_json = "1"
+comfy-table = "7"
+fastrand = "2"
+walkdir = "2"
+byte-unit = "5"
+ctrlc = "3"
+env_logger = "0.11"
+tempfile = "3"
+
+[[bench]]
+name = "benchmark"
+harness = false
