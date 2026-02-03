@@ -296,22 +296,22 @@ Adapted from the [redb benchmark suite](https://github.com/cberner/redb/tree/mas
 
 | | redb | lmdb | sled | fjall | sqlite | ferridyndb |
 |---|---|---|---|---|---|---|
-| bulk load | 20424ms | **11448ms** | 21817ms | 13366ms | 26093ms | 92641ms |
-| individual writes | **79ms** | 12165ms | 5084ms | 6220ms | 20699ms | 5034ms |
-| batch writes | 1394ms | 4465ms | 1083ms | **628ms** | 6409ms | 3377ms |
-| nosync writes | 3275ms | 949ms | 275ms | **217ms** | 1860ms | 889ms |
-| len() | 0ms | 0ms | 1514ms | 990ms | 25ms | **0ms** |
-| random reads | 1115ms | **579ms** | 1330ms | 2116ms | 3849ms | 3582ms |
-| random reads | 919ms | **589ms** | 1344ms | 2093ms | 3858ms | 3582ms |
-| random range reads | 1118ms | **509ms** | 1782ms | 2518ms | 7377ms | N/A |
-| random range reads | 1108ms | **508ms** | 1779ms | 2513ms | 7327ms | N/A |
-| random reads (4 threads) | 1379ms | **770ms** | 1787ms | 2776ms | 6922ms | 5253ms |
-| random reads (8 threads) | 765ms | **395ms** | 945ms | 1456ms | 8891ms | 3042ms |
-| random reads (16 threads) | 654ms | **206ms** | 633ms | 967ms | 23613ms | 3367ms |
-| random reads (32 threads) | 407ms | **139ms** | 407ms | 598ms | 27562ms | 4044ms |
-| removals | 16319ms | 9641ms | 9891ms | **5634ms** | 19098ms | 41905ms |
-| uncompacted size | 6.68 GiB | 2.63 GiB | 2.14 GiB | 1010.61 MiB | 1.10 GiB | 3.52 GiB |
-| compacted size | 1.64 GiB | **1.27 GiB** | N/A | 1010.61 MiB | 562.31 MiB | N/A |
+| bulk load | 20324ms | **11500ms** | 22174ms | 14553ms | 26006ms | 57480ms |
+| individual writes | **71ms** | 10612ms | 5056ms | 6428ms | 21097ms | 5274ms |
+| batch writes | 1330ms | 4697ms | 1104ms | **619ms** | 6843ms | 3212ms |
+| nosync writes | 3163ms | 925ms | 282ms | **216ms** | 1865ms | 934ms |
+| len() | 0ms | 0ms | 1485ms | 982ms | 25ms | **0ms** |
+| random reads | 1094ms | **585ms** | 1328ms | 2083ms | 3938ms | 3422ms |
+| random reads | 906ms | **580ms** | 1331ms | 2088ms | 3970ms | 3414ms |
+| random range reads | 1101ms | **512ms** | 1768ms | 2499ms | 7397ms | N/A |
+| random range reads | 1086ms | **530ms** | 1766ms | 2519ms | 7408ms | N/A |
+| random reads (4 threads) | 1316ms | **774ms** | 1796ms | 2771ms | 6984ms | 4954ms |
+| random reads (8 threads) | 743ms | **400ms** | 954ms | 1467ms | 8870ms | 2850ms |
+| random reads (16 threads) | 623ms | **207ms** | 636ms | 953ms | 23045ms | 3317ms |
+| random reads (32 threads) | 388ms | **123ms** | 406ms | 610ms | 27353ms | 4084ms |
+| removals | 16597ms | 9533ms | 9861ms | **5655ms** | 19786ms | 24285ms |
+| uncompacted size | 6.68 GiB | 2.63 GiB | 2.15 GiB | **1010.61 MiB** | 1.10 GiB | 3.09 GiB |
+| compacted size | 1.64 GiB | 1.27 GiB | N/A | 1010.61 MiB | **562.31 MiB** | N/A |
 
 Results collected on a Ryzen 9 9950X with Samsung 990 PRO NVMe.
 
