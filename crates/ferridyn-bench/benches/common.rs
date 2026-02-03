@@ -3,9 +3,6 @@ use ferridyn_core::api::batch::SyncMode;
 use ferridyn_core::types::KeyType;
 use heed::{CompactionOption, EnvFlags, EnvInfo, FlagSetMode};
 use redb::{AccessGuard, Durability, ReadableTableMetadata, TableDefinition};
-use rocksdb::{
-    Direction, IteratorMode, OptimisticTransactionDB, OptimisticTransactionOptions, WriteOptions,
-};
 use rusqlite::{Connection, Transaction};
 use serde_json::json;
 use std::fs::File;
@@ -14,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use std::{fs, mem, thread};
+use std::{fs, thread};
 
 #[allow(dead_code)]
 const X: TableDefinition<&[u8], &[u8]> = TableDefinition::new("x");
@@ -35,11 +32,8 @@ const RNG_SEED: u64 = 3;
 
 pub const CACHE_SIZE: usize = 4 * 1_024 * 1_024 * 1_024; // 4GB
 
-// XXX: Awful hack because Rocksdb seems to have unbounded memory usage for bulk writes
-const ROCKSDB_MAX_WRITES_PER_TXN: u64 = 100_000;
-
 // FerridynDB also needs to batch bulk writes to avoid overlay memory explosion
-const FERRIDYN_MAX_WRITES_PER_TXN: usize = 100_000;
+const FERRIDYN_MAX_WRITES_PER_TXN: usize = 1_000_000;
 
 /// Returns pairs of key, value
 fn random_pair(rng: &mut fastrand::Rng) -> ([u8; KEY_SIZE], Vec<u8>) {
@@ -1097,217 +1091,6 @@ impl BenchIterator for HeedBenchIterator<'_> {
 
     fn next(&mut self) -> Option<(Self::Output<'_>, Self::Output<'_>)> {
         self.iter.next().map(|x| x.unwrap())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// RocksDB implementation
-// ---------------------------------------------------------------------------
-
-pub struct RocksdbBenchDatabase<'a> {
-    db: &'a OptimisticTransactionDB,
-}
-
-impl<'a> RocksdbBenchDatabase<'a> {
-    pub fn new(db: &'a OptimisticTransactionDB) -> Self {
-        Self { db }
-    }
-}
-
-impl BenchDatabase for RocksdbBenchDatabase<'_> {
-    type C<'db>
-        = RocksdbBenchDatabaseConnection<'db>
-    where
-        Self: 'db;
-
-    fn db_type_name() -> &'static str {
-        "rocksdb"
-    }
-
-    fn connect(&self) -> Self::C<'_> {
-        RocksdbBenchDatabaseConnection {
-            db: self.db,
-            sync: true,
-        }
-    }
-
-    fn compact(&mut self) -> bool {
-        self.db.compact_range::<&[u8], &[u8]>(None, None);
-        true
-    }
-}
-
-pub struct RocksdbBenchDatabaseConnection<'a> {
-    db: &'a OptimisticTransactionDB,
-    sync: bool,
-}
-
-impl BenchDatabaseConnection for RocksdbBenchDatabaseConnection<'_> {
-    type W<'db>
-        = RocksdbBenchWriteTransaction<'db>
-    where
-        Self: 'db;
-    type R<'db>
-        = RocksdbBenchReadTransaction<'db>
-    where
-        Self: 'db;
-
-    fn set_sync(&mut self, sync: bool) -> bool {
-        self.sync = sync;
-        true
-    }
-
-    fn write_transaction(&self) -> Self::W<'_> {
-        let mut write_opt = WriteOptions::new();
-        write_opt.set_sync(self.sync);
-        let mut txn_opt = OptimisticTransactionOptions::new();
-        txn_opt.set_snapshot(true);
-        let txn = self.db.transaction_opt(&write_opt, &txn_opt);
-        RocksdbBenchWriteTransaction {
-            txn,
-            db: self.db,
-            db_dir: self.db.path().to_path_buf(),
-            sync: self.sync,
-        }
-    }
-
-    fn read_transaction(&self) -> Self::R<'_> {
-        let snapshot = self.db.snapshot();
-        RocksdbBenchReadTransaction { snapshot }
-    }
-}
-
-pub struct RocksdbBenchWriteTransaction<'a> {
-    txn: rocksdb::Transaction<'a, OptimisticTransactionDB>,
-    db: &'a OptimisticTransactionDB,
-    #[allow(dead_code)]
-    db_dir: PathBuf,
-    #[allow(dead_code)]
-    sync: bool,
-}
-
-impl<'a> BenchWriteTransaction for RocksdbBenchWriteTransaction<'a> {
-    type W<'txn>
-        = RocksdbBenchInserter<'txn, 'a>
-    where
-        Self: 'txn;
-
-    fn get_inserter(&mut self) -> Self::W<'_> {
-        RocksdbBenchInserter {
-            txn: self,
-            counter: 0,
-        }
-    }
-
-    fn commit(self) -> Result<(), ()> {
-        let result = self.txn.commit().map_err(|_| ());
-        #[cfg(target_os = "macos")]
-        if self.sync {
-            // Workaround for broken durability on MacOS in rocksdb
-            // See: https://github.com/cberner/redb/pull/928#issuecomment-2567032808
-            for entry in fs::read_dir(self.db_dir).unwrap() {
-                let entry = entry.unwrap();
-                if entry.path().is_file() {
-                    let file = File::open(entry.path()).unwrap();
-                    file.sync_all().unwrap();
-                }
-            }
-        }
-
-        result
-    }
-}
-
-pub struct RocksdbBenchInserter<'a, 'b> {
-    txn: &'a mut RocksdbBenchWriteTransaction<'b>,
-    counter: u64,
-}
-
-impl BenchInserter for RocksdbBenchInserter<'_, '_> {
-    fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<(), ()> {
-        self.counter += 1;
-        if self.counter == ROCKSDB_MAX_WRITES_PER_TXN {
-            let txn = mem::replace(&mut self.txn.txn, self.txn.db.transaction());
-            txn.commit().map_err(|_| ())?;
-            self.counter = 0;
-        }
-        self.txn.txn.put(key, value).map_err(|_| ())
-    }
-
-    fn remove(&mut self, key: &[u8]) -> Result<(), ()> {
-        self.counter += 1;
-        if self.counter == ROCKSDB_MAX_WRITES_PER_TXN {
-            let txn = mem::replace(&mut self.txn.txn, self.txn.db.transaction());
-            txn.commit().map_err(|_| ())?;
-            self.counter = 0;
-        }
-        self.txn.txn.delete(key).map_err(|_| ())
-    }
-}
-
-pub struct RocksdbBenchReadTransaction<'db> {
-    snapshot: rocksdb::SnapshotWithThreadMode<'db, OptimisticTransactionDB>,
-}
-
-impl<'db> BenchReadTransaction for RocksdbBenchReadTransaction<'db> {
-    type T<'txn>
-        = RocksdbBenchReader<'db, 'txn>
-    where
-        Self: 'txn;
-
-    fn get_reader(&self) -> Self::T<'_> {
-        RocksdbBenchReader {
-            snapshot: &self.snapshot,
-        }
-    }
-}
-
-pub struct RocksdbBenchReader<'db, 'txn> {
-    snapshot: &'txn rocksdb::SnapshotWithThreadMode<'db, OptimisticTransactionDB>,
-}
-
-impl BenchReader for RocksdbBenchReader<'_, '_> {
-    type Output<'out>
-        = Vec<u8>
-    where
-        Self: 'out;
-    type Iterator<'out>
-        = RocksdbBenchIterator<'out>
-    where
-        Self: 'out;
-
-    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.snapshot.get(key).unwrap()
-    }
-
-    fn range_from<'a>(&'a self, key: &'a [u8]) -> Self::Iterator<'a> {
-        let iter = self
-            .snapshot
-            .iterator(IteratorMode::From(key, Direction::Forward));
-
-        RocksdbBenchIterator { iter }
-    }
-
-    fn len(&self) -> u64 {
-        self.snapshot.iterator(IteratorMode::Start).count() as u64
-    }
-}
-
-pub struct RocksdbBenchIterator<'a> {
-    iter: rocksdb::DBIteratorWithThreadMode<'a, OptimisticTransactionDB>,
-}
-
-impl BenchIterator for RocksdbBenchIterator<'_> {
-    type Output<'out>
-        = Box<[u8]>
-    where
-        Self: 'out;
-
-    fn next(&mut self) -> Option<(Self::Output<'_>, Self::Output<'_>)> {
-        self.iter.next().map(|x| {
-            let x = x.unwrap();
-            (x.0, x.1)
-        })
     }
 }
 

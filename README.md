@@ -286,7 +286,7 @@ Two benchmark suites are available:
 
 - `cargo bench -p ferridyn-core` — In-memory (tmpfs) microbenchmarks for routine performance checks
 - `BENCH_DIR=/path/to/nvme cargo bench --bench ferridyn_file_bench` — File-backed benchmarks on real storage (run only after major refactors)
-- `cargo bench -p ferridyn-bench` — Head-to-head comparison against 6 other embedded databases (requires libclang for RocksDB)
+- `cargo bench -p ferridyn-bench` — Head-to-head comparison against 5 other embedded databases
 
 By default, benchmarks use tmpfs. Real NVMe benchmarks are dominated by fsync latency (~5ms per commit) and should only be run to validate algorithmic changes that show improvement in tmpfs benchmarks.
 
@@ -294,26 +294,26 @@ By default, benchmarks use tmpfs. Real NVMe benchmarks are dominated by fsync la
 
 Adapted from the [redb benchmark suite](https://github.com/cberner/redb/tree/master/crates/redb-bench). All databases use a 4 GiB cache with 5M bulk-loaded items (24-byte keys, 150-byte values). FerridynDB operates through its document API with hex-encoded keys, so it carries serialization overhead that raw KV stores avoid. Range scans are skipped for FerridynDB because the per-query document model overhead makes 500K iterations impractical at this scale.
 
-| | redb | lmdb | rocksdb | sled | fjall | sqlite | ferridyndb |
-|---|---|---|---|---|---|---|---|
-| bulk load | 20424ms | **11448ms** | 12954ms | 21817ms | 13366ms | 26093ms | 92641ms |
-| individual writes | **79ms** | 12165ms | 6225ms | 5084ms | 6220ms | 20699ms | 5034ms |
-| batch writes | 1394ms | 4465ms | 808ms | 1083ms | **628ms** | 6409ms | 3377ms |
-| nosync writes | 3275ms | 949ms | **168ms** | 275ms | 217ms | 1860ms | 889ms |
-| len() | 0ms | 0ms | 626ms | 1514ms | 990ms | 25ms | **0ms** |
-| random reads | 1115ms | **579ms** | 2148ms | 1330ms | 2116ms | 3849ms | 3582ms |
-| random reads | 919ms | **589ms** | 2118ms | 1344ms | 2093ms | 3858ms | 3582ms |
-| random range reads | 1118ms | **509ms** | 2778ms | 1782ms | 2518ms | 7377ms | N/A |
-| random range reads | 1108ms | **508ms** | 2778ms | 1779ms | 2513ms | 7327ms | N/A |
-| random reads (4 threads) | 1379ms | **770ms** | 3140ms | 1787ms | 2776ms | 6922ms | 5253ms |
-| random reads (8 threads) | 765ms | **395ms** | 1855ms | 945ms | 1456ms | 8891ms | 3042ms |
-| random reads (16 threads) | 654ms | **206ms** | 2354ms | 633ms | 967ms | 23613ms | 3367ms |
-| random reads (32 threads) | 407ms | **139ms** | 2333ms | 407ms | 598ms | 27562ms | 4044ms |
-| removals | 16319ms | 9641ms | 6483ms | 9891ms | **5634ms** | 19098ms | 41905ms |
-| uncompacted size | 6.68 GiB | 2.63 GiB | **948.17 MiB** | 2.14 GiB | 1010.61 MiB | 1.10 GiB | 3.52 GiB |
-| compacted size | 1.64 GiB | 1.27 GiB | **459.18 MiB** | N/A | 1010.61 MiB | 562.31 MiB | N/A |
+| | redb | lmdb | sled | fjall | sqlite | ferridyndb |
+|---|---|---|---|---|---|---|
+| bulk load | 20424ms | **11448ms** | 21817ms | 13366ms | 26093ms | 92641ms |
+| individual writes | **79ms** | 12165ms | 5084ms | 6220ms | 20699ms | 5034ms |
+| batch writes | 1394ms | 4465ms | 1083ms | **628ms** | 6409ms | 3377ms |
+| nosync writes | 3275ms | 949ms | 275ms | **217ms** | 1860ms | 889ms |
+| len() | 0ms | 0ms | 1514ms | 990ms | 25ms | **0ms** |
+| random reads | 1115ms | **579ms** | 1330ms | 2116ms | 3849ms | 3582ms |
+| random reads | 919ms | **589ms** | 1344ms | 2093ms | 3858ms | 3582ms |
+| random range reads | 1118ms | **509ms** | 1782ms | 2518ms | 7377ms | N/A |
+| random range reads | 1108ms | **508ms** | 1779ms | 2513ms | 7327ms | N/A |
+| random reads (4 threads) | 1379ms | **770ms** | 1787ms | 2776ms | 6922ms | 5253ms |
+| random reads (8 threads) | 765ms | **395ms** | 945ms | 1456ms | 8891ms | 3042ms |
+| random reads (16 threads) | 654ms | **206ms** | 633ms | 967ms | 23613ms | 3367ms |
+| random reads (32 threads) | 407ms | **139ms** | 407ms | 598ms | 27562ms | 4044ms |
+| removals | 16319ms | 9641ms | 9891ms | **5634ms** | 19098ms | 41905ms |
+| uncompacted size | 6.68 GiB | 2.63 GiB | 2.14 GiB | 1010.61 MiB | 1.10 GiB | 3.52 GiB |
+| compacted size | 1.64 GiB | **1.27 GiB** | N/A | 1010.61 MiB | 562.31 MiB | N/A |
 
-Results collected on a Ryzen 9 9950X with Samsung 990 PRO NVMe, running inside a container (required for RocksDB's libclang dependency).
+Results collected on a Ryzen 9 9950X with Samsung 990 PRO NVMe.
 
 ## Design Decisions
 

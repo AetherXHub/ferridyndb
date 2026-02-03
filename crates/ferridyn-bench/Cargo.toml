@@ -9,7 +9,6 @@ ferridyn-core = { path = "../ferridyn-core" }
 redb = "2"
 sled = "0.34"
 heed = "0.22"
-rocksdb = { version = "0.22", default-features = false, features = ["lz4"] }
 fjall = "=2.11"
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde_json = "1"
