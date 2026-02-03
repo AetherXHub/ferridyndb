@@ -1,101 +1,13 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::num::NonZeroUsize;
 use std::os::unix::fs::FileExt;
-use std::sync::Arc;
-
-use lru::LruCache;
-use parking_lot::Mutex;
 
 use crate::btree::PageStore;
 use crate::error::StorageError;
 use crate::storage::page::{Page, PageType};
 use crate::types::{PAGE_SIZE, PageId};
 
-/// Default page cache capacity: 10,000 pages = 40 MiB.
-const DEFAULT_CACHE_CAPACITY: usize = 10_000;
-
-/// Shared page cache type alias.
-pub type PageCache = Arc<Mutex<LruCache<PageId, [u8; PAGE_SIZE]>>>;
-
-/// Create a new shared page cache with the default capacity.
-pub fn new_page_cache() -> PageCache {
-    Arc::new(Mutex::new(LruCache::new(
-        NonZeroUsize::new(DEFAULT_CACHE_CAPACITY).unwrap(),
-    )))
-}
-
-/// A read-only [`PageStore`] backed by a file descriptor with an LRU page cache.
-///
-/// Uses `pread` (`FileExt::read_exact_at`) so it is safe to share the
-/// underlying file handle across threads (no seek-based state).
-/// Cache hits avoid disk I/O entirely.
-pub struct CachedPageStore {
-    file: File,
-    total_page_count: u64,
-    cache: PageCache,
-}
-
-impl CachedPageStore {
-    /// Wrap an already-cloned file descriptor for read-only page access with caching.
-    pub fn new(file: File, total_page_count: u64, cache: PageCache) -> Self {
-        Self {
-            file,
-            total_page_count,
-            cache,
-        }
-    }
-}
-
-impl PageStore for CachedPageStore {
-    fn read_page(&self, page_id: PageId) -> Result<Page, StorageError> {
-        if page_id >= self.total_page_count {
-            return Err(StorageError::PageOutOfBounds {
-                page_id,
-                total_pages: self.total_page_count,
-            });
-        }
-        // Check cache first.
-        {
-            let mut cache = self.cache.lock();
-            if let Some(buf) = cache.get(&page_id) {
-                return Ok(Page::from_bytes(*buf, page_id));
-            }
-        }
-        // Cache miss — read from disk.
-        let mut buf = [0u8; PAGE_SIZE];
-        let offset = page_id * PAGE_SIZE as u64;
-        self.file
-            .read_exact_at(&mut buf, offset)
-            .map_err(StorageError::Io)?;
-        // Insert into cache.
-        {
-            let mut cache = self.cache.lock();
-            cache.put(page_id, buf);
-        }
-        Ok(Page::from_bytes(buf, page_id))
-    }
-
-    fn write_page(&mut self, _page: Page) -> Result<(), StorageError> {
-        Err(StorageError::CorruptedPage(
-            "CachedPageStore is read-only".to_string(),
-        ))
-    }
-
-    fn allocate_page(&mut self, _page_type: PageType) -> Result<Page, StorageError> {
-        Err(StorageError::CorruptedPage(
-            "CachedPageStore is read-only".to_string(),
-        ))
-    }
-
-    fn free_page(&mut self, _page_id: PageId) -> Result<(), StorageError> {
-        Err(StorageError::CorruptedPage(
-            "CachedPageStore is read-only".to_string(),
-        ))
-    }
-}
-
-/// A read-only [`PageStore`] backed by a file descriptor (no cache).
+/// A read-only [`PageStore`] backed by a file descriptor.
 ///
 /// Uses `pread` (`FileExt::read_exact_at`) so it is safe to share the
 /// underlying file handle across threads (no seek-based state).
@@ -150,7 +62,7 @@ impl PageStore for FilePageStore {
 }
 
 /// A buffered [`PageStore`] that overlays in-memory writes on top of
-/// file-backed reads with optional LRU cache.
+/// file-backed reads.
 ///
 /// Used by write transactions: all mutations accumulate in the overlay
 /// `HashMap` and are flushed to disk only on commit.
@@ -160,7 +72,6 @@ pub struct BufferedPageStore {
     next_page_id: PageId,
     freed_pages: Vec<PageId>,
     file_total_pages: u64,
-    cache: Option<PageCache>,
 }
 
 impl BufferedPageStore {
@@ -175,19 +86,6 @@ impl BufferedPageStore {
             next_page_id: total_page_count,
             freed_pages: Vec::new(),
             file_total_pages: total_page_count,
-            cache: None,
-        }
-    }
-
-    /// Create a new buffered store with an LRU page cache.
-    pub fn with_cache(file: File, total_page_count: u64, cache: PageCache) -> Self {
-        Self {
-            file,
-            overlay: HashMap::new(),
-            next_page_id: total_page_count,
-            freed_pages: Vec::new(),
-            file_total_pages: total_page_count,
-            cache: Some(cache),
         }
     }
 
@@ -208,13 +106,6 @@ impl PageStore for BufferedPageStore {
         if let Some(buf) = self.overlay.get(&page_id) {
             return Ok(Page::from_bytes(*buf, page_id));
         }
-        // Check cache if available.
-        if let Some(cache) = &self.cache {
-            let mut cache = cache.lock();
-            if let Some(buf) = cache.get(&page_id) {
-                return Ok(Page::from_bytes(*buf, page_id));
-            }
-        }
         // Fall through to disk read.
         if page_id >= self.file_total_pages {
             return Err(StorageError::PageOutOfBounds {
@@ -227,11 +118,6 @@ impl PageStore for BufferedPageStore {
         self.file
             .read_exact_at(&mut buf, offset)
             .map_err(StorageError::Io)?;
-        // Insert into cache if available.
-        if let Some(cache) = &self.cache {
-            let mut cache = cache.lock();
-            cache.put(page_id, buf);
-        }
         Ok(Page::from_bytes(buf, page_id))
     }
 
@@ -307,24 +193,6 @@ mod tests {
     }
 
     #[test]
-    fn test_cached_page_store_read() {
-        let (tmp, count) = create_test_file();
-        let file = tmp.as_file().try_clone().unwrap();
-        let cache = new_page_cache();
-        let store = CachedPageStore::new(file, count, cache.clone());
-
-        let page0 = store.read_page(0).unwrap();
-        assert_eq!(page0.data()[100], 0xAA);
-
-        // Second read should hit cache.
-        let page0_cached = store.read_page(0).unwrap();
-        assert_eq!(page0_cached.data()[100], 0xAA);
-
-        // Verify it's in the cache.
-        assert!(cache.lock().contains(&0));
-    }
-
-    #[test]
     fn test_buffered_page_store_read_through() {
         let (tmp, count) = create_test_file();
         let file = tmp.as_file().try_clone().unwrap();
@@ -333,19 +201,6 @@ mod tests {
         // Should read from disk.
         let page0 = store.read_page(0).unwrap();
         assert_eq!(page0.data()[100], 0xAA);
-    }
-
-    #[test]
-    fn test_buffered_page_store_with_cache() {
-        let (tmp, count) = create_test_file();
-        let file = tmp.as_file().try_clone().unwrap();
-        let cache = new_page_cache();
-        let store = BufferedPageStore::with_cache(file, count, cache.clone());
-
-        // Should read from disk and populate cache.
-        let page0 = store.read_page(0).unwrap();
-        assert_eq!(page0.data()[100], 0xAA);
-        assert!(cache.lock().contains(&0));
     }
 
     #[test]
