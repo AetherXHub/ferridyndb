@@ -18,13 +18,6 @@ fn main() {
     })
     .unwrap();
 
-    let ferridyndb_results = {
-        let tmpfile = tmpdir.join("ferridyndb.dat");
-        let db = ferridyn_core::api::FerridynDB::create(&tmpfile).unwrap();
-        let table = FerridynBenchDatabase::new(db);
-        benchmark(table, &tmpfile)
-    };
-
     let redb_results = {
         let tmpfile: NamedTempFile = NamedTempFile::new_in(&tmpdir).unwrap();
         let mut db = redb::Database::builder()
@@ -109,22 +102,29 @@ fn main() {
         benchmark(table, tmpfile.path())
     };
 
+    let ferridyndb_results = {
+        let tmpfile = tmpdir.join("ferridyndb.dat");
+        let db = ferridyn_core::api::FerridynDB::create(&tmpfile).unwrap();
+        let table = FerridynBenchDatabase::new(db);
+        benchmark(table, &tmpfile)
+    };
+
     fs::remove_dir_all(&tmpdir).unwrap();
 
     let mut rows = Vec::new();
 
-    for (benchmark, _duration) in &ferridyndb_results {
+    for (benchmark, _duration) in &redb_results {
         rows.push(vec![benchmark.to_string()]);
     }
 
     let results = [
-        ferridyndb_results,
         redb_results,
         lmdb_results,
         rocksdb_results,
         sled_results,
         fjall_results,
         sqlite_results,
+        ferridyndb_results,
     ];
 
     let mut identified_smallests = vec![vec![false; results.len()]; rows.len()];
@@ -157,13 +157,13 @@ fn main() {
     table.set_width(120);
     table.set_header([
         "",
-        "ferridyndb",
         "redb",
         "lmdb",
         "rocksdb",
         "sled",
         "fjall",
         "sqlite",
+        "ferridyndb",
     ]);
     for row in rows {
         table.add_row(row);

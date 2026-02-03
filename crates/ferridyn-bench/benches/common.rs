@@ -232,36 +232,46 @@ pub fn benchmark<T: BenchDatabase + Send + Sync>(
             results.push(("random reads".to_string(), ResultType::Duration(duration)));
         }
 
-        for _ in 0..SCAN_ITERATIONS {
-            let mut rng = make_rng();
-            let start = Instant::now();
-            let reader = txn.get_reader();
-            let mut value_sum = 0;
-            for _ in 0..NUM_SCANS {
-                let (key, _value) = random_pair(&mut rng);
-                let mut iter = reader.range_from(&key);
-                for _ in 0..SCAN_LEN {
-                    if let Some((_, value)) = iter.next() {
-                        value_sum += value.as_ref()[0];
-                    } else {
-                        break;
+        if T::supports_range_scan() {
+            for _ in 0..SCAN_ITERATIONS {
+                let mut rng = make_rng();
+                let start = Instant::now();
+                let reader = txn.get_reader();
+                let mut value_sum = 0;
+                for _ in 0..NUM_SCANS {
+                    let (key, _value) = random_pair(&mut rng);
+                    let mut iter = reader.range_from(&key);
+                    for _ in 0..SCAN_LEN {
+                        if let Some((_, value)) = iter.next() {
+                            value_sum += value.as_ref()[0];
+                        } else {
+                            break;
+                        }
                     }
                 }
+                assert!(value_sum > 0);
+                let end = Instant::now();
+                let duration = end - start;
+                println!(
+                    "{}: Random range read {} x {} elements in {}ms",
+                    T::db_type_name(),
+                    NUM_SCANS,
+                    SCAN_LEN,
+                    duration.as_millis()
+                );
+                results.push((
+                    "random range reads".to_string(),
+                    ResultType::Duration(duration),
+                ));
             }
-            assert!(value_sum > 0);
-            let end = Instant::now();
-            let duration = end - start;
+        } else {
             println!(
-                "{}: Random range read {} x {} elements in {}ms",
+                "{}: Random range read skipped (not supported)",
                 T::db_type_name(),
-                NUM_SCANS,
-                SCAN_LEN,
-                duration.as_millis()
             );
-            results.push((
-                "random range reads".to_string(),
-                ResultType::Duration(duration),
-            ));
+            for _ in 0..SCAN_ITERATIONS {
+                results.push(("random range reads".to_string(), ResultType::NA));
+            }
         }
     }
     drop(txn);
@@ -416,6 +426,13 @@ pub trait BenchDatabase {
     // Returns a boolean indicating whether compaction is supported
     fn compact(&mut self) -> bool {
         false
+    }
+
+    // Returns a boolean indicating whether range scans are benchmarked.
+    // Override to false for databases where range scans are too slow to benchmark
+    // (e.g. document-model overhead with serialization round-trips).
+    fn supports_range_scan() -> bool {
+        true
     }
 }
 
@@ -1740,6 +1757,10 @@ impl BenchDatabase for FerridynBenchDatabase {
             db: self.db.clone(),
             count: self.count.clone(),
         }
+    }
+
+    fn supports_range_scan() -> bool {
+        false // Document-model overhead makes 500K range scans impractical
     }
 }
 
