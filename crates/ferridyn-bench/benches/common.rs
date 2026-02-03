@@ -1490,6 +1490,18 @@ impl BenchIterator for SqliteBenchIterator {
 // FerridynDB implementation
 // ---------------------------------------------------------------------------
 
+fn bytes_to_json(bytes: &[u8]) -> serde_json::Value {
+    serde_json::Value::Array(bytes.iter().map(|&b| serde_json::Value::from(b)).collect())
+}
+
+fn json_to_bytes(val: &serde_json::Value) -> Vec<u8> {
+    val.as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u8)
+        .collect()
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -1515,7 +1527,7 @@ impl FerridynBenchDatabase {
     pub fn new(db: FerridynDB) -> Self {
         db.create_table("bench")
             .partition_key("p", KeyType::String)
-            .sort_key("k", KeyType::String)
+            .sort_key("k", KeyType::Binary)
             .execute()
             .unwrap();
         Self {
@@ -1614,15 +1626,15 @@ impl FerridynBenchWriteTransaction {
                 for op in &ops {
                     match op {
                         FerridynBenchOp::Insert { key, value } => {
-                            let hex_key = hex_encode(key);
+                            let key_json = bytes_to_json(key);
                             let hex_value = hex_encode(value);
-                            let doc = json!({"p": "d", "k": hex_key, "v": hex_value});
+                            let doc = json!({"p": "d", "k": key_json, "v": hex_value});
                             txn.put_item("bench", doc)?;
                             inserts += 1;
                         }
                         FerridynBenchOp::Remove { key } => {
-                            let hex_key = hex_encode(key);
-                            txn.delete_item("bench", &json!("d"), Some(&json!(hex_key)))?;
+                            let key_json = bytes_to_json(key);
+                            txn.delete_item("bench", &json!("d"), Some(&key_json))?;
                             removes += 1;
                         }
                     }
@@ -1719,24 +1731,24 @@ impl BenchReader for FerridynBenchReader {
         Self: 'out;
 
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        let hex_key = hex_encode(key);
+        let key_json = bytes_to_json(key);
         let result = self
             .db
             .get_item("bench")
             .partition_key("d")
-            .sort_key(hex_key.as_str())
+            .sort_key(key_json)
             .execute()
             .unwrap();
         result.map(|doc| hex_decode(doc["v"].as_str().unwrap()))
     }
 
     fn range_from<'a>(&'a self, key: &'a [u8]) -> Self::Iterator<'a> {
-        let hex_key = hex_encode(key);
+        let key_json = bytes_to_json(key);
         let result = self
             .db
             .query("bench")
             .partition_key("d")
-            .sort_key_ge(hex_key.as_str())
+            .sort_key_ge(key_json)
             .limit(SCAN_LEN + 1)
             .execute()
             .unwrap();
@@ -1745,7 +1757,7 @@ impl BenchReader for FerridynBenchReader {
             .items
             .into_iter()
             .map(|doc| {
-                let k = hex_decode(doc["k"].as_str().unwrap());
+                let k = json_to_bytes(&doc["k"]);
                 let v = hex_decode(doc["v"].as_str().unwrap());
                 (k, v)
             })

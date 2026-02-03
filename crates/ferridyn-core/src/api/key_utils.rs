@@ -50,7 +50,6 @@ pub fn json_to_key_value(
                         })
                 })
                 .collect::<Result<_, _>>()?;
-            binary::validate_binary_key(&bytes)?;
             Ok(KeyValue::Binary(bytes))
         }
     }
@@ -247,12 +246,8 @@ pub fn decode_primary_key_from_index_entry(index_key: &[u8]) -> Result<Vec<u8>, 
             1 + 8 // tag + 8 bytes for f64
         }
         crate::types::KeyType::Binary => {
-            // Find the null terminator
-            let pos = index_key[1..]
-                .iter()
-                .position(|&b| b == 0x00)
-                .ok_or(crate::error::EncodingError::MalformedKey)?;
-            1 + pos + 1 // tag + binary bytes + terminator
+            let (_decoded, consumed) = binary::decode_binary(&index_key[1..])?;
+            1 + consumed // tag + escaped binary with terminator
         }
     };
 
