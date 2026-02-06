@@ -1,7 +1,7 @@
 # PRD: Merkle Checksum Tree
 
 **Priority:** 19
-**Status:** Approved
+**Status:** Complete (Phases 1-3)
 **Origin:** redb design analysis — long-term integrity hardening
 
 **Roadmap Sequencing:** Do **after PRD-15** (Vector Index) as part of a v2 storage format initiative. This is a high-effort change that touches every B-tree node and is best bundled with other format-breaking improvements (B-tree rebalancing, potential buddy allocator).

@@ -4,10 +4,10 @@ use crate::storage::page::PageType;
 use crate::types::{PAGE_SIZE, PageId, TxnId};
 
 /// Offset within a PendingFree page where the next-page link is stored.
-const NEXT_PAGE_OFFSET: usize = 32;
+const NEXT_PAGE_OFFSET: usize = 40;
 
 /// Offset within a PendingFree page where serialized data begins.
-const DATA_OFFSET: usize = 40;
+const DATA_OFFSET: usize = 48;
 
 /// Usable data bytes per PendingFree page.
 const DATA_PER_PAGE: usize = PAGE_SIZE - DATA_OFFSET;

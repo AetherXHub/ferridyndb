@@ -1,9 +1,12 @@
 use crate::error::StorageError;
 use crate::types::{PAGE_SIZE, PageId};
-use xxhash_rust::xxh64::Xxh64;
+use xxhash_rust::xxh3::xxh3_128;
 
-/// Byte range for the page header checksum computation: bytes 20..4096.
-const CHECKSUM_START: usize = 20;
+/// Byte offset where data resumes after the checksum field.
+///
+/// The checksum occupies bytes `[12..28]` (16 bytes, XXH3_128).
+/// Data after the checksum starts at byte 28.
+const CHECKSUM_START: usize = 28;
 
 /// Discriminant values for page types stored on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,14 +46,14 @@ impl PageType {
 
 /// A fixed-size page backed by a `[u8; PAGE_SIZE]` buffer.
 ///
-/// Common page header layout (first 32 bytes):
+/// Common page header layout (first 40 bytes):
 /// ```text
 /// [0..4]   page_type: u32 (little-endian)
 /// [4..12]  page_id: u64 (little-endian)
-/// [12..20] xxhash64 checksum (of bytes 0..12 + 20..4096)
-/// [20..24] entry_count: u32 (little-endian)
-/// [24..28] free_space_offset: u32 (little-endian)
-/// [28..32] reserved: u32
+/// [12..28] xxh3_128 checksum (of bytes 0..12 + 28..4096)
+/// [28..32] entry_count: u32 (little-endian)
+/// [32..36] free_space_offset: u32 (little-endian)
+/// [36..40] reserved: u32
 /// ```
 pub struct Page {
     buf: [u8; PAGE_SIZE],
@@ -68,7 +71,7 @@ impl Page {
         buf[4..12].copy_from_slice(&page_id.to_le_bytes());
         // entry_count = 0 (already zeroed)
         // free_space_offset = PAGE_SIZE (no cells allocated yet)
-        buf[24..28].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
+        buf[32..36].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
 
         Self {
             buf,
@@ -99,22 +102,22 @@ impl Page {
 
     /// Read the entry count from the header.
     pub fn entry_count(&self) -> u32 {
-        u32::from_le_bytes(self.buf[20..24].try_into().unwrap())
+        u32::from_le_bytes(self.buf[28..32].try_into().unwrap())
     }
 
     /// Set the entry count in the header.
     pub fn set_entry_count(&mut self, count: u32) {
-        self.buf[20..24].copy_from_slice(&count.to_le_bytes());
+        self.buf[28..32].copy_from_slice(&count.to_le_bytes());
     }
 
     /// Read the free space offset from the header.
     pub fn free_space_offset(&self) -> u32 {
-        u32::from_le_bytes(self.buf[24..28].try_into().unwrap())
+        u32::from_le_bytes(self.buf[32..36].try_into().unwrap())
     }
 
     /// Set the free space offset in the header.
     pub fn set_free_space_offset(&mut self, offset: u32) {
-        self.buf[24..28].copy_from_slice(&offset.to_le_bytes());
+        self.buf[32..36].copy_from_slice(&offset.to_le_bytes());
     }
 
     /// Raw buffer access (read-only).
@@ -127,30 +130,26 @@ impl Page {
         &mut self.buf
     }
 
-    /// Compute the xxhash64 checksum of bytes `[0..12] + [20..PAGE_SIZE]`.
+    /// Compute the XXH3_128 checksum of bytes `[0..12] + [28..PAGE_SIZE]`.
     ///
     /// This covers page_type, page_id, and all data after the checksum field,
-    /// skipping only the checksum field itself at `[12..20]`.
-    pub fn compute_checksum(&self) -> u64 {
-        let mut hasher = Xxh64::new(0);
-        hasher.update(&self.buf[0..12]); // page_type + page_id
-        hasher.update(&self.buf[CHECKSUM_START..PAGE_SIZE]); // data after checksum field
-        hasher.digest()
+    /// skipping only the checksum field itself at `[12..28]`.
+    pub fn compute_checksum(&self) -> u128 {
+        compute_checksum_buf(&self.buf)
     }
 
-    /// Compute the checksum and write it into the header at `[12..20]`.
+    /// Compute the checksum and write it into the header at `[12..28]`.
     pub fn write_checksum(&mut self) {
-        let cs = self.compute_checksum();
-        self.buf[12..20].copy_from_slice(&cs.to_le_bytes());
+        write_checksum_buf(&mut self.buf);
     }
 
     /// Verify that the stored checksum matches the computed value.
     pub fn verify_checksum(&self) -> Result<(), StorageError> {
-        let stored = u64::from_le_bytes(self.buf[12..20].try_into().unwrap());
+        let stored = u128::from_le_bytes(self.buf[12..28].try_into().unwrap());
         let computed = self.compute_checksum();
         if stored != computed {
             return Err(StorageError::CorruptedPage(format!(
-                "checksum mismatch on page {}: stored={stored:#018x}, computed={computed:#018x}",
+                "checksum mismatch on page {}: stored={stored:#034x}, computed={computed:#034x}",
                 self.page_id
             )));
         }
@@ -168,20 +167,20 @@ impl Page {
     }
 }
 
-/// Compute checksum for a raw page buffer, covering page_type, page_id, and data.
+/// Compute XXH3_128 checksum for a raw page buffer.
 ///
-/// Hashes bytes `[0..12] + [20..PAGE_SIZE]`, skipping the checksum field at `[12..20]`.
-pub fn compute_checksum_buf(buf: &[u8; PAGE_SIZE]) -> u64 {
-    let mut hasher = Xxh64::new(0);
-    hasher.update(&buf[0..12]);
-    hasher.update(&buf[CHECKSUM_START..PAGE_SIZE]);
-    hasher.digest()
+/// Hashes bytes `[0..12] + [28..PAGE_SIZE]`, skipping the checksum field at `[12..28]`.
+pub fn compute_checksum_buf(buf: &[u8; PAGE_SIZE]) -> u128 {
+    let mut data = Vec::with_capacity(12 + (PAGE_SIZE - CHECKSUM_START));
+    data.extend_from_slice(&buf[0..12]);
+    data.extend_from_slice(&buf[CHECKSUM_START..PAGE_SIZE]);
+    xxh3_128(&data)
 }
 
-/// Compute and write the checksum into a raw page buffer at `[12..20]`.
+/// Compute and write the XXH3_128 checksum into a raw page buffer at `[12..28]`.
 pub fn write_checksum_buf(buf: &mut [u8; PAGE_SIZE]) {
     let cs = compute_checksum_buf(buf);
-    buf[12..20].copy_from_slice(&cs.to_le_bytes());
+    buf[12..28].copy_from_slice(&cs.to_le_bytes());
 }
 
 /// Verify a raw page buffer's checksum and page_id consistency.
@@ -201,11 +200,11 @@ pub fn verify_page_integrity(
         )));
     }
     // Verify checksum.
-    let stored = u64::from_le_bytes(buf[12..20].try_into().unwrap());
+    let stored = u128::from_le_bytes(buf[12..28].try_into().unwrap());
     let computed = compute_checksum_buf(buf);
     if stored != computed {
         return Err(StorageError::CorruptedPage(format!(
-            "checksum mismatch on page {expected_page_id}: stored={stored:#018x}, computed={computed:#018x}"
+            "checksum mismatch on page {expected_page_id}: stored={stored:#034x}, computed={computed:#034x}"
         )));
     }
     Ok(())

@@ -91,6 +91,16 @@ impl PageStore for InMemoryPageStore {
         self.pages.remove(&page_id);
         Ok(())
     }
+
+    fn cow_write_page(&mut self, page: Page) -> Result<PageId, StorageError> {
+        let new_id = self.next_page_id;
+        self.next_page_id += 1;
+        let mut buf = *page.data();
+        // Update the page_id stored in the buffer to match the new allocation.
+        buf[4..12].copy_from_slice(&new_id.to_le_bytes());
+        self.pages.insert(new_id, buf);
+        Ok(new_id)
+    }
 }
 
 #[cfg(test)]

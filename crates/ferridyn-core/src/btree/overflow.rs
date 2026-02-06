@@ -3,9 +3,9 @@
 //! ## Overflow page layout
 //!
 //! ```text
-//! [0..32]    common page header (PageType::Overflow)
-//! [32..40]   next_overflow: u64 LE (PageId of next page in chain, 0 if last)
-//! [40..4096] data (up to OVERFLOW_DATA_PER_PAGE bytes)
+//! [0..40]    common page header (PageType::Overflow)
+//! [40..48]   next_overflow: u64 LE (PageId of next page in chain, 0 if last)
+//! [48..4096] data (up to OVERFLOW_DATA_PER_PAGE bytes)
 //! ```
 //!
 //! ## Value encoding in leaf cells
@@ -18,10 +18,10 @@ use crate::storage::page::{Page, PageType};
 use crate::types::{PAGE_SIZE, PageId, SLOT_SIZE};
 
 use super::PageStore;
-use super::node::BTREE_DATA_OFFSET;
+use super::node::LEAF_DATA_OFFSET;
 
 /// Size of the overflow-specific header region (common header + next pointer).
-pub const OVERFLOW_HEADER_SIZE: usize = 40;
+pub const OVERFLOW_HEADER_SIZE: usize = 48;
 
 /// Maximum data bytes stored per overflow page.
 pub const OVERFLOW_DATA_PER_PAGE: usize = PAGE_SIZE - OVERFLOW_HEADER_SIZE;
@@ -42,9 +42,9 @@ pub const OVERFLOW_THRESHOLD: usize = 1500;
 /// fits in a single empty leaf page.
 pub fn max_inline_value_size(encoded_key_len: usize) -> usize {
     // Available space in an empty leaf page for a single cell + slot:
-    //   PAGE_SIZE - BTREE_DATA_OFFSET - SLOT_SIZE
+    //   PAGE_SIZE - LEAF_DATA_OFFSET - SLOT_SIZE
     // Cell layout: [key_len: u16][key bytes][marker: u8][value bytes]
-    let max_cell_size = PAGE_SIZE - BTREE_DATA_OFFSET - SLOT_SIZE;
+    let max_cell_size = PAGE_SIZE - LEAF_DATA_OFFSET - SLOT_SIZE;
     let cell_overhead = 2 + encoded_key_len + 1; // key_len prefix + key + inline marker
     max_cell_size.saturating_sub(cell_overhead)
 }
@@ -52,13 +52,13 @@ pub fn max_inline_value_size(encoded_key_len: usize) -> usize {
 /// Read the next-overflow pointer from an overflow page.
 fn overflow_next(page: &Page) -> PageId {
     let data = page.data();
-    u64::from_le_bytes(data[32..40].try_into().unwrap())
+    u64::from_le_bytes(data[40..48].try_into().unwrap())
 }
 
 /// Set the next-overflow pointer on an overflow page.
 fn overflow_set_next(page: &mut Page, next: PageId) {
     let data = page.data_mut();
-    data[32..40].copy_from_slice(&next.to_le_bytes());
+    data[40..48].copy_from_slice(&next.to_le_bytes());
 }
 
 /// Read a value that may be inline or stored across overflow pages.

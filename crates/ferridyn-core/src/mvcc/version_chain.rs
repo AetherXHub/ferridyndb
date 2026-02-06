@@ -1,7 +1,7 @@
 //! Version chain storage for old versions of MVCC documents.
 //!
-//! Reuses the overflow page format (header [0..32] common, [32..40] next_page
-//! u64 LE, [40..4096] data) for storing serialized `VersionedDocument` bytes of
+//! Reuses the overflow page format (header [0..40] common, [40..48] next_page
+//! u64 LE, [48..4096] data) for storing serialized `VersionedDocument` bytes of
 //! old versions.
 
 use crate::btree::PageStore;
@@ -9,17 +9,17 @@ use crate::error::StorageError;
 use crate::storage::page::PageType;
 use crate::types::{PAGE_SIZE, PageId};
 
-const CHAIN_HEADER_SIZE: usize = 40;
+const CHAIN_HEADER_SIZE: usize = 48;
 const CHAIN_DATA_PER_PAGE: usize = PAGE_SIZE - CHAIN_HEADER_SIZE;
 
 /// Read the next-page pointer from a chain (overflow) page.
 fn chain_next(data: &[u8; PAGE_SIZE]) -> PageId {
-    u64::from_le_bytes(data[32..40].try_into().unwrap())
+    u64::from_le_bytes(data[40..48].try_into().unwrap())
 }
 
 /// Set the next-page pointer on a chain (overflow) page.
 fn chain_set_next(data: &mut [u8; PAGE_SIZE], next: PageId) {
-    data[32..40].copy_from_slice(&next.to_le_bytes());
+    data[40..48].copy_from_slice(&next.to_le_bytes());
 }
 
 /// Write data to a version chain of Overflow pages.

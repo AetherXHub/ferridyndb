@@ -2,18 +2,18 @@ use crate::types::{PAGE_SIZE, PageId};
 
 use super::page::Page;
 
-/// Byte offset where free list-specific data begins (after the 32-byte common header).
+/// Byte offset where free list-specific data begins (after the 40-byte common header).
 ///
 /// Layout of a free list trunk page:
 /// ```text
-/// [0..32]    common page header (page_type=FreeList, entry_count=N)
-/// [32..40]   next_trunk: u64 LE — PageId of the next trunk page, or 0 if none
-/// [40..4096] array of PageId values (up to 507 entries, u64 LE each)
+/// [0..40]    common page header (page_type=FreeList, entry_count=N)
+/// [40..48]   next_trunk: u64 LE — PageId of the next trunk page, or 0 if none
+/// [48..4096] array of PageId values (up to 506 entries, u64 LE each)
 /// ```
-const NEXT_TRUNK_OFFSET: usize = 32;
+const NEXT_TRUNK_OFFSET: usize = 40;
 
 /// Byte offset where the PageId array begins.
-pub const FREELIST_DATA_OFFSET: usize = 40;
+pub const FREELIST_DATA_OFFSET: usize = 48;
 
 /// Maximum number of PageId entries that fit in one free list trunk page.
 pub const FREELIST_MAX_ENTRIES: usize = (PAGE_SIZE - FREELIST_DATA_OFFSET) / 8;

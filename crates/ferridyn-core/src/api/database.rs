@@ -13,7 +13,7 @@ use crate::mvcc::ops as mvcc_ops;
 use crate::storage::file::FileManager;
 use crate::storage::header::FileHeader;
 use crate::storage::lock::FileLock;
-use crate::storage::page::write_checksum_buf;
+use crate::storage::page::{compute_checksum_buf, write_checksum_buf};
 use crate::storage::pending_free::PendingFreeList;
 use crate::storage::snapshot::SnapshotTracker;
 use crate::storage::tombstone::TombstoneQueue;
@@ -94,11 +94,19 @@ impl FerridynDB {
             file_manager.write_page(page_id, &buf)?;
         }
 
+        // Compute the Merkle root checksum for the catalog B-tree root page.
+        let catalog_root_checksum = if let Some(data) = store.overlay().get(&catalog_root) {
+            compute_checksum_buf(data)
+        } else {
+            0u128
+        };
+
         // Write header to slot 0.
         let mut header = FileHeader::new();
         header.txn_counter = 1;
         header.catalog_root_page = catalog_root;
         header.total_page_count = new_total;
+        header.catalog_root_checksum = catalog_root_checksum;
 
         let mut header_buf = [0u8; PAGE_SIZE];
         header.write_to_page(&mut header_buf);
@@ -137,6 +145,19 @@ impl FerridynDB {
         let file_lock = FileLock::exclusive(&lock_path)?;
 
         let (file_manager, header, slot) = FileManager::open(path)?;
+
+        // Verify the catalog root page's Merkle checksum against the header.
+        if header.catalog_root_checksum != 0 && header.catalog_root_page != 0 {
+            let buf = file_manager.read_page(header.catalog_root_page)?;
+            let actual = compute_checksum_buf(&buf);
+            if actual != header.catalog_root_checksum {
+                return Err(StorageError::CorruptedPage(format!(
+                    "catalog root checksum mismatch: header={:#034x}, actual={actual:#034x}",
+                    header.catalog_root_checksum,
+                ))
+                .into());
+            }
+        }
 
         // Load persisted pending free list and tombstone queue from the header's chains.
         let (pending_free, tombstone_queue) = {
@@ -601,6 +622,19 @@ impl FerridynDB {
             state.file_manager.write_page(page_id, &buf)?;
         }
 
+        // Compute the Merkle root checksum for the catalog B-tree root page.
+        let catalog_root_checksum = if catalog_root != 0 {
+            if let Some(data) = store.overlay().get(&catalog_root) {
+                compute_checksum_buf(data)
+            } else {
+                // Catalog root not in overlay — read from disk.
+                let buf = state.file_manager.read_page(catalog_root)?;
+                compute_checksum_buf(&buf)
+            }
+        } else {
+            0u128
+        };
+
         // Write new header to alternate slot.
         let new_slot = FileHeader::alternate_slot(state.header_slot);
         state.header.txn_counter = txn_id;
@@ -608,6 +642,7 @@ impl FerridynDB {
         state.header.total_page_count = new_total;
         state.header.pending_free_root_page = pending_free_root;
         state.header.tombstone_root_page = tombstone_root;
+        state.header.catalog_root_checksum = catalog_root_checksum;
 
         let mut header_buf = [0u8; PAGE_SIZE];
         state.header.write_to_page(&mut header_buf);
@@ -1249,6 +1284,61 @@ mod crash_recovery_tests {
                 .unwrap();
             let new_item = db.get_item("data").partition_key("new").execute().unwrap();
             assert!(new_item.is_some());
+        }
+    }
+
+    #[test]
+    fn test_corrupted_catalog_root_detected_on_open() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("merkle_root_test.db");
+
+        // Create a DB with some data so the catalog root is non-trivial.
+        {
+            let db = FerridynDB::create(&db_path).unwrap();
+            db.create_table("items")
+                .partition_key("id", KeyType::String)
+                .execute()
+                .unwrap();
+            db.put_item("items", json!({"id": "k1", "value": "v1"}))
+                .unwrap();
+        }
+
+        // Read the active header to find the catalog root page, then corrupt it.
+        {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&db_path)
+                .unwrap();
+
+            let mut buf_a = [0u8; PAGE_SIZE];
+            let mut buf_b = [0u8; PAGE_SIZE];
+            file.read_exact_at(&mut buf_a, 0).unwrap();
+            file.read_exact_at(&mut buf_b, PAGE_SIZE as u64).unwrap();
+            let (header, _slot) = FileHeader::select_current(&buf_a, &buf_b).unwrap();
+
+            // Corrupt some bytes in the catalog root page's data region.
+            let root_offset = header.catalog_root_page * PAGE_SIZE as u64;
+            let mut root_buf = [0u8; PAGE_SIZE];
+            file.read_exact_at(&mut root_buf, root_offset).unwrap();
+            // Flip bytes in the data region (after page header).
+            for byte in &mut root_buf[100..110] {
+                *byte ^= 0xFF;
+            }
+            file.write_all_at(&root_buf, root_offset).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        // Reopen should fail because the catalog root checksum doesn't match.
+        match FerridynDB::open(&db_path) {
+            Err(e) => {
+                let err_msg = format!("{e}");
+                assert!(
+                    err_msg.contains("checksum mismatch"),
+                    "error should mention checksum mismatch, got: {err_msg}"
+                );
+            }
+            Ok(_) => panic!("open should fail when catalog root page is corrupted"),
         }
     }
 }

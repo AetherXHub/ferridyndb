@@ -1,22 +1,37 @@
 use crate::error::StorageError;
 use crate::types::{PAGE_SIZE, PageId};
+use xxhash_rust::xxh3::xxh3_128;
 use xxhash_rust::xxh64::xxh64;
 
 /// Magic bytes identifying a FerridynDB database file.
 pub const MAGIC: &[u8; 4] = b"DYNA";
 
 /// Current file format version.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 5;
 
 /// Previous file format versions.
 const VERSION_1: u32 = 1;
 const VERSION_2: u32 = 2;
+const VERSION_3: u32 = 3;
+const VERSION_4: u32 = 4;
 
-/// V3 header checksum covers bytes `[0..60]`.
-const CHECKSUM_RANGE_END: usize = 60;
+/// V5 header checksum (XXH3_128) covers bytes `[0..76]`.
+const CHECKSUM_RANGE_END: usize = 76;
 
-/// V3 checksum is stored at bytes `[60..68]`.
-const CHECKSUM_OFFSET: usize = 60;
+/// V5 checksum (16 bytes) is stored at bytes `[76..92]`.
+const CHECKSUM_OFFSET: usize = 76;
+
+/// V4 header checksum (XXH3_128) covers bytes `[0..60]`.
+const V4_CHECKSUM_RANGE_END: usize = 60;
+
+/// V4 checksum (16 bytes) is stored at bytes `[60..76]`.
+const V4_CHECKSUM_OFFSET: usize = 60;
+
+/// V3 header checksum (xxHash64) covers bytes `[0..60]`.
+const V3_CHECKSUM_RANGE_END: usize = 60;
+
+/// V3 checksum (8 bytes) is stored at bytes `[60..68]`.
+const V3_CHECKSUM_OFFSET: usize = 60;
 
 /// V2 header checksum covers bytes `[0..52]`.
 const V2_CHECKSUM_RANGE_END: usize = 52;
@@ -32,10 +47,10 @@ const V1_CHECKSUM_OFFSET: usize = 44;
 
 /// Double-buffered file header for crash-safe metadata updates.
 ///
-/// Header layout v3 (within a 4096-byte page):
+/// Header layout v5 (within a 4096-byte page):
 /// ```text
 /// [0..4]   magic: "DYNA" (4 bytes)
-/// [4..8]   version: u32 (3) little-endian
+/// [4..8]   version: u32 (5) little-endian
 /// [8..12]  page_size: u32 (4096) little-endian
 /// [12..20] txn_counter: u64 little-endian
 /// [20..28] catalog_root_page: u64 little-endian
@@ -43,7 +58,8 @@ const V1_CHECKSUM_OFFSET: usize = 44;
 /// [36..44] total_page_count: u64 little-endian
 /// [44..52] pending_free_root_page: u64 little-endian
 /// [52..60] tombstone_root_page: u64 little-endian
-/// [60..68] xxhash64 checksum (of bytes 0..60) little-endian
+/// [60..76] catalog_root_checksum: u128 little-endian (Merkle root)
+/// [76..92] xxh3_128 checksum (of bytes 0..76) little-endian
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileHeader {
@@ -53,6 +69,9 @@ pub struct FileHeader {
     pub total_page_count: u64,
     pub pending_free_root_page: PageId,
     pub tombstone_root_page: PageId,
+    /// Merkle checksum of the catalog B-tree root page.
+    /// Enables top-down integrity verification from the header.
+    pub catalog_root_checksum: u128,
 }
 
 impl FileHeader {
@@ -66,12 +85,13 @@ impl FileHeader {
             total_page_count: 2,
             pending_free_root_page: 0,
             tombstone_root_page: 0,
+            catalog_root_checksum: 0,
         }
     }
 
     /// Parse a header from a raw page buffer, validating magic, version, and checksum.
     ///
-    /// Supports v1, v2, and v3 headers with backwards compatibility.
+    /// Supports v1, v2, v3, v4, and v5 headers with backwards compatibility.
     pub fn from_page(page_data: &[u8; PAGE_SIZE]) -> Result<Self, StorageError> {
         // Validate magic
         if &page_data[0..4] != MAGIC {
@@ -81,38 +101,92 @@ impl FileHeader {
         // Validate version
         let version = u32::from_le_bytes(page_data[4..8].try_into().unwrap());
 
-        let (checksum_offset, checksum_range_end, pending_free_root_page, tombstone_root_page) =
-            match version {
-                VERSION_1 => {
-                    // V1: checksum at [44..52] covers [0..44].
-                    (V1_CHECKSUM_OFFSET, V1_CHECKSUM_RANGE_END, 0u64, 0u64)
+        let (pending_free_root_page, tombstone_root_page, catalog_root_checksum) = match version {
+            VERSION_1 => {
+                // V1: xxHash64 checksum at [44..52] covers [0..44].
+                let stored = u64::from_le_bytes(
+                    page_data[V1_CHECKSUM_OFFSET..V1_CHECKSUM_OFFSET + 8]
+                        .try_into()
+                        .unwrap(),
+                );
+                let computed = xxh64(&page_data[..V1_CHECKSUM_RANGE_END], 0);
+                if stored != computed {
+                    return Err(StorageError::CorruptedPage(format!(
+                        "header checksum mismatch: stored={stored:#018x}, computed={computed:#018x}"
+                    )));
                 }
-                VERSION_2 => {
-                    // V2: checksum at [52..60] covers [0..52], pending_free_root_page at [44..52].
-                    let pfr = u64::from_le_bytes(page_data[44..52].try_into().unwrap());
-                    (V2_CHECKSUM_OFFSET, V2_CHECKSUM_RANGE_END, pfr, 0u64)
+                (0u64, 0u64, 0u128)
+            }
+            VERSION_2 => {
+                // V2: xxHash64 checksum at [52..60] covers [0..52].
+                let stored = u64::from_le_bytes(
+                    page_data[V2_CHECKSUM_OFFSET..V2_CHECKSUM_OFFSET + 8]
+                        .try_into()
+                        .unwrap(),
+                );
+                let computed = xxh64(&page_data[..V2_CHECKSUM_RANGE_END], 0);
+                if stored != computed {
+                    return Err(StorageError::CorruptedPage(format!(
+                        "header checksum mismatch: stored={stored:#018x}, computed={computed:#018x}"
+                    )));
                 }
-                VERSION => {
-                    // V3: checksum at [60..68] covers [0..60], tombstone_root_page at [52..60].
-                    let pfr = u64::from_le_bytes(page_data[44..52].try_into().unwrap());
-                    let trp = u64::from_le_bytes(page_data[52..60].try_into().unwrap());
-                    (CHECKSUM_OFFSET, CHECKSUM_RANGE_END, pfr, trp)
+                let pfr = u64::from_le_bytes(page_data[44..52].try_into().unwrap());
+                (pfr, 0u64, 0u128)
+            }
+            VERSION_3 => {
+                // V3: xxHash64 checksum at [60..68] covers [0..60].
+                let stored = u64::from_le_bytes(
+                    page_data[V3_CHECKSUM_OFFSET..V3_CHECKSUM_OFFSET + 8]
+                        .try_into()
+                        .unwrap(),
+                );
+                let computed = xxh64(&page_data[..V3_CHECKSUM_RANGE_END], 0);
+                if stored != computed {
+                    return Err(StorageError::CorruptedPage(format!(
+                        "header checksum mismatch: stored={stored:#018x}, computed={computed:#018x}"
+                    )));
                 }
-                other => return Err(StorageError::UnsupportedVersion(other)),
-            };
-
-        // Validate checksum
-        let stored_checksum = u64::from_le_bytes(
-            page_data[checksum_offset..checksum_offset + 8]
-                .try_into()
-                .unwrap(),
-        );
-        let computed_checksum = xxh64(&page_data[..checksum_range_end], 0);
-        if stored_checksum != computed_checksum {
-            return Err(StorageError::CorruptedPage(format!(
-                "header checksum mismatch: stored={stored_checksum:#018x}, computed={computed_checksum:#018x}"
-            )));
-        }
+                let pfr = u64::from_le_bytes(page_data[44..52].try_into().unwrap());
+                let trp = u64::from_le_bytes(page_data[52..60].try_into().unwrap());
+                (pfr, trp, 0u128)
+            }
+            VERSION_4 => {
+                // V4: XXH3_128 checksum at [60..76] covers [0..60].
+                let stored = u128::from_le_bytes(
+                    page_data[V4_CHECKSUM_OFFSET..V4_CHECKSUM_OFFSET + 16]
+                        .try_into()
+                        .unwrap(),
+                );
+                let computed = xxh3_128(&page_data[..V4_CHECKSUM_RANGE_END]);
+                if stored != computed {
+                    return Err(StorageError::CorruptedPage(format!(
+                        "header checksum mismatch: stored={stored:#034x}, computed={computed:#034x}"
+                    )));
+                }
+                let pfr = u64::from_le_bytes(page_data[44..52].try_into().unwrap());
+                let trp = u64::from_le_bytes(page_data[52..60].try_into().unwrap());
+                (pfr, trp, 0u128)
+            }
+            VERSION => {
+                // V5: XXH3_128 checksum at [76..92] covers [0..76].
+                let stored = u128::from_le_bytes(
+                    page_data[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 16]
+                        .try_into()
+                        .unwrap(),
+                );
+                let computed = xxh3_128(&page_data[..CHECKSUM_RANGE_END]);
+                if stored != computed {
+                    return Err(StorageError::CorruptedPage(format!(
+                        "header checksum mismatch: stored={stored:#034x}, computed={computed:#034x}"
+                    )));
+                }
+                let pfr = u64::from_le_bytes(page_data[44..52].try_into().unwrap());
+                let trp = u64::from_le_bytes(page_data[52..60].try_into().unwrap());
+                let crc = u128::from_le_bytes(page_data[60..76].try_into().unwrap());
+                (pfr, trp, crc)
+            }
+            other => return Err(StorageError::UnsupportedVersion(other)),
+        };
 
         let txn_counter = u64::from_le_bytes(page_data[12..20].try_into().unwrap());
         let catalog_root_page = u64::from_le_bytes(page_data[20..28].try_into().unwrap());
@@ -126,17 +200,18 @@ impl FileHeader {
             total_page_count,
             pending_free_root_page,
             tombstone_root_page,
+            catalog_root_checksum,
         })
     }
 
     /// Serialize this header into a page buffer, including magic, version, page_size,
-    /// and the trailing checksum.
+    /// and the trailing XXH3_128 checksum.
     pub fn write_to_page(&self, buf: &mut [u8; PAGE_SIZE]) {
         buf.fill(0);
 
         // magic
         buf[0..4].copy_from_slice(MAGIC);
-        // version (always writes v3)
+        // version (always writes v5)
         buf[4..8].copy_from_slice(&VERSION.to_le_bytes());
         // page_size
         buf[8..12].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
@@ -152,9 +227,11 @@ impl FileHeader {
         buf[44..52].copy_from_slice(&self.pending_free_root_page.to_le_bytes());
         // tombstone_root_page
         buf[52..60].copy_from_slice(&self.tombstone_root_page.to_le_bytes());
-        // checksum of [0..60]
-        let checksum = xxh64(&buf[..CHECKSUM_RANGE_END], 0);
-        buf[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 8].copy_from_slice(&checksum.to_le_bytes());
+        // catalog_root_checksum (Merkle root)
+        buf[60..76].copy_from_slice(&self.catalog_root_checksum.to_le_bytes());
+        // XXH3_128 checksum of [0..76]
+        let checksum = xxh3_128(&buf[..CHECKSUM_RANGE_END]);
+        buf[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 16].copy_from_slice(&checksum.to_le_bytes());
     }
 
     /// Given two header page buffers, return the valid one with the higher
@@ -211,6 +288,7 @@ mod tests {
             total_page_count: 100,
             pending_free_root_page: 7,
             tombstone_root_page: 3,
+            catalog_root_checksum: 0xDEAD_BEEF_CAFE_BABE_1234_5678_9ABC_DEF0,
         };
 
         let mut buf = [0u8; PAGE_SIZE];
@@ -299,8 +377,8 @@ mod tests {
         // Set version to 99
         buf[4..8].copy_from_slice(&99u32.to_le_bytes());
         // Re-compute checksum so we actually hit the version check, not the checksum check
-        let checksum = xxh64(&buf[..CHECKSUM_RANGE_END], 0);
-        buf[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 8].copy_from_slice(&checksum.to_le_bytes());
+        let checksum = xxh3_128(&buf[..CHECKSUM_RANGE_END]);
+        buf[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 16].copy_from_slice(&checksum.to_le_bytes());
 
         match FileHeader::from_page(&buf) {
             Err(StorageError::UnsupportedVersion(99)) => {}
@@ -317,11 +395,12 @@ mod tests {
         assert_eq!(header.total_page_count, 2);
         assert_eq!(header.pending_free_root_page, 0);
         assert_eq!(header.tombstone_root_page, 0);
+        assert_eq!(header.catalog_root_checksum, 0);
     }
 
     #[test]
     fn test_v1_header_compat() {
-        // Build a v1 header by hand: checksum at [44..52] covers [0..44].
+        // Build a v1 header by hand: xxHash64 checksum at [44..52] covers [0..44].
         let mut buf = [0u8; PAGE_SIZE];
         buf[0..4].copy_from_slice(MAGIC);
         buf[4..8].copy_from_slice(&1u32.to_le_bytes()); // version 1
@@ -344,7 +423,7 @@ mod tests {
 
     #[test]
     fn test_v2_header_compat() {
-        // Build a v2 header by hand: checksum at [52..60] covers [0..52].
+        // Build a v2 header by hand: xxHash64 checksum at [52..60] covers [0..52].
         let mut buf = [0u8; PAGE_SIZE];
         buf[0..4].copy_from_slice(MAGIC);
         buf[4..8].copy_from_slice(&2u32.to_le_bytes()); // version 2
@@ -364,5 +443,57 @@ mod tests {
         assert_eq!(header.total_page_count, 10);
         assert_eq!(header.pending_free_root_page, 5);
         assert_eq!(header.tombstone_root_page, 0);
+    }
+
+    #[test]
+    fn test_v3_header_compat() {
+        // Build a v3 header by hand: xxHash64 checksum at [60..68] covers [0..60].
+        let mut buf = [0u8; PAGE_SIZE];
+        buf[0..4].copy_from_slice(MAGIC);
+        buf[4..8].copy_from_slice(&3u32.to_le_bytes()); // version 3
+        buf[8..12].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
+        buf[12..20].copy_from_slice(&7u64.to_le_bytes()); // txn_counter = 7
+        buf[20..28].copy_from_slice(&3u64.to_le_bytes()); // catalog_root = 3
+        buf[28..36].copy_from_slice(&0u64.to_le_bytes()); // free_list = 0
+        buf[36..44].copy_from_slice(&10u64.to_le_bytes()); // total_pages = 10
+        buf[44..52].copy_from_slice(&5u64.to_le_bytes()); // pending_free = 5
+        buf[52..60].copy_from_slice(&8u64.to_le_bytes()); // tombstone = 8
+
+        let checksum = xxh64(&buf[..V3_CHECKSUM_RANGE_END], 0);
+        buf[V3_CHECKSUM_OFFSET..V3_CHECKSUM_OFFSET + 8].copy_from_slice(&checksum.to_le_bytes());
+
+        let header = FileHeader::from_page(&buf).unwrap();
+        assert_eq!(header.txn_counter, 7);
+        assert_eq!(header.catalog_root_page, 3);
+        assert_eq!(header.total_page_count, 10);
+        assert_eq!(header.pending_free_root_page, 5);
+        assert_eq!(header.tombstone_root_page, 8);
+        assert_eq!(header.catalog_root_checksum, 0);
+    }
+
+    #[test]
+    fn test_v4_header_compat() {
+        // Build a v4 header by hand: XXH3_128 checksum at [60..76] covers [0..60].
+        let mut buf = [0u8; PAGE_SIZE];
+        buf[0..4].copy_from_slice(MAGIC);
+        buf[4..8].copy_from_slice(&4u32.to_le_bytes()); // version 4
+        buf[8..12].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
+        buf[12..20].copy_from_slice(&7u64.to_le_bytes()); // txn_counter = 7
+        buf[20..28].copy_from_slice(&3u64.to_le_bytes()); // catalog_root = 3
+        buf[28..36].copy_from_slice(&0u64.to_le_bytes()); // free_list = 0
+        buf[36..44].copy_from_slice(&10u64.to_le_bytes()); // total_pages = 10
+        buf[44..52].copy_from_slice(&5u64.to_le_bytes()); // pending_free = 5
+        buf[52..60].copy_from_slice(&8u64.to_le_bytes()); // tombstone = 8
+
+        let checksum = xxh3_128(&buf[..V4_CHECKSUM_RANGE_END]);
+        buf[V4_CHECKSUM_OFFSET..V4_CHECKSUM_OFFSET + 16].copy_from_slice(&checksum.to_le_bytes());
+
+        let header = FileHeader::from_page(&buf).unwrap();
+        assert_eq!(header.txn_counter, 7);
+        assert_eq!(header.catalog_root_page, 3);
+        assert_eq!(header.total_page_count, 10);
+        assert_eq!(header.pending_free_root_page, 5);
+        assert_eq!(header.tombstone_root_page, 8);
+        assert_eq!(header.catalog_root_checksum, 0);
     }
 }

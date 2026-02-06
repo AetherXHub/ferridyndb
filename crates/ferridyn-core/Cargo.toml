@@ -10,7 +10,7 @@ fs2 = "0.4"
 parking_lot = "0.12"
 thiserror = "2"
 bytes = "1"
-xxhash-rust = { version = "0.8", features = ["xxh64"] }
+xxhash-rust = { version = "0.8", features = ["xxh64", "xxh3"] }
 rmp-serde = "1"
 
 [dev-dependencies]

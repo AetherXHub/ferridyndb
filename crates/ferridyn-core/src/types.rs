@@ -12,7 +12,17 @@ pub type TxnId = u64;
 pub const PAGE_SIZE: usize = 4096;
 
 /// Size of the common page header in bytes.
-pub const PAGE_HEADER_SIZE: usize = 32;
+///
+/// Layout (v4+):
+/// ```text
+/// [0..4]   page_type: u32 LE
+/// [4..12]  page_id: u64 LE
+/// [12..28] xxh3_128 checksum (16 bytes)
+/// [28..32] entry_count: u32 LE
+/// [32..36] free_space_offset: u32 LE
+/// [36..40] reserved: u32
+/// ```
+pub const PAGE_HEADER_SIZE: usize = 40;
 
 /// Maximum document size in bytes (400KB, matching DynamoDB).
 pub const MAX_DOCUMENT_SIZE: usize = 400 * 1024;
