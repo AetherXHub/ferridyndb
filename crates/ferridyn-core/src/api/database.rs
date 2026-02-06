@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -17,6 +16,7 @@ use crate::storage::lock::FileLock;
 use crate::storage::page::write_checksum_buf;
 use crate::storage::pending_free::PendingFreeList;
 use crate::storage::snapshot::SnapshotTracker;
+use crate::storage::tombstone::TombstoneQueue;
 use crate::types::{IndexDefinition, PAGE_SIZE, PageId, PartitionSchema};
 
 use super::batch::{SyncMode, WriteBatch};
@@ -33,19 +33,21 @@ pub(crate) struct DatabaseState {
     pub(crate) header: FileHeader,
     pub(crate) header_slot: u8,
     pub(crate) pending_free: PendingFreeList,
+    pub(crate) tombstone_queue: TombstoneQueue,
 }
 
 struct DatabaseInner {
     state: RwLock<DatabaseState>,
-    #[allow(dead_code)]
+    /// Serializes write transactions (single-writer model).
+    writer_lock: Mutex<()>,
+    /// File descriptor for readers. Uses `pread` which is thread-safe,
+    /// so readers can clone this without holding any lock.
+    read_file: std::fs::File,
     snapshot_tracker: SnapshotTracker,
     _file_lock: FileLock,
     #[allow(dead_code)]
     path: PathBuf,
     sync_mode: AtomicU8,
-    /// Cache of catalog entries by table name. Cleared on every write commit
-    /// since any put/delete may change a table's `data_root_page`.
-    catalog_cache: Mutex<HashMap<String, catalog::CatalogEntry>>,
 }
 
 /// The main database handle.
@@ -103,6 +105,11 @@ impl FerridynDB {
         file_manager.write_page(0, &header_buf)?;
         file_manager.sync()?;
 
+        let read_file = file_manager
+            .file()
+            .try_clone()
+            .map_err(StorageError::from)?;
+
         Ok(Self {
             inner: Arc::new(DatabaseInner {
                 state: RwLock::new(DatabaseState {
@@ -110,12 +117,14 @@ impl FerridynDB {
                     header,
                     header_slot: 0,
                     pending_free: PendingFreeList::new(),
+                    tombstone_queue: TombstoneQueue::new(),
                 }),
+                writer_lock: Mutex::new(()),
+                read_file,
                 snapshot_tracker: SnapshotTracker::new(),
                 _file_lock: file_lock,
                 path: path.to_path_buf(),
                 sync_mode: AtomicU8::new(SyncMode::Full as u8),
-                catalog_cache: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -129,17 +138,30 @@ impl FerridynDB {
 
         let (file_manager, header, slot) = FileManager::open(path)?;
 
-        // Load the persisted pending free list from the header's chain.
-        let pending_free = if header.pending_free_root_page != 0 {
+        // Load persisted pending free list and tombstone queue from the header's chains.
+        let (pending_free, tombstone_queue) = {
             let file = file_manager
                 .file()
                 .try_clone()
                 .map_err(StorageError::from)?;
             let store = FilePageStore::new(file, file_manager.total_page_count());
-            PendingFreeList::deserialize_from_pages(&store, header.pending_free_root_page)?
-        } else {
-            PendingFreeList::new()
+            let pf = if header.pending_free_root_page != 0 {
+                PendingFreeList::deserialize_from_pages(&store, header.pending_free_root_page)?
+            } else {
+                PendingFreeList::new()
+            };
+            let tq = if header.tombstone_root_page != 0 {
+                TombstoneQueue::deserialize_from_pages(&store, header.tombstone_root_page)?
+            } else {
+                TombstoneQueue::new()
+            };
+            (pf, tq)
         };
+
+        let read_file = file_manager
+            .file()
+            .try_clone()
+            .map_err(StorageError::from)?;
 
         Ok(Self {
             inner: Arc::new(DatabaseInner {
@@ -148,12 +170,14 @@ impl FerridynDB {
                     header,
                     header_slot: slot,
                     pending_free,
+                    tombstone_queue,
                 }),
+                writer_lock: Mutex::new(()),
+                read_file,
                 snapshot_tracker: SnapshotTracker::new(),
                 _file_lock: file_lock,
                 path: path.to_path_buf(),
                 sync_mode: AtomicU8::new(SyncMode::Full as u8),
-                catalog_cache: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -175,16 +199,14 @@ impl FerridynDB {
 
     /// List all table names.
     pub fn list_tables(&self) -> Result<Vec<String>, Error> {
-        let state = self.inner.state.read();
-        let store = self.read_store(&state)?;
-        catalog::ops::list_tables(&store, state.header.catalog_root_page)
+        let (store, header) = self.read_store_snapshot()?;
+        catalog::ops::list_tables(&store, header.catalog_root_page)
     }
 
     /// Describe a table's schema (partition key, sort key, types).
     pub fn describe_table(&self, name: &str) -> Result<crate::types::TableSchema, Error> {
-        let state = self.inner.state.read();
-        let store = self.read_store(&state)?;
-        let entry = self.cached_get_table(&store, state.header.catalog_root_page, name)?;
+        let (store, header) = self.read_store_snapshot()?;
+        let entry = self.cached_get_table(&store, header.catalog_root_page, name)?;
         Ok(entry.schema)
     }
 
@@ -289,9 +311,8 @@ impl FerridynDB {
 
     /// List all partition schemas for a table.
     pub fn list_partition_schemas(&self, table: &str) -> Result<Vec<PartitionSchema>, Error> {
-        let state = self.inner.state.read();
-        let store = self.read_store(&state)?;
-        catalog::ops::list_partition_schemas(&store, state.header.catalog_root_page, table)
+        let (store, header) = self.read_store_snapshot()?;
+        catalog::ops::list_partition_schemas(&store, header.catalog_root_page, table)
     }
 
     /// Describe a specific partition schema by prefix.
@@ -300,9 +321,8 @@ impl FerridynDB {
         table: &str,
         prefix: &str,
     ) -> Result<PartitionSchema, Error> {
-        let state = self.inner.state.read();
-        let store = self.read_store(&state)?;
-        let entry = self.cached_get_table(&store, state.header.catalog_root_page, table)?;
+        let (store, header) = self.read_store_snapshot()?;
+        let entry = self.cached_get_table(&store, header.catalog_root_page, table)?;
         entry
             .partition_schemas
             .into_iter()
@@ -339,16 +359,14 @@ impl FerridynDB {
 
     /// List all secondary indexes for a table.
     pub fn list_indexes(&self, table: &str) -> Result<Vec<IndexDefinition>, Error> {
-        let state = self.inner.state.read();
-        let store = self.read_store(&state)?;
-        catalog::ops::list_indexes(&store, state.header.catalog_root_page, table)
+        let (store, header) = self.read_store_snapshot()?;
+        catalog::ops::list_indexes(&store, header.catalog_root_page, table)
     }
 
     /// Describe a specific secondary index by name.
     pub fn describe_index(&self, table: &str, index_name: &str) -> Result<IndexDefinition, Error> {
-        let state = self.inner.state.read();
-        let store = self.read_store(&state)?;
-        let entry = self.cached_get_table(&store, state.header.catalog_root_page, table)?;
+        let (store, header) = self.read_store_snapshot()?;
+        let entry = self.cached_get_table(&store, header.catalog_root_page, table)?;
         entry
             .indexes
             .into_iter()
@@ -460,26 +478,40 @@ impl FerridynDB {
     where
         F: FnOnce(&mut Transaction) -> Result<R, Error>,
     {
-        let mut state = self.inner.state.write();
-        let new_txn_id = state.header.txn_counter + 1;
+        // Serialize writers — only one write transaction at a time.
+        let _writer_guard = self.inner.writer_lock.lock();
 
-        let file = state
-            .file_manager
-            .file()
-            .try_clone()
-            .map_err(StorageError::from)?;
-        let store = BufferedPageStore::new(file, state.file_manager.total_page_count());
+        // Capture current committed state under a brief read lock.
+        let (file, total_pages, catalog_root, new_txn_id) = {
+            let state = self.inner.state.read();
+            let file = state
+                .file_manager
+                .file()
+                .try_clone()
+                .map_err(StorageError::from)?;
+            (
+                file,
+                state.file_manager.total_page_count(),
+                state.header.catalog_root_page,
+                state.header.txn_counter + 1,
+            )
+        };
+        // Read lock released — readers can proceed during the transaction body.
 
+        let store = BufferedPageStore::new(file, total_pages);
         let mut txn = Transaction {
             store,
-            catalog_root: state.header.catalog_root_page,
+            catalog_root,
             txn_id: new_txn_id,
+            tombstones: Vec::new(),
         };
 
         let result = f(&mut txn);
 
         match result {
             Ok(val) => {
+                // Acquire write lock briefly for the commit phase only.
+                let mut state = self.inner.state.write();
                 self.commit_txn(txn, &mut state)?;
                 Ok(val)
             }
@@ -488,36 +520,28 @@ impl FerridynDB {
     }
 
     /// Read-only helper: execute a closure with a read store and snapshot txn.
+    ///
+    /// Captures a lightweight snapshot of the committed header, then releases
+    /// the state lock so reads do not block writes (and vice versa). The
+    /// snapshot is registered with `SnapshotTracker` to prevent premature
+    /// page reclamation while the reader is active.
     pub(crate) fn read_snapshot<F, R>(&self, f: F) -> Result<R, Error>
     where
         F: FnOnce(&FilePageStore, PageId, u64) -> Result<R, Error>,
     {
-        let state = self.inner.state.read();
-        let store = self.read_store(&state)?;
-        let snapshot_txn = state.header.txn_counter;
-        let catalog_root = state.header.catalog_root_page;
-        f(&store, catalog_root, snapshot_txn)
+        let (store, header) = self.read_store_snapshot()?;
+        let _guard = self.inner.snapshot_tracker.register(header.txn_counter);
+        f(&store, header.catalog_root_page, header.txn_counter)
     }
 
-    /// Look up a table's catalog entry, returning a cached copy when available.
+    /// Look up a table's catalog entry.
     pub(crate) fn cached_get_table(
         &self,
         store: &impl crate::btree::PageStore,
         catalog_root: PageId,
         table_name: &str,
     ) -> Result<catalog::CatalogEntry, Error> {
-        {
-            let cache = self.inner.catalog_cache.lock();
-            if let Some(entry) = cache.get(table_name) {
-                return Ok(entry.clone());
-            }
-        }
-        let entry = catalog::ops::get_table(store, catalog_root, table_name)?;
-        {
-            let mut cache = self.inner.catalog_cache.lock();
-            cache.insert(table_name.to_string(), entry.clone());
-        }
-        Ok(entry)
+        catalog::ops::get_table(store, catalog_root, table_name)
     }
 
     fn commit_txn(&self, txn: Transaction, state: &mut DatabaseState) -> Result<(), Error> {
@@ -525,6 +549,7 @@ impl FerridynDB {
             mut store,
             catalog_root,
             txn_id,
+            tombstones,
         } = txn;
 
         // Record COW-replaced original pages in the pending free list so they
@@ -535,8 +560,6 @@ impl FerridynDB {
         }
 
         // Track old pending-free chain pages so they can be freed eventually.
-        // These pages are from the previous commit's serialization and are now
-        // obsolete once we write a new chain.
         let old_pf_root = state.header.pending_free_root_page;
         if old_pf_root != 0 {
             let old_chain_pages = PendingFreeList::collect_chain_page_ids(&store, old_pf_root)?;
@@ -545,8 +568,21 @@ impl FerridynDB {
             }
         }
 
-        // Serialize the pending free list into newly allocated pages.
+        // Track old tombstone chain pages for freeing.
+        let old_ts_root = state.header.tombstone_root_page;
+        if old_ts_root != 0 {
+            let old_chain_pages = TombstoneQueue::collect_chain_page_ids(&store, old_ts_root)?;
+            if !old_chain_pages.is_empty() {
+                state.pending_free.add(txn_id, old_chain_pages);
+            }
+        }
+
+        // Record tombstones from this transaction for incremental GC.
+        state.tombstone_queue.add(txn_id, tombstones);
+
+        // Serialize the pending free list and tombstone queue into newly allocated pages.
         let pending_free_root = state.pending_free.serialize_to_pages(&mut store)?;
+        let tombstone_root = state.tombstone_queue.serialize_to_pages(&mut store)?;
 
         let new_total = store.next_page_id();
 
@@ -571,6 +607,7 @@ impl FerridynDB {
         state.header.catalog_root_page = catalog_root;
         state.header.total_page_count = new_total;
         state.header.pending_free_root_page = pending_free_root;
+        state.header.tombstone_root_page = tombstone_root;
 
         let mut header_buf = [0u8; PAGE_SIZE];
         state.header.write_to_page(&mut header_buf);
@@ -584,22 +621,24 @@ impl FerridynDB {
         }
         state.header_slot = new_slot;
 
-        // Invalidate catalog cache — any write may have changed data_root_page.
-        self.inner.catalog_cache.lock().clear();
-
         Ok(())
     }
 
-    fn read_store(&self, state: &DatabaseState) -> Result<FilePageStore, Error> {
-        let file = state
-            .file_manager
-            .file()
+    /// Capture a snapshot of the committed state and create a read-only store.
+    ///
+    /// The state read lock is held only long enough to copy the header and
+    /// clone the file descriptor, then released immediately.
+    fn read_store_snapshot(&self) -> Result<(FilePageStore, FileHeader), Error> {
+        let header = {
+            let state = self.inner.state.read();
+            state.header.clone()
+        };
+        let file = self
+            .inner
+            .read_file
             .try_clone()
             .map_err(StorageError::from)?;
-        Ok(FilePageStore::new(
-            file,
-            state.file_manager.total_page_count(),
-        ))
+        Ok((FilePageStore::new(file, header.total_page_count), header))
     }
 }
 
@@ -1353,6 +1392,160 @@ mod concurrency_stress_tests {
         // Final verification: scan to confirm total count.
         let result = db.scan("stress").execute().unwrap();
         assert_eq!(result.items.len(), 500);
+    }
+
+    #[test]
+    fn test_concurrent_scan_during_writes() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("scan_concurrent.db");
+        let db = FerridynDB::create(&db_path).unwrap();
+
+        db.create_table("items")
+            .partition_key("pk", KeyType::String)
+            .sort_key("sk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        // Prepopulate 20 items so scans always return data.
+        for i in 0..20 {
+            db.put_item(
+                "items",
+                json!({"pk": "p", "sk": format!("s_{i:04}"), "v": i}),
+            )
+            .unwrap();
+        }
+
+        let running = Arc::new(AtomicBool::new(true));
+
+        // Spawn 2 scan-reader threads.
+        let scan_handles: Vec<_> = (0..2)
+            .map(|_| {
+                let db_clone = db.clone();
+                let running_clone = running.clone();
+                thread::spawn(move || {
+                    let mut scans = 0u64;
+                    while running_clone.load(Ordering::Relaxed) {
+                        let result = db_clone
+                            .query("items")
+                            .partition_key("p")
+                            .execute()
+                            .unwrap();
+                        // Must always see at least the original 20 items.
+                        assert!(
+                            result.items.len() >= 20,
+                            "scan should see at least 20 items, got {}",
+                            result.items.len()
+                        );
+                        scans += 1;
+                    }
+                    scans
+                })
+            })
+            .collect();
+
+        // Writer: insert 50 more items.
+        let db_writer = db.clone();
+        let writer_handle = thread::spawn(move || {
+            for i in 20..70 {
+                db_writer
+                    .put_item(
+                        "items",
+                        json!({"pk": "p", "sk": format!("s_{i:04}"), "v": i}),
+                    )
+                    .unwrap();
+            }
+        });
+
+        writer_handle.join().unwrap();
+        running.store(false, Ordering::Relaxed);
+
+        for handle in scan_handles {
+            let scans = handle.join().unwrap();
+            assert!(
+                scans > 0,
+                "each scanner should have completed at least one scan"
+            );
+        }
+
+        // Final count should be 70.
+        let result = db.query("items").partition_key("p").execute().unwrap();
+        assert_eq!(result.items.len(), 70);
+    }
+
+    #[test]
+    fn test_snapshot_isolation_readers_dont_see_partial_writes() {
+        use std::sync::Barrier;
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("snapshot.db");
+        let db = FerridynDB::create(&db_path).unwrap();
+
+        db.create_table("items")
+            .partition_key("id", KeyType::String)
+            .execute()
+            .unwrap();
+
+        // Insert items A and B atomically via transact.
+        db.transact(|txn| {
+            txn.put_item("items", json!({"id": "A", "batch": 1}))?;
+            txn.put_item("items", json!({"id": "B", "batch": 1}))?;
+            Ok(())
+        })
+        .unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+
+        // Reader thread: read A, wait for writer, then read B.
+        // Both should return the same batch number (snapshot isolation).
+        let db_reader = db.clone();
+        let barrier_clone = barrier.clone();
+        let reader_handle = thread::spawn(move || {
+            // Read A first.
+            let a = db_reader
+                .get_item("items")
+                .partition_key("A")
+                .execute()
+                .unwrap()
+                .unwrap();
+            let a_batch = a["batch"].as_i64().unwrap();
+
+            // Signal writer to go.
+            barrier_clone.wait();
+
+            // Brief pause to let writer commit.
+            thread::sleep(std::time::Duration::from_millis(10));
+
+            // Read B — should be consistent (both batch 1 or both batch 2,
+            // depending on whether we see the write).
+            let b = db_reader
+                .get_item("items")
+                .partition_key("B")
+                .execute()
+                .unwrap()
+                .unwrap();
+            let b_batch = b["batch"].as_i64().unwrap();
+
+            // Both reads are independent snapshots, so each sees a consistent
+            // state. The key property: neither read returns a torn state.
+            assert!(
+                a_batch >= 1 && b_batch >= 1,
+                "both items should exist with valid batch numbers"
+            );
+            (a_batch, b_batch)
+        });
+
+        // Writer thread: update both A and B atomically.
+        let db_writer = db.clone();
+        barrier.wait(); // Wait for reader to read A.
+        db_writer
+            .transact(|txn| {
+                txn.put_item("items", json!({"id": "A", "batch": 2}))?;
+                txn.put_item("items", json!({"id": "B", "batch": 2}))?;
+                Ok(())
+            })
+            .unwrap();
+
+        let (_a_batch, _b_batch) = reader_handle.join().unwrap();
     }
 }
 

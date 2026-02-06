@@ -8,3 +8,4 @@ pub mod page;
 pub mod pending_free;
 pub mod slotted;
 pub mod snapshot;
+pub mod tombstone;

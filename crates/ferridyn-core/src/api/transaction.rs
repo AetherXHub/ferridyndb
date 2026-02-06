@@ -4,6 +4,7 @@ use crate::catalog;
 use crate::encoding::composite;
 use crate::error::{Error, QueryError, SchemaError, StorageError};
 use crate::mvcc::ops as mvcc_ops;
+use crate::storage::tombstone::TombstoneEntry;
 use crate::types::{PageId, TxnId, VersionedItem};
 
 use super::key_utils;
@@ -127,6 +128,8 @@ pub struct Transaction {
     pub(crate) store: BufferedPageStore,
     pub(crate) catalog_root: PageId,
     pub(crate) txn_id: TxnId,
+    /// Keys deleted during this transaction (for incremental GC).
+    pub(crate) tombstones: Vec<TombstoneEntry>,
 }
 
 impl Transaction {
@@ -443,6 +446,12 @@ impl Transaction {
             &composite_key,
             self.txn_id,
         )?;
+
+        // Record tombstone for incremental GC.
+        self.tombstones.push(TombstoneEntry {
+            table: table.to_string(),
+            key: composite_key.clone(),
+        });
 
         let mut updated = entry.clone();
         updated.data_root_page = new_data_root;

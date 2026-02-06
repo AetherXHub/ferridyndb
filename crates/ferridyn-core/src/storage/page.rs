@@ -15,6 +15,7 @@ pub enum PageType {
     Overflow = 3,
     FreeList = 4,
     PendingFree = 5,
+    Tombstone = 6,
 }
 
 impl PageType {
@@ -27,6 +28,7 @@ impl PageType {
             3 => Ok(PageType::Overflow),
             4 => Ok(PageType::FreeList),
             5 => Ok(PageType::PendingFree),
+            6 => Ok(PageType::Tombstone),
             other => Err(StorageError::CorruptedPage(format!(
                 "invalid page type discriminant: {other}"
             ))),

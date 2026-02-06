@@ -125,6 +125,93 @@ pub fn gc_versions(
     Ok((current_root, freed_count))
 }
 
+/// Run incremental garbage collection using tombstone entries.
+///
+/// Instead of scanning the full B-tree, processes only the keys listed in
+/// `tombstones`. Each tombstone identifies a key that was deleted and may
+/// be eligible for cleanup.
+///
+/// Returns `(new_data_root, number_of_cleanups)`.
+pub fn gc_versions_incremental(
+    store: &mut impl PageStore,
+    data_root: PageId,
+    oldest_snapshot: Option<TxnId>,
+    tombstones: &[(TxnId, &[u8])],
+) -> Result<(PageId, usize), StorageError> {
+    let mut current_root = data_root;
+    let mut freed_count = 0usize;
+
+    for &(deleted_txn, key) in tombstones {
+        if freed_count >= GC_BATCH_LIMIT {
+            break;
+        }
+
+        // Check if this tombstone is reclaimable.
+        let can_reclaim = if let Some(oldest) = oldest_snapshot {
+            deleted_txn <= oldest
+        } else {
+            true
+        };
+        if !can_reclaim {
+            continue;
+        }
+
+        // Look up the key in the data tree.
+        let current_value = btree_ops::search(store, current_root, key)?;
+        let Some(current_bytes) = current_value else {
+            // Already removed by a previous GC pass.
+            continue;
+        };
+
+        let mut doc = VersionedDocument::deserialize(&current_bytes)?;
+
+        // Free old version chains if present.
+        if doc.prev_version_page != 0 {
+            let prev_bytes = version_chain::read_version_chain(
+                store,
+                doc.prev_version_page,
+                doc.prev_version_len,
+            )?;
+            let prev_doc = VersionedDocument::deserialize(&prev_bytes)?;
+
+            let can_free = if let Some(oldest) = oldest_snapshot {
+                prev_doc.deleted_txn.is_some_and(|d| d <= oldest)
+            } else {
+                true
+            };
+
+            if can_free {
+                if prev_doc.prev_version_page != 0 {
+                    free_chain_recursive(store, &prev_doc)?;
+                }
+                version_chain::free_version_chain(store, doc.prev_version_page)?;
+                doc.prev_version_page = 0;
+                doc.prev_version_len = 0;
+
+                let serialized = doc.serialize();
+                current_root = btree_ops::insert(store, current_root, key, &serialized)?;
+                freed_count += 1;
+
+                // Re-read after modification.
+                let updated = btree_ops::search(store, current_root, key)?;
+                if let Some(updated_bytes) = updated {
+                    doc = VersionedDocument::deserialize(&updated_bytes)?;
+                } else {
+                    continue;
+                }
+            }
+        }
+
+        // Remove fully dead entries from the B+Tree.
+        if doc.deleted_txn.is_some() && doc.prev_version_page == 0 {
+            current_root = btree_ops::delete(store, current_root, key)?;
+            freed_count += 1;
+        }
+    }
+
+    Ok((current_root, freed_count))
+}
+
 /// Recursively free version chains from a previous document.
 fn free_chain_recursive(
     store: &mut impl PageStore,
@@ -248,5 +335,70 @@ mod tests {
         let (_new_root, count) = gc_versions(&mut store, root, None).unwrap();
         assert!(count <= 100, "GC should process at most 100, got {count}");
         assert!(count > 0, "GC should process at least some entries");
+    }
+
+    #[test]
+    fn test_incremental_gc_removes_dead_entry() {
+        let (mut store, mut root) = setup();
+
+        // Put at txn 1, delete at txn 5.
+        root = mvcc_put(&mut store, root, b"key1", b"value1", 1).unwrap();
+        root = mvcc_put(&mut store, root, b"key2", b"value2", 1).unwrap();
+        root = crate::mvcc::ops::mvcc_delete(&mut store, root, b"key1", 5).unwrap();
+
+        // Incremental GC with tombstone for key1 only.
+        let tombstones: Vec<(u64, &[u8])> = vec![(5, b"key1")];
+        let (new_root, count) =
+            gc_versions_incremental(&mut store, root, None, &tombstones).unwrap();
+        assert!(count > 0);
+        root = new_root;
+
+        // key1 should be fully removed.
+        let raw = crate::btree::ops::search(&store, root, b"key1").unwrap();
+        assert!(raw.is_none());
+
+        // key2 should still exist.
+        let val = mvcc_get(&store, root, b"key2", 5).unwrap();
+        assert_eq!(val, Some(b"value2".to_vec()));
+    }
+
+    #[test]
+    fn test_incremental_gc_respects_snapshot() {
+        let (mut store, mut root) = setup();
+
+        root = mvcc_put(&mut store, root, b"key", b"value", 1).unwrap();
+        root = crate::mvcc::ops::mvcc_delete(&mut store, root, b"key", 5).unwrap();
+
+        // Oldest snapshot is 3 — deletion at txn 5 is NOT reclaimable.
+        let tombstones: Vec<(u64, &[u8])> = vec![(5, b"key")];
+        let (new_root, count) =
+            gc_versions_incremental(&mut store, root, Some(3), &tombstones).unwrap();
+        assert_eq!(count, 0);
+        root = new_root;
+
+        // Key should still exist (visible to snapshot 3).
+        let val = mvcc_get(&store, root, b"key", 3).unwrap();
+        assert_eq!(val, Some(b"value".to_vec()));
+    }
+
+    #[test]
+    fn test_incremental_gc_frees_version_chain() {
+        let (mut store, mut root) = setup();
+
+        // Put at txn 1, overwrite at txn 5, delete at txn 10.
+        root = mvcc_put(&mut store, root, b"key", b"v1", 1).unwrap();
+        root = mvcc_put(&mut store, root, b"key", b"v2", 5).unwrap();
+        root = crate::mvcc::ops::mvcc_delete(&mut store, root, b"key", 10).unwrap();
+
+        // Incremental GC with tombstone — no active snapshots.
+        let tombstones: Vec<(u64, &[u8])> = vec![(10, b"key")];
+        let (new_root, count) =
+            gc_versions_incremental(&mut store, root, None, &tombstones).unwrap();
+        assert!(count > 0);
+        root = new_root;
+
+        // Key should be completely gone.
+        let raw = crate::btree::ops::search(&store, root, b"key").unwrap();
+        assert!(raw.is_none());
     }
 }
