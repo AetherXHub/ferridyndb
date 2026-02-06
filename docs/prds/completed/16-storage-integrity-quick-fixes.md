@@ -1,7 +1,7 @@
 # PRD: Storage Integrity Quick Fixes
 
 **Priority:** 16
-**Status:** Approved
+**Status:** Complete
 **Origin:** redb design analysis — immediate correctness fixes
 
 **Roadmap Sequencing:** Do **before PRD-02** (Filter Expressions). These are trivial fixes to the storage foundation that every subsequent feature builds on.

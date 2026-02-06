@@ -14,6 +14,7 @@ pub enum PageType {
     BTreeLeaf = 2,
     Overflow = 3,
     FreeList = 4,
+    PendingFree = 5,
 }
 
 impl PageType {
@@ -25,6 +26,7 @@ impl PageType {
             2 => Ok(PageType::BTreeLeaf),
             3 => Ok(PageType::Overflow),
             4 => Ok(PageType::FreeList),
+            5 => Ok(PageType::PendingFree),
             other => Err(StorageError::CorruptedPage(format!(
                 "invalid page type discriminant: {other}"
             ))),

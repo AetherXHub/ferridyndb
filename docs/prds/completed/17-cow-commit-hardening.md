@@ -1,7 +1,7 @@
 # PRD: Copy-on-Write Commit Hardening
 
 **Priority:** 17
-**Status:** Approved
+**Status:** Complete
 **Origin:** redb design analysis — crash safety improvements
 
 **Roadmap Sequencing:** Do **between PRD-08** (MessagePack Wire Protocol) **and PRD-09** (Global Secondary Indexes). GSIs multiply the pages touched per commit; fixing the commit protocol before that prevents crash-corruption of both primary and index trees.

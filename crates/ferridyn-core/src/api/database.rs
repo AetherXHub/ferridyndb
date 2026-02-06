@@ -32,7 +32,6 @@ pub(crate) struct DatabaseState {
     pub(crate) file_manager: FileManager,
     pub(crate) header: FileHeader,
     pub(crate) header_slot: u8,
-    #[allow(dead_code)]
     pub(crate) pending_free: PendingFreeList,
 }
 
@@ -130,13 +129,25 @@ impl FerridynDB {
 
         let (file_manager, header, slot) = FileManager::open(path)?;
 
+        // Load the persisted pending free list from the header's chain.
+        let pending_free = if header.pending_free_root_page != 0 {
+            let file = file_manager
+                .file()
+                .try_clone()
+                .map_err(StorageError::from)?;
+            let store = FilePageStore::new(file, file_manager.total_page_count());
+            PendingFreeList::deserialize_from_pages(&store, header.pending_free_root_page)?
+        } else {
+            PendingFreeList::new()
+        };
+
         Ok(Self {
             inner: Arc::new(DatabaseInner {
                 state: RwLock::new(DatabaseState {
                     file_manager,
                     header,
                     header_slot: slot,
-                    pending_free: PendingFreeList::new(),
+                    pending_free,
                 }),
                 snapshot_tracker: SnapshotTracker::new(),
                 _file_lock: file_lock,
@@ -511,10 +522,32 @@ impl FerridynDB {
 
     fn commit_txn(&self, txn: Transaction, state: &mut DatabaseState) -> Result<(), Error> {
         let Transaction {
-            store,
+            mut store,
             catalog_root,
             txn_id,
         } = txn;
+
+        // Record COW-replaced original pages in the pending free list so they
+        // can be reclaimed once no active snapshots reference them.
+        let cow_old = store.cow_old_pages().to_vec();
+        if !cow_old.is_empty() {
+            state.pending_free.add(txn_id, cow_old);
+        }
+
+        // Track old pending-free chain pages so they can be freed eventually.
+        // These pages are from the previous commit's serialization and are now
+        // obsolete once we write a new chain.
+        let old_pf_root = state.header.pending_free_root_page;
+        if old_pf_root != 0 {
+            let old_chain_pages = PendingFreeList::collect_chain_page_ids(&store, old_pf_root)?;
+            if !old_chain_pages.is_empty() {
+                state.pending_free.add(txn_id, old_chain_pages);
+            }
+        }
+
+        // Serialize the pending free list into newly allocated pages.
+        let pending_free_root = state.pending_free.serialize_to_pages(&mut store)?;
+
         let new_total = store.next_page_id();
 
         // Grow file if needed.
@@ -537,6 +570,7 @@ impl FerridynDB {
         state.header.txn_counter = txn_id;
         state.header.catalog_root_page = catalog_root;
         state.header.total_page_count = new_total;
+        state.header.pending_free_root_page = pending_free_root;
 
         let mut header_buf = [0u8; PAGE_SIZE];
         state.header.write_to_page(&mut header_buf);
@@ -3609,5 +3643,125 @@ mod update_item_tests {
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("type mismatch"), "error: {msg}");
+    }
+
+    /// Simulate a crash after writing data pages but before the header is
+    /// fully persisted: corrupt the latest header slot and verify that
+    /// reopening the database falls back to the alternate (previous) header.
+    #[test]
+    fn test_recovery_from_corrupted_header() {
+        use std::os::unix::fs::FileExt;
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let lock_path = db_path.with_extension("lock");
+
+        // Create and populate the database.
+        {
+            let db = FerridynDB::create(&db_path).unwrap();
+            db.create_table("items")
+                .partition_key("id", KeyType::String)
+                .execute()
+                .unwrap();
+            db.put_item("items", json!({"id": "a", "value": 1}))
+                .unwrap();
+        }
+        // Drop the lock file so we can reopen.
+        let _ = std::fs::remove_file(&lock_path);
+
+        // Do another commit so both header slots are valid with different txn_counters.
+        let latest_slot: u8;
+        {
+            let db = FerridynDB::open(&db_path).unwrap();
+            db.put_item("items", json!({"id": "b", "value": 2}))
+                .unwrap();
+            // Read the current header slot.
+            latest_slot = db.inner.state.read().header_slot;
+        }
+        let _ = std::fs::remove_file(&lock_path);
+
+        // Corrupt the latest header slot to simulate a partial header write.
+        {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&db_path)
+                .unwrap();
+            let offset = latest_slot as u64 * PAGE_SIZE as u64;
+            // Overwrite part of the header with garbage.
+            file.write_all_at(&[0xFF; 64], offset).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        // Reopen: should recover using the alternate (older) header.
+        {
+            let db = FerridynDB::open(&db_path).unwrap();
+
+            // The first item ("a") was committed before the corrupted header,
+            // so it should be visible via the recovered alternate header.
+            let item = db.get_item("items").partition_key("a").execute().unwrap();
+            assert!(item.is_some(), "item 'a' should survive recovery");
+            assert_eq!(item.unwrap()["value"], 1);
+
+            // The alternate header slot should be selected (not the corrupted one).
+            let recovered_slot = db.inner.state.read().header_slot;
+            assert_ne!(
+                recovered_slot, latest_slot,
+                "should have recovered to the alternate slot"
+            );
+        }
+    }
+
+    /// Verify that the pending free list is persisted to disk and survives
+    /// a close/reopen cycle.
+    #[test]
+    fn test_pending_free_list_persists_across_reopen() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let lock_path = db_path.with_extension("lock");
+
+        // Create the database and do multiple writes to generate COW'd pages.
+        {
+            let db = FerridynDB::create(&db_path).unwrap();
+            db.create_table("items")
+                .partition_key("id", KeyType::String)
+                .execute()
+                .unwrap();
+
+            // First put: creates B-tree leaf pages.
+            db.put_item("items", json!({"id": "a", "value": 1}))
+                .unwrap();
+
+            // Second put to same key: overwrites, generating COW'd pages.
+            db.put_item("items", json!({"id": "a", "value": 2}))
+                .unwrap();
+
+            // The pending free list should have entries from the COW.
+            let state = db.inner.state.read();
+            let pf_root = state.header.pending_free_root_page;
+            assert!(
+                pf_root != 0,
+                "pending free root should be non-zero after COW writes"
+            );
+            assert!(
+                state.pending_free.pending_count() > 0,
+                "in-memory pending free list should have entries"
+            );
+        }
+        let _ = std::fs::remove_file(&lock_path);
+
+        // Reopen and verify the pending free list was loaded from disk.
+        {
+            let db = FerridynDB::open(&db_path).unwrap();
+            let state = db.inner.state.read();
+            assert!(
+                state.pending_free.pending_count() > 0,
+                "pending free list should be loaded from disk on reopen"
+            );
+            assert!(
+                state.header.pending_free_root_page != 0,
+                "header should reference the pending free chain"
+            );
+        }
     }
 }

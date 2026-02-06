@@ -76,6 +76,10 @@ pub struct BufferedPageStore {
     next_page_id: PageId,
     freed_pages: Vec<PageId>,
     file_total_pages: u64,
+    /// Maps original on-disk page_id → COW'd new page_id for this transaction.
+    cow_map: HashMap<PageId, PageId>,
+    /// Original page IDs that were COW-replaced (to be added to pending free list at commit).
+    cow_old_pages: Vec<PageId>,
 }
 
 impl BufferedPageStore {
@@ -90,6 +94,8 @@ impl BufferedPageStore {
             next_page_id: total_page_count,
             freed_pages: Vec::new(),
             file_total_pages: total_page_count,
+            cow_map: HashMap::new(),
+            cow_old_pages: Vec::new(),
         }
     }
 
@@ -102,13 +108,27 @@ impl BufferedPageStore {
     pub fn next_page_id(&self) -> PageId {
         self.next_page_id
     }
+
+    /// Return the original page IDs that were COW-replaced during this transaction.
+    pub fn cow_old_pages(&self) -> &[PageId] {
+        &self.cow_old_pages
+    }
 }
 
 impl PageStore for BufferedPageStore {
     fn read_page(&self, page_id: PageId) -> Result<Page, StorageError> {
+        // Translate through COW map (handles next_leaf and other horizontal links).
+        let actual_id = self.cow_map.get(&page_id).copied().unwrap_or(page_id);
+
         // Check overlay first.
-        if let Some(buf) = self.overlay.get(&page_id) {
-            return Ok(Page::from_bytes(*buf, page_id));
+        if let Some(buf) = self.overlay.get(&actual_id) {
+            return Ok(Page::from_bytes(*buf, actual_id));
+        }
+        // If the page was COW-remapped but not in overlay, that's a bug.
+        if actual_id != page_id {
+            return Err(StorageError::CorruptedPage(format!(
+                "COW page {actual_id} (remapped from {page_id}) not found in overlay"
+            )));
         }
         // Fall through to disk read.
         if page_id >= self.file_total_pages {
@@ -147,6 +167,29 @@ impl PageStore for BufferedPageStore {
         self.overlay.remove(&page_id);
         self.freed_pages.push(page_id);
         Ok(())
+    }
+
+    fn cow_write_page(&mut self, page: Page) -> Result<PageId, StorageError> {
+        let old_id = page.page_id();
+        if old_id < self.file_total_pages && !self.cow_map.contains_key(&old_id) {
+            // This page existed on disk before this transaction — allocate a new
+            // page ID so the original remains untouched for crash safety.
+            let new_id = self.next_page_id;
+            self.next_page_id += 1;
+            let mut buf = *page.data();
+            // Update the page_id in the on-disk buffer (bytes 4..12).
+            buf[4..12].copy_from_slice(&new_id.to_le_bytes());
+            self.overlay.insert(new_id, buf);
+            self.overlay.remove(&old_id);
+            self.cow_map.insert(old_id, new_id);
+            self.cow_old_pages.push(old_id);
+            Ok(new_id)
+        } else {
+            // Either a newly allocated page (>= file_total_pages) or already
+            // COW'd in this transaction — write normally.
+            self.overlay.insert(old_id, *page.data());
+            Ok(old_id)
+        }
     }
 }
 

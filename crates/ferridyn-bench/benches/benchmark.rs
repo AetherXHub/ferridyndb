@@ -123,15 +123,7 @@ fn main() {
     let mut table = comfy_table::Table::new();
     table.load_preset(comfy_table::presets::ASCII_MARKDOWN);
     table.set_width(120);
-    table.set_header([
-        "",
-        "redb",
-        "lmdb",
-        "sled",
-        "fjall",
-        "sqlite",
-        "ferridyndb",
-    ]);
+    table.set_header(["", "redb", "lmdb", "sled", "fjall", "sqlite", "ferridyndb"]);
     for row in rows {
         table.add_row(row);
     }

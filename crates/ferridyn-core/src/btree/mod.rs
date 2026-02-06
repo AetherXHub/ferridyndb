@@ -24,6 +24,19 @@ pub trait PageStore {
     fn allocate_page(&mut self, page_type: PageType) -> Result<Page, StorageError>;
     /// Free a page, returning it to the pool.
     fn free_page(&mut self, page_id: PageId) -> Result<(), StorageError>;
+
+    /// Write a page with copy-on-write semantics.
+    ///
+    /// If the page existed on disk before this transaction, allocates a new
+    /// page ID and writes the data there, preserving the original on-disk page
+    /// for crash safety. Returns the actual page ID the data was written to.
+    ///
+    /// Default implementation: writes normally and returns the same page ID.
+    fn cow_write_page(&mut self, page: Page) -> Result<PageId, StorageError> {
+        let page_id = page.page_id();
+        self.write_page(page)?;
+        Ok(page_id)
+    }
 }
 
 /// In-memory page store backed by a `HashMap`. Used for testing.

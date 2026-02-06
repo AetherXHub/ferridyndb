@@ -20,13 +20,16 @@ pub type KeyValuePair = (Vec<u8>, Vec<u8>);
 /// Result of inserting into a node. If the node split, the caller must
 /// propagate the median key and the new page to the parent.
 enum InsertResult {
-    /// Insertion completed without splitting.
-    Done,
+    /// Insertion completed without splitting. The page ID may have changed
+    /// due to copy-on-write allocation.
+    Done(PageId),
     /// The node split. `median_key` is the separator key to insert into the
-    /// parent, and `new_page_id` is the new right sibling.
+    /// parent, `left_page_id` is the (possibly COW'd) original page, and
+    /// `right_page_id` is the new right sibling.
     Split {
         median_key: Vec<u8>,
-        new_page_id: PageId,
+        left_page_id: PageId,
+        right_page_id: PageId,
     },
 }
 
@@ -69,24 +72,25 @@ pub fn insert(
 ) -> Result<PageId, StorageError> {
     let result = insert_recursive(store, root_page, key, value)?;
     match result {
-        InsertResult::Done => Ok(root_page),
+        InsertResult::Done(new_root) => Ok(new_root),
         InsertResult::Split {
             median_key,
-            new_page_id,
+            left_page_id,
+            right_page_id,
         } => {
             // Root split: create a new root with one key.
             let mut new_root = store.allocate_page(PageType::BTreeInternal)?;
             let new_root_id = new_root.page_id();
 
-            // The old root becomes the left child of the separator key.
+            // The (possibly COW'd) old root becomes the left child.
             // The new page becomes the rightmost child.
-            let cell = make_internal_cell(&median_key, root_page);
+            let cell = make_internal_cell(&median_key, left_page_id);
             {
                 let mut sp = SlottedPage::new(&mut new_root, BTREE_DATA_OFFSET);
                 sp.insert(&cell)?;
             }
 
-            internal_set_rightmost_child(&mut new_root, new_page_id);
+            internal_set_rightmost_child(&mut new_root, right_page_id);
             store.write_page(new_root)?;
 
             Ok(new_root_id)
@@ -145,8 +149,8 @@ fn insert_into_leaf(
             sp.insert_at(insert_idx, &new_cell)?;
         }
 
-        store.write_page(page)?;
-        return Ok(InsertResult::Done);
+        let new_page_id = store.cow_write_page(page)?;
+        return Ok(InsertResult::Done(new_page_id));
     }
 
     // Try to insert directly.
@@ -162,8 +166,8 @@ fn insert_into_leaf(
             let mut sp = SlottedPage::new(&mut page, BTREE_DATA_OFFSET);
             sp.insert_at(insert_idx, &new_cell)?;
         }
-        store.write_page(page)?;
-        return Ok(InsertResult::Done);
+        let new_page_id = store.cow_write_page(page)?;
+        return Ok(InsertResult::Done(new_page_id));
     }
 
     // Not enough space -- split the leaf.
@@ -224,12 +228,13 @@ fn split_leaf(
         }
     }
 
-    store.write_page(old_page)?;
+    let left_page_id = store.cow_write_page(old_page)?;
     store.write_page(new_page)?;
 
     Ok(InsertResult::Split {
         median_key,
-        new_page_id,
+        left_page_id,
+        right_page_id: new_page_id,
     })
 }
 
@@ -266,14 +271,26 @@ fn insert_into_internal(
     let child_result = insert_recursive(store, child_id, key, value)?;
 
     match child_result {
-        InsertResult::Done => Ok(InsertResult::Done),
+        InsertResult::Done(new_child_id) => {
+            if new_child_id != child_id {
+                // Child was COW'd — update our child pointer and COW ourselves.
+                let mut page = store.read_page(page_id)?;
+                update_internal_child_by_value(&mut page, child_id, new_child_id);
+                let new_page_id = store.cow_write_page(page)?;
+                Ok(InsertResult::Done(new_page_id))
+            } else {
+                Ok(InsertResult::Done(page_id))
+            }
+        }
         InsertResult::Split {
             median_key,
-            new_page_id,
+            left_page_id,
+            right_page_id,
         } => {
             // Re-read the internal page to insert the split key.
             let mut page = store.read_page(page_id)?;
-            let new_cell = make_internal_cell(&median_key, child_id);
+            // Use left_page_id (possibly COW'd child) as the left child of the median.
+            let new_cell = make_internal_cell(&median_key, left_page_id);
 
             // Find where to insert the median_key.
             let insert_idx = internal_search_slot(&page, &median_key);
@@ -290,21 +307,49 @@ fn insert_into_internal(
                     sp.insert_at(insert_idx, &new_cell)?;
                 }
 
-                // Update the child pointer that used to refer to child_id on
-                // the RIGHT side of the median to now point to new_page_id.
+                // Update the child pointer on the RIGHT side of the median
+                // to point to right_page_id (the new right sibling).
                 if insert_idx + 1 < count + 1 {
-                    update_internal_cell_child(&mut page, insert_idx + 1, new_page_id);
+                    update_internal_cell_child(&mut page, insert_idx + 1, right_page_id);
                 } else {
-                    internal_set_rightmost_child(&mut page, new_page_id);
+                    internal_set_rightmost_child(&mut page, right_page_id);
                 }
 
-                store.write_page(page)?;
-                Ok(InsertResult::Done)
+                let new_page_id = store.cow_write_page(page)?;
+                Ok(InsertResult::Done(new_page_id))
             } else {
                 // Internal node is full -- must split it.
-                split_internal(store, page, &median_key, child_id, new_page_id)
+                split_internal(store, page, &median_key, left_page_id, right_page_id)
             }
         }
+    }
+}
+
+/// Update a child pointer in an internal node by searching for the old child
+/// value and replacing it with the new one. Handles both cell children and
+/// the rightmost child pointer.
+fn update_internal_child_by_value(page: &mut Page, old_child: PageId, new_child: PageId) {
+    // Check rightmost child first.
+    if internal_rightmost_child(page) == old_child {
+        internal_set_rightmost_child(page, new_child);
+        return;
+    }
+    // Search cells for the old child pointer.
+    let slot_idx = {
+        let sp_ref = SlottedPageRef::new(page, BTREE_DATA_OFFSET);
+        let count = sp_ref.slot_count();
+        let mut found = None;
+        for i in 0..count {
+            let cell = sp_ref.cell(i).unwrap();
+            if internal_cell_child(cell) == old_child {
+                found = Some(i);
+                break;
+            }
+        }
+        found
+    };
+    if let Some(idx) = slot_idx {
+        update_internal_cell_child(page, idx, new_child);
     }
 }
 
@@ -403,12 +448,13 @@ fn split_internal(
     }
     internal_set_rightmost_child(&mut new_page, children[total]);
 
-    store.write_page(old_page)?;
+    let left_page_id = store.cow_write_page(old_page)?;
     store.write_page(new_page)?;
 
     Ok(InsertResult::Split {
         median_key: promoted_key,
-        new_page_id,
+        left_page_id,
+        right_page_id: new_page_id,
     })
 }
 
@@ -422,24 +468,26 @@ fn find_internal_insert_idx(cells: &[Vec<u8>], key: &[u8]) -> usize {
     cells.len()
 }
 
-/// Delete a key from the B+Tree. Returns the (possibly same) root page ID.
+/// Delete a key from the B+Tree. Returns the (possibly new) root page ID.
 ///
 /// This is a simplified v1 delete: it finds the leaf containing the key and
 /// marks the slot as dead. No rebalancing or merging is performed.
+/// With COW, modified pages get new page IDs that propagate to the root.
 pub fn delete(
     store: &mut impl PageStore,
     root_page: PageId,
     key: &[u8],
 ) -> Result<PageId, StorageError> {
-    delete_recursive(store, root_page, key)?;
-    Ok(root_page)
+    let (_found, new_root) = delete_recursive(store, root_page, key)?;
+    Ok(new_root)
 }
 
+/// Returns `(key_was_found, possibly_new_page_id)`.
 fn delete_recursive(
     store: &mut impl PageStore,
     page_id: PageId,
     key: &[u8],
-) -> Result<bool, StorageError> {
+) -> Result<(bool, PageId), StorageError> {
     let page = store.read_page(page_id)?;
     match page.page_type()? {
         PageType::BTreeInternal => {
@@ -448,7 +496,16 @@ fn delete_recursive(
             {
                 let _consumed = page;
             }
-            delete_recursive(store, child_id, key)
+            let (found, new_child_id) = delete_recursive(store, child_id, key)?;
+            if found && new_child_id != child_id {
+                // Child was COW'd — update our child pointer and COW ourselves.
+                let mut page = store.read_page(page_id)?;
+                update_internal_child_by_value(&mut page, child_id, new_child_id);
+                let new_page_id = store.cow_write_page(page)?;
+                Ok((true, new_page_id))
+            } else {
+                Ok((found, page_id))
+            }
         }
         PageType::BTreeLeaf => {
             if let Some(slot_idx) = leaf_find_exact(&page, key) {
@@ -466,10 +523,10 @@ fn delete_recursive(
                     let mut sp = SlottedPage::new(&mut page, BTREE_DATA_OFFSET);
                     sp.mark_dead(slot_idx);
                 }
-                store.write_page(page)?;
-                Ok(true)
+                let new_page_id = store.cow_write_page(page)?;
+                Ok((true, new_page_id))
             } else {
-                Ok(false)
+                Ok((false, page_id))
             }
         }
         _ => Err(StorageError::CorruptedPage(
@@ -482,82 +539,113 @@ fn delete_recursive(
 ///
 /// If `start_key` is `None`, scanning starts from the very first leaf entry.
 /// If `end_key` is `None`, scanning continues to the end of the tree.
+///
+/// Uses tree-structure traversal (not `next_leaf` pointers) so that scans are
+/// correct even after copy-on-write page allocation reassigns page IDs.
 pub fn range_scan(
     store: &impl PageStore,
     root_page: PageId,
     start_key: Option<&[u8]>,
     end_key: Option<&[u8]>,
 ) -> Result<Vec<KeyValuePair>, StorageError> {
-    // Navigate to the leftmost leaf that could contain start_key.
-    let leaf_id = find_leaf(store, root_page, start_key)?;
     let mut results = Vec::new();
-    let mut current_leaf = leaf_id;
-
-    while current_leaf != 0 {
-        let page = store.read_page(current_leaf)?;
-        let sp = SlottedPageRef::new(&page, BTREE_DATA_OFFSET);
-        let count = sp.slot_count();
-
-        for i in 0..count {
-            if sp.is_dead(i) {
-                continue;
-            }
-            let cell = sp.cell(i).unwrap();
-            let cell_key = leaf_cell_key(cell);
-
-            // Skip keys before start_key.
-            if let Some(sk) = start_key
-                && cell_key < sk
-            {
-                continue;
-            }
-
-            // Stop at end_key.
-            if let Some(ek) = end_key
-                && cell_key >= ek
-            {
-                return Ok(results);
-            }
-
-            let raw_value = leaf_cell_value(cell);
-            let value = read_value(store, raw_value)?;
-            results.push((cell_key.to_vec(), value));
-        }
-
-        current_leaf = leaf_next_leaf(&page);
-    }
-
+    tree_range_scan(store, root_page, start_key, end_key, &mut results)?;
     Ok(results)
 }
 
-/// Navigate from the root to the leaf page that would contain `key`.
-/// If `key` is `None`, navigate to the leftmost leaf.
-fn find_leaf(
+/// Recursive tree-structure range scan. Returns `false` when `end_key` is
+/// reached and the caller should stop visiting further children.
+fn tree_range_scan(
     store: &impl PageStore,
     page_id: PageId,
-    key: Option<&[u8]>,
-) -> Result<PageId, StorageError> {
+    start_key: Option<&[u8]>,
+    end_key: Option<&[u8]>,
+    results: &mut Vec<KeyValuePair>,
+) -> Result<bool, StorageError> {
     let page = store.read_page(page_id)?;
     match page.page_type()? {
-        PageType::BTreeLeaf => Ok(page_id),
+        PageType::BTreeLeaf => {
+            let sp = SlottedPageRef::new(&page, BTREE_DATA_OFFSET);
+            let count = sp.slot_count();
+            for i in 0..count {
+                if sp.is_dead(i) {
+                    continue;
+                }
+                let cell = sp.cell(i).unwrap();
+                let cell_key = leaf_cell_key(cell);
+
+                if let Some(sk) = start_key
+                    && cell_key < sk
+                {
+                    continue;
+                }
+                if let Some(ek) = end_key
+                    && cell_key >= ek
+                {
+                    return Ok(false);
+                }
+
+                let raw_value = leaf_cell_value(cell);
+                let value = read_value(store, raw_value)?;
+                results.push((cell_key.to_vec(), value));
+            }
+            Ok(true)
+        }
         PageType::BTreeInternal => {
-            let child_id = match key {
-                Some(k) => internal_find_child(&page, k),
-                None => {
-                    // Go to leftmost child: the child in cell[0] (if any) or rightmost.
-                    let sp = SlottedPageRef::new(&page, BTREE_DATA_OFFSET);
-                    if sp.slot_count() > 0 {
-                        let cell = sp.cell(0).unwrap();
-                        internal_cell_child(cell)
+            let sp_ref = SlottedPageRef::new(&page, BTREE_DATA_OFFSET);
+            let count = sp_ref.slot_count();
+
+            // Determine which child to start scanning from.
+            //
+            // Internal node structure (N separator keys, N+1 children):
+            //   child[0] covers (-inf, key[0])
+            //   child[i] covers [key[i-1], key[i]) for 0 < i < N
+            //   child[N] (rightmost) covers [key[N-1], +inf)
+            let start_child = if let Some(sk) = start_key {
+                let mut idx = 0;
+                for i in 0..count {
+                    let cell = sp_ref.cell(i).unwrap();
+                    let sep = internal_cell_key(cell);
+                    if sep <= sk {
+                        idx = i + 1;
                     } else {
-                        internal_rightmost_child(&page)
+                        break;
                     }
                 }
+                idx
+            } else {
+                0
             };
-            find_leaf(store, child_id, key)
+
+            for i in start_child..=count {
+                // If this child's lower bound >= end_key, all remaining children
+                // are past the scan range.
+                if let Some(ek) = end_key
+                    && i > 0
+                {
+                    let prev_cell = sp_ref.cell(i - 1).unwrap();
+                    let lower = internal_cell_key(prev_cell);
+                    if lower >= ek {
+                        return Ok(false);
+                    }
+                }
+
+                let child_id = if i < count {
+                    let cell = sp_ref.cell(i).unwrap();
+                    internal_cell_child(cell)
+                } else {
+                    internal_rightmost_child(&page)
+                };
+
+                if !tree_range_scan(store, child_id, start_key, end_key, results)? {
+                    return Ok(false);
+                }
+            }
+
+            Ok(true)
         }
         _ => Err(StorageError::CorruptedPage(
-            "unexpected page type during leaf search".to_string(),
+            "unexpected page type during scan".to_string(),
         )),
     }
 }

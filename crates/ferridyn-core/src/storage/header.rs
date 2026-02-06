@@ -6,26 +6,36 @@ use xxhash_rust::xxh64::xxh64;
 pub const MAGIC: &[u8; 4] = b"DYNA";
 
 /// Current file format version.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
-/// Header checksum covers bytes `[0..44]`.
-const CHECKSUM_RANGE_END: usize = 44;
+/// Previous file format version (no pending_free_root_page field).
+const VERSION_1: u32 = 1;
 
-/// The checksum is stored at bytes `[44..52]`.
-const CHECKSUM_OFFSET: usize = 44;
+/// V2 header checksum covers bytes `[0..52]`.
+const CHECKSUM_RANGE_END: usize = 52;
+
+/// V2 checksum is stored at bytes `[52..60]`.
+const CHECKSUM_OFFSET: usize = 52;
+
+/// V1 header checksum covers bytes `[0..44]`.
+const V1_CHECKSUM_RANGE_END: usize = 44;
+
+/// V1 checksum is stored at bytes `[44..52]`.
+const V1_CHECKSUM_OFFSET: usize = 44;
 
 /// Double-buffered file header for crash-safe metadata updates.
 ///
-/// Header layout (within a 4096-byte page):
+/// Header layout v2 (within a 4096-byte page):
 /// ```text
 /// [0..4]   magic: "DYNA" (4 bytes)
-/// [4..8]   version: u32 (1) little-endian
+/// [4..8]   version: u32 (2) little-endian
 /// [8..12]  page_size: u32 (4096) little-endian
 /// [12..20] txn_counter: u64 little-endian
 /// [20..28] catalog_root_page: u64 little-endian
 /// [28..36] free_list_head_page: u64 little-endian
 /// [36..44] total_page_count: u64 little-endian
-/// [44..52] xxhash64 checksum (of bytes 0..44) little-endian
+/// [44..52] pending_free_root_page: u64 little-endian
+/// [52..60] xxhash64 checksum (of bytes 0..52) little-endian
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileHeader {
@@ -33,6 +43,7 @@ pub struct FileHeader {
     pub catalog_root_page: PageId,
     pub free_list_head_page: PageId,
     pub total_page_count: u64,
+    pub pending_free_root_page: PageId,
 }
 
 impl FileHeader {
@@ -44,10 +55,13 @@ impl FileHeader {
             catalog_root_page: 0,
             free_list_head_page: 0,
             total_page_count: 2,
+            pending_free_root_page: 0,
         }
     }
 
     /// Parse a header from a raw page buffer, validating magic, version, and checksum.
+    ///
+    /// Supports both v1 (no pending_free_root_page) and v2 (with pending_free_root_page).
     pub fn from_page(page_data: &[u8; PAGE_SIZE]) -> Result<Self, StorageError> {
         // Validate magic
         if &page_data[0..4] != MAGIC {
@@ -56,17 +70,27 @@ impl FileHeader {
 
         // Validate version
         let version = u32::from_le_bytes(page_data[4..8].try_into().unwrap());
-        if version != VERSION {
-            return Err(StorageError::UnsupportedVersion(version));
-        }
+
+        let (checksum_offset, checksum_range_end, pending_free_root_page) = match version {
+            VERSION_1 => {
+                // V1: checksum at [44..52] covers [0..44], no pending_free_root_page.
+                (V1_CHECKSUM_OFFSET, V1_CHECKSUM_RANGE_END, 0u64)
+            }
+            VERSION => {
+                // V2: checksum at [52..60] covers [0..52], pending_free_root_page at [44..52].
+                let pfr = u64::from_le_bytes(page_data[44..52].try_into().unwrap());
+                (CHECKSUM_OFFSET, CHECKSUM_RANGE_END, pfr)
+            }
+            other => return Err(StorageError::UnsupportedVersion(other)),
+        };
 
         // Validate checksum
         let stored_checksum = u64::from_le_bytes(
-            page_data[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 8]
+            page_data[checksum_offset..checksum_offset + 8]
                 .try_into()
                 .unwrap(),
         );
-        let computed_checksum = xxh64(&page_data[..CHECKSUM_RANGE_END], 0);
+        let computed_checksum = xxh64(&page_data[..checksum_range_end], 0);
         if stored_checksum != computed_checksum {
             return Err(StorageError::CorruptedPage(format!(
                 "header checksum mismatch: stored={stored_checksum:#018x}, computed={computed_checksum:#018x}"
@@ -83,6 +107,7 @@ impl FileHeader {
             catalog_root_page,
             free_list_head_page,
             total_page_count,
+            pending_free_root_page,
         })
     }
 
@@ -93,7 +118,7 @@ impl FileHeader {
 
         // magic
         buf[0..4].copy_from_slice(MAGIC);
-        // version
+        // version (always writes v2)
         buf[4..8].copy_from_slice(&VERSION.to_le_bytes());
         // page_size
         buf[8..12].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
@@ -105,7 +130,9 @@ impl FileHeader {
         buf[28..36].copy_from_slice(&self.free_list_head_page.to_le_bytes());
         // total_page_count
         buf[36..44].copy_from_slice(&self.total_page_count.to_le_bytes());
-        // checksum of [0..44]
+        // pending_free_root_page
+        buf[44..52].copy_from_slice(&self.pending_free_root_page.to_le_bytes());
+        // checksum of [0..52]
         let checksum = xxh64(&buf[..CHECKSUM_RANGE_END], 0);
         buf[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 8].copy_from_slice(&checksum.to_le_bytes());
     }
@@ -162,6 +189,7 @@ mod tests {
             catalog_root_page: 5,
             free_list_head_page: 10,
             total_page_count: 100,
+            pending_free_root_page: 7,
         };
 
         let mut buf = [0u8; PAGE_SIZE];
@@ -266,5 +294,28 @@ mod tests {
         assert_eq!(header.catalog_root_page, 0);
         assert_eq!(header.free_list_head_page, 0);
         assert_eq!(header.total_page_count, 2);
+        assert_eq!(header.pending_free_root_page, 0);
+    }
+
+    #[test]
+    fn test_v1_header_compat() {
+        // Build a v1 header by hand: checksum at [44..52] covers [0..44].
+        let mut buf = [0u8; PAGE_SIZE];
+        buf[0..4].copy_from_slice(MAGIC);
+        buf[4..8].copy_from_slice(&1u32.to_le_bytes()); // version 1
+        buf[8..12].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
+        buf[12..20].copy_from_slice(&7u64.to_le_bytes()); // txn_counter = 7
+        buf[20..28].copy_from_slice(&3u64.to_le_bytes()); // catalog_root = 3
+        buf[28..36].copy_from_slice(&0u64.to_le_bytes()); // free_list = 0
+        buf[36..44].copy_from_slice(&10u64.to_le_bytes()); // total_pages = 10
+
+        let checksum = xxh64(&buf[..V1_CHECKSUM_RANGE_END], 0);
+        buf[V1_CHECKSUM_OFFSET..V1_CHECKSUM_OFFSET + 8].copy_from_slice(&checksum.to_le_bytes());
+
+        let header = FileHeader::from_page(&buf).unwrap();
+        assert_eq!(header.txn_counter, 7);
+        assert_eq!(header.catalog_root_page, 3);
+        assert_eq!(header.total_page_count, 10);
+        assert_eq!(header.pending_free_root_page, 0);
     }
 }

@@ -106,9 +106,11 @@ pub fn gc_versions(
         // - It is deleted (deleted_txn.is_some())
         // - It has no previous version chain
         // - The deletion is invisible to all snapshots
-        if doc.deleted_txn.is_some() && doc.prev_version_page == 0 {
+        if let Some(deleted_txn) = doc.deleted_txn
+            && doc.prev_version_page == 0
+        {
             let can_remove = if let Some(oldest) = oldest_snapshot {
-                doc.deleted_txn.unwrap() <= oldest
+                deleted_txn <= oldest
             } else {
                 true
             };
