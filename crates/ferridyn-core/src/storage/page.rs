@@ -1,6 +1,6 @@
 use crate::error::StorageError;
 use crate::types::{PAGE_SIZE, PageId};
-use xxhash_rust::xxh64::xxh64;
+use xxhash_rust::xxh64::Xxh64;
 
 /// Byte range for the page header checksum computation: bytes 20..4096.
 const CHECKSUM_START: usize = 20;
@@ -43,7 +43,7 @@ impl PageType {
 /// ```text
 /// [0..4]   page_type: u32 (little-endian)
 /// [4..12]  page_id: u64 (little-endian)
-/// [12..20] xxhash64 checksum (of bytes 20..4096)
+/// [12..20] xxhash64 checksum (of bytes 0..12 + 20..4096)
 /// [20..24] entry_count: u32 (little-endian)
 /// [24..28] free_space_offset: u32 (little-endian)
 /// [28..32] reserved: u32
@@ -123,14 +123,20 @@ impl Page {
         &mut self.buf
     }
 
-    /// Compute the xxhash64 checksum of bytes `[20..PAGE_SIZE]`.
+    /// Compute the xxhash64 checksum of bytes `[0..12] + [20..PAGE_SIZE]`.
+    ///
+    /// This covers page_type, page_id, and all data after the checksum field,
+    /// skipping only the checksum field itself at `[12..20]`.
     pub fn compute_checksum(&self) -> u64 {
-        xxh64(&self.buf[CHECKSUM_START..PAGE_SIZE], 0)
+        let mut hasher = Xxh64::new(0);
+        hasher.update(&self.buf[0..12]); // page_type + page_id
+        hasher.update(&self.buf[CHECKSUM_START..PAGE_SIZE]); // data after checksum field
+        hasher.digest()
     }
 
     /// Compute the checksum and write it into the header at `[12..20]`.
     pub fn write_checksum(&mut self) {
-        let cs = xxh64(&self.buf[CHECKSUM_START..PAGE_SIZE], 0);
+        let cs = self.compute_checksum();
         self.buf[12..20].copy_from_slice(&cs.to_le_bytes());
     }
 
@@ -156,6 +162,49 @@ impl Page {
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
+}
+
+/// Compute checksum for a raw page buffer, covering page_type, page_id, and data.
+///
+/// Hashes bytes `[0..12] + [20..PAGE_SIZE]`, skipping the checksum field at `[12..20]`.
+pub fn compute_checksum_buf(buf: &[u8; PAGE_SIZE]) -> u64 {
+    let mut hasher = Xxh64::new(0);
+    hasher.update(&buf[0..12]);
+    hasher.update(&buf[CHECKSUM_START..PAGE_SIZE]);
+    hasher.digest()
+}
+
+/// Compute and write the checksum into a raw page buffer at `[12..20]`.
+pub fn write_checksum_buf(buf: &mut [u8; PAGE_SIZE]) {
+    let cs = compute_checksum_buf(buf);
+    buf[12..20].copy_from_slice(&cs.to_le_bytes());
+}
+
+/// Verify a raw page buffer's checksum and page_id consistency.
+///
+/// Checks that the stored page_id matches the expected offset and that
+/// the stored checksum matches the computed value. Returns `Ok(())` if
+/// valid, or a descriptive `StorageError::CorruptedPage` error.
+pub fn verify_page_integrity(
+    buf: &[u8; PAGE_SIZE],
+    expected_page_id: PageId,
+) -> Result<(), StorageError> {
+    // Check page_id matches expected offset.
+    let stored_page_id = u64::from_le_bytes(buf[4..12].try_into().unwrap());
+    if stored_page_id != expected_page_id {
+        return Err(StorageError::CorruptedPage(format!(
+            "page_id mismatch: expected {expected_page_id}, found {stored_page_id}"
+        )));
+    }
+    // Verify checksum.
+    let stored = u64::from_le_bytes(buf[12..20].try_into().unwrap());
+    let computed = compute_checksum_buf(buf);
+    if stored != computed {
+        return Err(StorageError::CorruptedPage(format!(
+            "checksum mismatch on page {expected_page_id}: stored={stored:#018x}, computed={computed:#018x}"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -236,5 +285,52 @@ mod tests {
         assert!(!page2.is_dirty());
         page2.mark_dirty();
         assert!(page2.is_dirty());
+    }
+
+    #[test]
+    fn test_checksum_covers_page_type() {
+        let mut page = Page::new(1, PageType::BTreeLeaf);
+        page.write_checksum();
+        // Corrupt the page_type field
+        page.data_mut()[0..4].copy_from_slice(&99u32.to_le_bytes());
+        assert!(page.verify_checksum().is_err());
+    }
+
+    #[test]
+    fn test_checksum_covers_page_id() {
+        let mut page = Page::new(1, PageType::BTreeLeaf);
+        page.write_checksum();
+        // Corrupt the page_id field
+        page.data_mut()[4..12].copy_from_slice(&999u64.to_le_bytes());
+        assert!(page.verify_checksum().is_err());
+    }
+
+    #[test]
+    fn test_verify_page_integrity_valid() {
+        let mut page = Page::new(42, PageType::BTreeLeaf);
+        page.set_entry_count(5);
+        page.write_checksum();
+        assert!(verify_page_integrity(page.data(), 42).is_ok());
+    }
+
+    #[test]
+    fn test_verify_page_integrity_wrong_page_id() {
+        let mut page = Page::new(42, PageType::BTreeLeaf);
+        page.write_checksum();
+        // Verify with wrong expected page_id
+        assert!(verify_page_integrity(page.data(), 99).is_err());
+    }
+
+    #[test]
+    fn test_buf_checksum_helpers() {
+        let mut buf = [0u8; PAGE_SIZE];
+        // Set page_type
+        buf[0..4].copy_from_slice(&(PageType::BTreeLeaf.as_u32()).to_le_bytes());
+        // Set page_id
+        buf[4..12].copy_from_slice(&7u64.to_le_bytes());
+        // Write checksum
+        write_checksum_buf(&mut buf);
+        // Verify
+        assert!(verify_page_integrity(&buf, 7).is_ok());
     }
 }

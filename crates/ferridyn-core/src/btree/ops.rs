@@ -117,7 +117,7 @@ fn insert_into_leaf(
     value: &[u8],
 ) -> Result<InsertResult, StorageError> {
     // Encode value (may be inline or overflow).
-    let encoded_value = write_value(store, value)?;
+    let encoded_value = write_value(store, value, key.len())?;
     let new_cell = make_leaf_cell(key, &encoded_value);
 
     // Check if key already exists.

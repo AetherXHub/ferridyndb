@@ -4,7 +4,7 @@ use std::os::unix::fs::FileExt;
 
 use crate::btree::PageStore;
 use crate::error::StorageError;
-use crate::storage::page::{Page, PageType};
+use crate::storage::page::{Page, PageType, verify_page_integrity};
 use crate::types::{PAGE_SIZE, PageId};
 
 /// A read-only [`PageStore`] backed by a file descriptor.
@@ -39,6 +39,10 @@ impl PageStore for FilePageStore {
         self.file
             .read_exact_at(&mut buf, offset)
             .map_err(StorageError::Io)?;
+        // Verify page integrity for data pages (skip header pages 0 and 1).
+        if page_id >= 2 {
+            verify_page_integrity(&buf, page_id)?;
+        }
         Ok(Page::from_bytes(buf, page_id))
     }
 
@@ -118,6 +122,10 @@ impl PageStore for BufferedPageStore {
         self.file
             .read_exact_at(&mut buf, offset)
             .map_err(StorageError::Io)?;
+        // Verify page integrity for data pages (skip header pages 0 and 1).
+        if page_id >= 2 {
+            verify_page_integrity(&buf, page_id)?;
+        }
         Ok(Page::from_bytes(buf, page_id))
     }
 

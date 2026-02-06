@@ -15,9 +15,10 @@
 
 use crate::error::StorageError;
 use crate::storage::page::{Page, PageType};
-use crate::types::{PAGE_SIZE, PageId};
+use crate::types::{PAGE_SIZE, PageId, SLOT_SIZE};
 
 use super::PageStore;
+use super::node::BTREE_DATA_OFFSET;
 
 /// Size of the overflow-specific header region (common header + next pointer).
 pub const OVERFLOW_HEADER_SIZE: usize = 40;
@@ -31,8 +32,22 @@ pub const INLINE_MARKER: u8 = 0x00;
 /// Marker byte for overflow pointer values.
 pub const OVERFLOW_MARKER: u8 = 0x01;
 
-/// If the raw value exceeds this many bytes, store it via overflow pages.
+/// Legacy fixed overflow threshold, kept for backward compatibility in tests.
 pub const OVERFLOW_THRESHOLD: usize = 1500;
+
+/// Compute the maximum inline value size for a given encoded key length.
+///
+/// Returns the largest value that can be stored inline such that the resulting
+/// leaf cell (key_len_prefix + key + inline_marker + value) plus its slot entry
+/// fits in a single empty leaf page.
+pub fn max_inline_value_size(encoded_key_len: usize) -> usize {
+    // Available space in an empty leaf page for a single cell + slot:
+    //   PAGE_SIZE - BTREE_DATA_OFFSET - SLOT_SIZE
+    // Cell layout: [key_len: u16][key bytes][marker: u8][value bytes]
+    let max_cell_size = PAGE_SIZE - BTREE_DATA_OFFSET - SLOT_SIZE;
+    let cell_overhead = 2 + encoded_key_len + 1; // key_len prefix + key + inline marker
+    max_cell_size.saturating_sub(cell_overhead)
+}
 
 /// Read the next-overflow pointer from an overflow page.
 fn overflow_next(page: &Page) -> PageId {
@@ -96,10 +111,16 @@ pub fn read_value(store: &impl PageStore, raw_value: &[u8]) -> Result<Vec<u8>, S
 
 /// Write a value, returning the raw bytes to store in the leaf cell.
 ///
-/// If the value is small enough (<= OVERFLOW_THRESHOLD), it is stored inline.
-/// Otherwise, it is written across one or more overflow pages.
-pub fn write_value(store: &mut impl PageStore, data: &[u8]) -> Result<Vec<u8>, StorageError> {
-    if data.len() <= OVERFLOW_THRESHOLD {
+/// If the value is small enough to fit inline in a leaf page alongside the
+/// given key, it is stored inline. Otherwise, it is written across one or
+/// more overflow pages. The `encoded_key_len` parameter is the byte length
+/// of the already-encoded key.
+pub fn write_value(
+    store: &mut impl PageStore,
+    data: &[u8],
+    encoded_key_len: usize,
+) -> Result<Vec<u8>, StorageError> {
+    if data.len() <= max_inline_value_size(encoded_key_len) {
         // Inline: marker + data
         let mut result = Vec::with_capacity(1 + data.len());
         result.push(INLINE_MARKER);
@@ -184,11 +205,14 @@ mod tests {
     use super::*;
     use crate::btree::InMemoryPageStore;
 
+    /// Typical encoded key length used by most tests.
+    const TEST_KEY_LEN: usize = 20;
+
     #[test]
     fn test_inline_roundtrip() {
         let mut store = InMemoryPageStore::new();
         let data = b"hello world";
-        let raw = write_value(&mut store, data).unwrap();
+        let raw = write_value(&mut store, data, TEST_KEY_LEN).unwrap();
         assert_eq!(raw[0], INLINE_MARKER);
         let recovered = read_value(&store, &raw).unwrap();
         assert_eq!(recovered, data);
@@ -197,7 +221,7 @@ mod tests {
     #[test]
     fn test_inline_empty() {
         let mut store = InMemoryPageStore::new();
-        let raw = write_value(&mut store, b"").unwrap();
+        let raw = write_value(&mut store, b"", TEST_KEY_LEN).unwrap();
         assert_eq!(raw[0], INLINE_MARKER);
         let recovered = read_value(&store, &raw).unwrap();
         assert!(recovered.is_empty());
@@ -206,8 +230,9 @@ mod tests {
     #[test]
     fn test_overflow_roundtrip() {
         let mut store = InMemoryPageStore::new();
-        let data = vec![0xAB; 2000]; // > OVERFLOW_THRESHOLD
-        let raw = write_value(&mut store, &data).unwrap();
+        // Use a value larger than any possible inline threshold
+        let data = vec![0xAB; PAGE_SIZE];
+        let raw = write_value(&mut store, &data, TEST_KEY_LEN).unwrap();
         assert_eq!(raw[0], OVERFLOW_MARKER);
         assert_eq!(raw.len(), 13);
         let recovered = read_value(&store, &raw).unwrap();
@@ -219,7 +244,7 @@ mod tests {
         let mut store = InMemoryPageStore::new();
         // Fill more than one overflow page
         let data = vec![0xCD; OVERFLOW_DATA_PER_PAGE * 3 + 100];
-        let raw = write_value(&mut store, &data).unwrap();
+        let raw = write_value(&mut store, &data, TEST_KEY_LEN).unwrap();
         assert_eq!(raw[0], OVERFLOW_MARKER);
         let recovered = read_value(&store, &raw).unwrap();
         assert_eq!(recovered, data);
@@ -229,7 +254,7 @@ mod tests {
     fn test_overflow_free_chain() {
         let mut store = InMemoryPageStore::new();
         let data = vec![0xEF; 5000];
-        let raw = write_value(&mut store, &data).unwrap();
+        let raw = write_value(&mut store, &data, TEST_KEY_LEN).unwrap();
 
         // Verify we can read before freeing
         assert_eq!(read_value(&store, &raw).unwrap(), data);
@@ -244,7 +269,7 @@ mod tests {
     #[test]
     fn test_free_inline_noop() {
         let mut store = InMemoryPageStore::new();
-        let raw = write_value(&mut store, b"small").unwrap();
+        let raw = write_value(&mut store, b"small", TEST_KEY_LEN).unwrap();
         // Freeing an inline value is a no-op
         free_overflow_chain(&mut store, &raw).unwrap();
     }
@@ -257,19 +282,36 @@ mod tests {
     }
 
     #[test]
-    fn test_overflow_at_threshold_boundary() {
+    fn test_dynamic_overflow_threshold() {
         let mut store = InMemoryPageStore::new();
+        let key_len = TEST_KEY_LEN;
+        let threshold = max_inline_value_size(key_len);
 
         // Exactly at threshold: should be inline
-        let data_at = vec![0x01; OVERFLOW_THRESHOLD];
-        let raw = write_value(&mut store, &data_at).unwrap();
+        let data_at = vec![0x01; threshold];
+        let raw = write_value(&mut store, &data_at, key_len).unwrap();
         assert_eq!(raw[0], INLINE_MARKER);
 
         // One byte over: should be overflow
-        let data_over = vec![0x02; OVERFLOW_THRESHOLD + 1];
-        let raw = write_value(&mut store, &data_over).unwrap();
+        let data_over = vec![0x02; threshold + 1];
+        let raw = write_value(&mut store, &data_over, key_len).unwrap();
         assert_eq!(raw[0], OVERFLOW_MARKER);
         let recovered = read_value(&store, &raw).unwrap();
         assert_eq!(recovered, data_over);
+    }
+
+    #[test]
+    fn test_small_key_allows_larger_inline() {
+        // A small key should allow a larger inline value than a big key.
+        let small_key_threshold = max_inline_value_size(5);
+        let large_key_threshold = max_inline_value_size(500);
+        assert!(small_key_threshold > large_key_threshold);
+    }
+
+    #[test]
+    fn test_max_inline_value_size_huge_key() {
+        // A key so large it fills the entire page should yield 0 inline capacity.
+        let threshold = max_inline_value_size(PAGE_SIZE);
+        assert_eq!(threshold, 0);
     }
 }

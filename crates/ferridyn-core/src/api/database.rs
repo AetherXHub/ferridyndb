@@ -14,6 +14,7 @@ use crate::mvcc::ops as mvcc_ops;
 use crate::storage::file::FileManager;
 use crate::storage::header::FileHeader;
 use crate::storage::lock::FileLock;
+use crate::storage::page::write_checksum_buf;
 use crate::storage::pending_free::PendingFreeList;
 use crate::storage::snapshot::SnapshotTracker;
 use crate::types::{IndexDefinition, PAGE_SIZE, PageId, PartitionSchema};
@@ -84,7 +85,12 @@ impl FerridynDB {
             file_manager.grow(new_total)?;
         }
         for (&page_id, data) in store.overlay() {
-            file_manager.write_page(page_id, data)?;
+            let mut buf = *data;
+            // Data pages get checksums; header pages (0, 1) use their own scheme.
+            if page_id >= 2 {
+                write_checksum_buf(&mut buf);
+            }
+            file_manager.write_page(page_id, &buf)?;
         }
 
         // Write header to slot 0.
@@ -516,9 +522,14 @@ impl FerridynDB {
             state.file_manager.grow(new_total)?;
         }
 
-        // Write all overlay pages to disk.
+        // Write all overlay pages to disk with checksums.
         for (&page_id, data) in store.overlay() {
-            state.file_manager.write_page(page_id, data)?;
+            let mut buf = *data;
+            // Data pages get checksums; header pages (0, 1) use their own scheme.
+            if page_id >= 2 {
+                write_checksum_buf(&mut buf);
+            }
+            state.file_manager.write_page(page_id, &buf)?;
         }
 
         // Write new header to alternate slot.
