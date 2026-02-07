@@ -15,7 +15,9 @@ JSON-over-newlines on Unix domain socket. Each request is one JSON line, each re
 {"op":"put_item","table":"users","item":{"user_id":"alice","name":"Updated"},"expected_version":5}
 {"op":"delete_item","table":"users","partition_key":"alice"}
 {"op":"query","table":"users","partition_key":"alice","limit":20}
+{"op":"query","table":"users","partition_key":"alice","filter":{"Gt":[{"Attr":"age"},{"Literal":25}]}}
 {"op":"scan","table":"users","limit":100}
+{"op":"scan","table":"users","limit":100,"filter":{"And":[{"Eq":[{"Attr":"status"},{"Literal":"active"}]},{"Gt":[{"Attr":"age"},{"Literal":18}]}]}}
 {"op":"create_table","table":"users","partition_key":{"name":"user_id","type":"String"}}
 {"op":"list_tables"}
 {"op":"list_partition_keys","table":"users","limit":20}

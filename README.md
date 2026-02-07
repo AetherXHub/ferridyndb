@@ -4,7 +4,7 @@ A local, embedded, DynamoDB-style document database written in Rust with single-
 
 ## Features
 
-- **DynamoDB-compatible API** — Builder-pattern methods for `put_item`, `get_item`, `delete_item`, `update_item`, `query`, and `scan`
+- **DynamoDB-compatible API** — Builder-pattern methods for `put_item`, `get_item`, `delete_item`, `update_item`, `query`, and `scan` with server-side filter expressions
 - **Single-file storage** — Copy-on-write pages with atomic double-buffered header commits (no WAL)
 - **MVCC snapshot isolation** — Single writer, unlimited concurrent readers with version chains
 - **B+Tree indexing** — Efficient range scans with slotted pages and overflow support
@@ -56,6 +56,17 @@ db.create_table("events")
 let results = db.query("events")
     .partition_key("device_123")
     .sort_key_between(100.0, 200.0)
+    .execute()
+    .unwrap();
+
+// Query with server-side filter expression
+use ferridyn_core::api::FilterExpr;
+let results = db.query("events")
+    .partition_key("device_123")
+    .filter(FilterExpr::gt(
+        FilterExpr::attr("temperature"),
+        FilterExpr::Literal(json!(100.0)),
+    ))
     .execute()
     .unwrap();
 
@@ -124,7 +135,7 @@ assert_eq!(result.items[0]["name"], "Alice");
 # Compile all crates
 cargo build
 
-# Run all tests (511 tests across workspace)
+# Run all tests (592 tests across workspace)
 cargo test
 
 # Run tests for a specific crate
