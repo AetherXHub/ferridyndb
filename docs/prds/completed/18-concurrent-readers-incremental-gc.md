@@ -1,7 +1,7 @@
 # PRD: Concurrent Readers & Incremental GC
 
 **Priority:** 18
-**Status:** Approved
+**Status:** Complete
 **Origin:** redb design analysis — concurrency and scale improvements
 
 **Roadmap Sequencing:** Do **between PRD-10** (Change Streams) **and PRD-11** (Sort Key Range Queries). Change stream consumers poll reads while writes are happening; the current exclusive-lock model blocks them entirely during commits. Incremental GC prevents O(n) full scans as the database grows with GSIs + streams.
