@@ -150,6 +150,9 @@ pub enum QueryError {
 
     #[error("index key value is required")]
     IndexKeyRequired,
+
+    #[error("invalid index pagination cursor: {0}")]
+    InvalidIndexCursor(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

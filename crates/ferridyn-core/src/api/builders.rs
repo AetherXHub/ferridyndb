@@ -974,6 +974,7 @@ pub struct IndexQueryBuilder<'a> {
     limit: Option<usize>,
     scan_forward: bool,
     filter: Option<FilterExpr>,
+    exclusive_start_key: Option<Value>,
 }
 
 impl<'a> IndexQueryBuilder<'a> {
@@ -986,6 +987,7 @@ impl<'a> IndexQueryBuilder<'a> {
             limit: None,
             scan_forward: true,
             filter: None,
+            exclusive_start_key: None,
         }
     }
 
@@ -1013,12 +1015,19 @@ impl<'a> IndexQueryBuilder<'a> {
         self
     }
 
+    /// Set the exclusive start key for pagination.
+    pub fn exclusive_start_key(mut self, key: impl Into<Value>) -> Self {
+        self.exclusive_start_key = Some(key.into());
+        self
+    }
+
     /// Execute the index query.
     pub fn execute(self) -> Result<QueryResult, Error> {
         let search_value = self.key_value.ok_or(QueryError::IndexKeyRequired)?;
 
         self.db.read_snapshot(|store, catalog_root, snapshot_txn| {
             let entry = self.db.cached_get_table(store, catalog_root, &self.table)?;
+            let schema = &entry.schema;
 
             // Find the index definition.
             let index = entry
@@ -1035,10 +1044,14 @@ impl<'a> IndexQueryBuilder<'a> {
             )?;
 
             // Compute scan bounds for all entries with this indexed value.
-            // The index B+Tree keys start with the encoded indexed value as a
-            // "partition prefix", so compute_scan_bounds with no sort condition
-            // gives us the correct byte range.
             let (start_key, end_key) = compute_scan_bounds(&indexed_kv, None, None)?;
+
+            // Encode the exclusive_start_key if provided.
+            let skip_key = if let Some(ref esk) = self.exclusive_start_key {
+                Some(encode_index_exclusive_start_key(esk, schema, index)?)
+            } else {
+                None
+            };
 
             // Scan the index B+Tree (plain B+Tree, no MVCC wrapping).
             let index_entries = btree_ops::range_scan(
@@ -1049,8 +1062,22 @@ impl<'a> IndexQueryBuilder<'a> {
             )?;
 
             // Collect results by looking up each primary document via MVCC.
-            let mut items: Vec<Value> = Vec::new();
+            // Track index key bytes alongside documents for cursor building.
+            let mut items: Vec<(Vec<u8>, Value)> = Vec::new();
             for (index_key, _empty_val) in &index_entries {
+                // Skip items based on exclusive_start_key (direction-aware).
+                // Forward: skip items already seen (key <= cursor).
+                // Reverse: skip items already seen (key >= cursor).
+                if let Some(ref sk) = skip_key {
+                    if self.scan_forward {
+                        if *index_key <= *sk {
+                            continue;
+                        }
+                    } else if *index_key >= *sk {
+                        continue;
+                    }
+                }
+
                 // Decode the primary composite key bytes from the index entry.
                 let primary_key_bytes = key_utils::decode_primary_key_from_index_entry(index_key)?;
 
@@ -1073,7 +1100,7 @@ impl<'a> IndexQueryBuilder<'a> {
                         if is_ttl_expired(&val, &entry.schema) {
                             continue;
                         }
-                        items.push(val);
+                        items.push((index_key.clone(), val));
                     }
                     None => {
                         // Document deleted or invisible — lazy GC skip.
@@ -1089,15 +1116,18 @@ impl<'a> IndexQueryBuilder<'a> {
 
             // Evaluate limit (counts evaluated items) and filter.
             let mut result_items = Vec::new();
+            let mut last_evaluated_bytes: Option<Vec<u8>> = None;
             let mut has_more = false;
 
-            for (evaluated, val) in items.iter().enumerate() {
+            for (evaluated, (index_key_bytes, val)) in items.iter().enumerate() {
                 if let Some(limit) = self.limit
                     && evaluated >= limit
                 {
                     has_more = true;
                     break;
                 }
+
+                last_evaluated_bytes = Some(index_key_bytes.clone());
 
                 let passes = match &self.filter {
                     Some(filter) => filter.eval(val).unwrap_or(false),
@@ -1109,13 +1139,20 @@ impl<'a> IndexQueryBuilder<'a> {
                 }
             }
 
-            // IndexQueryBuilder doesn't support pagination cursors yet,
-            // but signal that more results exist if limit was hit.
-            let _ = has_more;
+            // Build pagination cursor if limit was hit and more items remain.
+            let last_evaluated_key = if has_more {
+                if let Some(ref last_key) = last_evaluated_bytes {
+                    Some(build_index_last_evaluated_key(last_key, schema, index)?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
             Ok(QueryResult {
                 items: result_items,
-                last_evaluated_key: None,
+                last_evaluated_key,
             })
         })
     }
@@ -1326,6 +1363,129 @@ fn build_last_evaluated_key(key_bytes: &[u8], schema: &TableSchema) -> Result<Va
     if let (Some(sk_def), Some(sk_val)) = (&schema.sort_key, sk) {
         obj.insert(sk_def.name.clone(), key_utils::key_value_to_json(&sk_val));
     }
+    Ok(Value::Object(obj))
+}
+
+/// Encode an index query exclusive_start_key JSON object into index B+Tree key bytes.
+fn encode_index_exclusive_start_key(
+    esk: &Value,
+    schema: &TableSchema,
+    index: &crate::types::IndexDefinition,
+) -> Result<Vec<u8>, Error> {
+    use crate::encoding::{binary, composite};
+
+    // Extract and validate the indexed attribute value.
+    let index_attr_val = esk.get(&index.index_key.name).ok_or_else(|| {
+        QueryError::InvalidIndexCursor(format!(
+            "missing indexed attribute '{}' in cursor",
+            index.index_key.name
+        ))
+    })?;
+    let index_kv = key_utils::json_to_key_value(
+        index_attr_val,
+        index.index_key.key_type,
+        &index.index_key.name,
+    )
+    .map_err(|e| {
+        QueryError::InvalidIndexCursor(format!(
+            "invalid type for indexed attribute '{}': {e}",
+            index.index_key.name
+        ))
+    })?;
+
+    // Extract and validate the partition key.
+    let pk_val = esk.get(&schema.partition_key.name).ok_or_else(|| {
+        QueryError::InvalidIndexCursor(format!(
+            "missing partition key '{}' in cursor",
+            schema.partition_key.name
+        ))
+    })?;
+    let pk = key_utils::json_to_key_value(
+        pk_val,
+        schema.partition_key.key_type,
+        &schema.partition_key.name,
+    )
+    .map_err(|e| {
+        QueryError::InvalidIndexCursor(format!(
+            "invalid type for partition key '{}': {e}",
+            schema.partition_key.name
+        ))
+    })?;
+
+    // Extract and validate the sort key (if table has one).
+    let sk = if let Some(ref sk_def) = schema.sort_key {
+        let sk_val = esk.get(&sk_def.name).ok_or_else(|| {
+            QueryError::InvalidIndexCursor(format!("missing sort key '{}' in cursor", sk_def.name))
+        })?;
+        Some(
+            key_utils::json_to_key_value(sk_val, sk_def.key_type, &sk_def.name).map_err(|e| {
+                QueryError::InvalidIndexCursor(format!(
+                    "invalid type for sort key '{}': {e}",
+                    sk_def.name
+                ))
+            })?,
+        )
+    } else {
+        None
+    };
+
+    // Build the primary composite key bytes.
+    let primary_key_bytes = composite::encode_composite(&pk, sk.as_ref())?;
+
+    // Build the index key: [tag][indexed_value][TAG_BINARY][primary_key_bytes]
+    // Same format as build_index_key() in key_utils.rs.
+    let mut index_key = Vec::new();
+
+    index_key.push(composite::key_value_tag(&index_kv));
+    index_key.extend(match &index_kv {
+        crate::encoding::KeyValue::String(s) => crate::encoding::string::encode_string(s),
+        crate::encoding::KeyValue::Number(n) => {
+            crate::encoding::number::encode_number(*n)?.to_vec()
+        }
+        crate::encoding::KeyValue::Binary(b) => binary::encode_binary(b),
+    });
+
+    index_key.push(composite::TAG_BINARY);
+    index_key.extend(&primary_key_bytes);
+
+    Ok(index_key)
+}
+
+/// Build a last_evaluated_key JSON object from index B+Tree key bytes.
+fn build_index_last_evaluated_key(
+    index_key_bytes: &[u8],
+    schema: &TableSchema,
+    index: &crate::types::IndexDefinition,
+) -> Result<Value, Error> {
+    if index_key_bytes.is_empty() {
+        return Err(crate::error::EncodingError::MalformedKey.into());
+    }
+
+    // Decode the indexed attribute value from the first component.
+    let tag = index_key_bytes[0];
+    let (index_kv, _consumed) = composite::decode_key_value(tag, &index_key_bytes[1..])?;
+
+    // Extract primary key bytes from the index entry.
+    let primary_bytes = key_utils::decode_primary_key_from_index_entry(index_key_bytes)?;
+
+    // Decode the primary composite key.
+    let has_sort_key = schema.sort_key.is_some();
+    let (pk, sk) = composite::decode_composite(&primary_bytes, has_sort_key)?;
+
+    // Build the JSON cursor object.
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        index.index_key.name.clone(),
+        key_utils::key_value_to_json(&index_kv),
+    );
+    obj.insert(
+        schema.partition_key.name.clone(),
+        key_utils::key_value_to_json(&pk),
+    );
+    if let (Some(sk_def), Some(sk_val)) = (&schema.sort_key, sk) {
+        obj.insert(sk_def.name.clone(), key_utils::key_value_to_json(&sk_val));
+    }
+
     Ok(Value::Object(obj))
 }
 

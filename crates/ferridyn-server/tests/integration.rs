@@ -779,6 +779,7 @@ async fn test_query_index() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -790,6 +791,7 @@ async fn test_query_index() {
             "data",
             "email-idx",
             json!("bob@example.com"),
+            None,
             None,
             None,
             None,
@@ -805,6 +807,7 @@ async fn test_query_index() {
             "data",
             "email-idx",
             json!("nobody@example.com"),
+            None,
             None,
             None,
             None,
@@ -878,7 +881,15 @@ async fn test_query_index_with_limit() {
 
     // Query with limit 2.
     let result = client
-        .query_index("data", "status-idx", json!("active"), Some(2), None, None)
+        .query_index(
+            "data",
+            "status-idx",
+            json!("active"),
+            Some(2),
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(result.items.len(), 2);
@@ -1133,4 +1144,124 @@ async fn test_server_condition_check_failed_response() {
     assert!(result.is_err());
     let err = format!("{:?}", result.unwrap_err());
     assert!(err.contains("ConditionCheckFailed"));
+}
+
+// ---------------------------------------------------------------------------
+// Index query pagination tests (PRD-04)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_index_pagination_over_wire() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    client
+        .create_table(
+            "data",
+            KeyDef {
+                name: "pk".to_string(),
+                key_type: "String".to_string(),
+            },
+            Some(KeyDef {
+                name: "sk".to_string(),
+                key_type: "String".to_string(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+    client
+        .create_schema(
+            "data",
+            "ITEM",
+            Some("Items"),
+            &[AttributeDefInput {
+                name: "status".to_string(),
+                attr_type: "String".to_string(),
+                required: false,
+            }],
+            false,
+        )
+        .await
+        .unwrap();
+
+    client
+        .create_index("data", "status-idx", "ITEM", "status", "String")
+        .await
+        .unwrap();
+
+    // Insert 10 items.
+    for i in 0..10 {
+        client
+            .put_item(
+                "data",
+                json!({
+                    "pk": format!("ITEM#{i:03}"),
+                    "sk": "info",
+                    "status": "active",
+                }),
+            )
+            .await
+            .unwrap();
+    }
+
+    // Page 1: limit 4.
+    let page1 = client
+        .query_index(
+            "data",
+            "status-idx",
+            json!("active"),
+            Some(4),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(page1.items.len(), 4);
+    assert!(page1.last_evaluated_key.is_some());
+
+    // Page 2: limit 4 with cursor.
+    let page2 = client
+        .query_index(
+            "data",
+            "status-idx",
+            json!("active"),
+            Some(4),
+            None,
+            None,
+            page1.last_evaluated_key,
+        )
+        .await
+        .unwrap();
+    assert_eq!(page2.items.len(), 4);
+    assert!(page2.last_evaluated_key.is_some());
+
+    // Page 3: limit 4 with cursor — should get 2 remaining.
+    let page3 = client
+        .query_index(
+            "data",
+            "status-idx",
+            json!("active"),
+            Some(4),
+            None,
+            None,
+            page2.last_evaluated_key,
+        )
+        .await
+        .unwrap();
+    assert_eq!(page3.items.len(), 2);
+    assert!(page3.last_evaluated_key.is_none());
+
+    // Verify all 10 items covered, no duplicates.
+    let mut all_pks: Vec<String> = Vec::new();
+    for page in [&page1.items, &page2.items, &page3.items] {
+        for item in page {
+            all_pks.push(item["pk"].as_str().unwrap().to_string());
+        }
+    }
+    all_pks.sort();
+    all_pks.dedup();
+    assert_eq!(all_pks.len(), 10);
 }

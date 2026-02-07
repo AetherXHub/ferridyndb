@@ -37,7 +37,7 @@ fn encode_key_value(kv: &KeyValue) -> Result<Vec<u8>, EncodingError> {
 }
 
 /// Return the type tag for a `KeyValue`.
-fn key_value_tag(kv: &KeyValue) -> u8 {
+pub(crate) fn key_value_tag(kv: &KeyValue) -> u8 {
     match kv {
         KeyValue::String(_) => TAG_STRING,
         KeyValue::Number(_) => TAG_NUMBER,
@@ -49,7 +49,7 @@ fn key_value_tag(kv: &KeyValue) -> u8 {
 ///
 /// Returns `(decoded_value, bytes_consumed)` where bytes_consumed does NOT include
 /// the tag byte (the caller is expected to have already consumed the tag).
-fn decode_key_value(tag: u8, data: &[u8]) -> Result<(KeyValue, usize), EncodingError> {
+pub(crate) fn decode_key_value(tag: u8, data: &[u8]) -> Result<(KeyValue, usize), EncodingError> {
     match tag {
         TAG_STRING => {
             let (s, consumed) = super::string::decode_string(data)?;

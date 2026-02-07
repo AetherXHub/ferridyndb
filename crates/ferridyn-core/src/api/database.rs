@@ -3213,8 +3213,8 @@ mod partition_schema_and_index_tests {
             .unwrap();
         assert_eq!(result.items.len(), 50);
 
-        // Pagination not yet implemented — last_evaluated_key is always None.
-        assert!(result.last_evaluated_key.is_none());
+        // Pagination cursor should be present when limit truncates results.
+        assert!(result.last_evaluated_key.is_some());
     }
 
     // -------------------------------------------------------------------
@@ -3362,8 +3362,8 @@ mod partition_schema_and_index_tests {
             .unwrap();
         assert_eq!(result.items.len(), 2);
         assert!(
-            result.last_evaluated_key.is_none(),
-            "pagination not yet implemented"
+            result.last_evaluated_key.is_some(),
+            "pagination cursor should be returned when limit truncates"
         );
 
         // Without limit → all 3 matching docs.
@@ -4951,5 +4951,359 @@ mod condition_expression_tests {
         // Should fail with stale version.
         let result = db.put_item_conditional("items", json!({"id": "a", "val": 3}), vi.version);
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod index_pagination_tests {
+    use super::*;
+    use crate::types::{AttrType, KeyType};
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    fn create_test_db() -> (FerridynDB, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = FerridynDB::create(&db_path).unwrap();
+        (db, dir)
+    }
+
+    // -----------------------------------------------------------------------
+    // Index query pagination tests (PRD-04)
+    // -----------------------------------------------------------------------
+
+    /// Helper: create a table with sort key, partition schema, and index.
+    fn setup_table_with_sort_key_and_index(db: &FerridynDB) {
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .sort_key("sk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_partition_schema("data")
+            .prefix("ITEM")
+            .description("Items")
+            .attribute("status", AttrType::String, false)
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("status-idx")
+            .partition_schema("ITEM")
+            .index_key("status", KeyType::String)
+            .execute()
+            .unwrap();
+    }
+
+    #[test]
+    fn test_index_pagination_basic() {
+        let (db, _dir) = create_test_db();
+        setup_table_with_sort_key_and_index(&db);
+
+        // Insert 25 items all with status "active".
+        for i in 0..25 {
+            db.put_item(
+                "data",
+                json!({
+                    "pk": format!("ITEM#{i:03}"),
+                    "sk": "info",
+                    "status": "active",
+                    "seq": i,
+                }),
+            )
+            .unwrap();
+        }
+
+        // Page 1: limit 10.
+        let page1 = db
+            .query_index("data", "status-idx")
+            .key_value("active")
+            .limit(10)
+            .execute()
+            .unwrap();
+        assert_eq!(page1.items.len(), 10);
+        assert!(page1.last_evaluated_key.is_some());
+
+        // Page 2: limit 10 with cursor from page 1.
+        let page2 = db
+            .query_index("data", "status-idx")
+            .key_value("active")
+            .limit(10)
+            .exclusive_start_key(page1.last_evaluated_key.unwrap())
+            .execute()
+            .unwrap();
+        assert_eq!(page2.items.len(), 10);
+        assert!(page2.last_evaluated_key.is_some());
+
+        // Page 3: limit 10 with cursor from page 2 — should get 5 remaining.
+        let page3 = db
+            .query_index("data", "status-idx")
+            .key_value("active")
+            .limit(10)
+            .exclusive_start_key(page2.last_evaluated_key.unwrap())
+            .execute()
+            .unwrap();
+        assert_eq!(page3.items.len(), 5);
+        assert!(page3.last_evaluated_key.is_none());
+
+        // Verify all 25 items are covered with no duplicates.
+        let mut all_pks: Vec<String> = Vec::new();
+        for page in [&page1.items, &page2.items, &page3.items] {
+            for item in page {
+                all_pks.push(item["pk"].as_str().unwrap().to_string());
+            }
+        }
+        all_pks.sort();
+        all_pks.dedup();
+        assert_eq!(all_pks.len(), 25);
+    }
+
+    #[test]
+    fn test_index_pagination_exact_page() {
+        let (db, _dir) = create_test_db();
+        setup_table_with_sort_key_and_index(&db);
+
+        // Insert exactly 10 items.
+        for i in 0..10 {
+            db.put_item(
+                "data",
+                json!({
+                    "pk": format!("ITEM#{i:03}"),
+                    "sk": "info",
+                    "status": "active",
+                }),
+            )
+            .unwrap();
+        }
+
+        // limit 10 on 10 items — should get all, no cursor.
+        let result = db
+            .query_index("data", "status-idx")
+            .key_value("active")
+            .limit(10)
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 10);
+        assert!(
+            result.last_evaluated_key.is_none(),
+            "no cursor when all items fit in one page"
+        );
+    }
+
+    #[test]
+    fn test_index_pagination_single_item_pages() {
+        let (db, _dir) = create_test_db();
+        setup_table_with_sort_key_and_index(&db);
+
+        for i in 0..3 {
+            db.put_item(
+                "data",
+                json!({
+                    "pk": format!("ITEM#{i:03}"),
+                    "sk": "info",
+                    "status": "pending",
+                }),
+            )
+            .unwrap();
+        }
+
+        // Page through with limit=1.
+        let page1 = db
+            .query_index("data", "status-idx")
+            .key_value("pending")
+            .limit(1)
+            .execute()
+            .unwrap();
+        assert_eq!(page1.items.len(), 1);
+        assert!(page1.last_evaluated_key.is_some());
+
+        let page2 = db
+            .query_index("data", "status-idx")
+            .key_value("pending")
+            .limit(1)
+            .exclusive_start_key(page1.last_evaluated_key.unwrap())
+            .execute()
+            .unwrap();
+        assert_eq!(page2.items.len(), 1);
+        assert!(page2.last_evaluated_key.is_some());
+
+        let page3 = db
+            .query_index("data", "status-idx")
+            .key_value("pending")
+            .limit(1)
+            .exclusive_start_key(page2.last_evaluated_key.unwrap())
+            .execute()
+            .unwrap();
+        assert_eq!(page3.items.len(), 1);
+        assert!(page3.last_evaluated_key.is_none());
+
+        // All three items should be distinct.
+        let pk1 = page1.items[0]["pk"].as_str().unwrap();
+        let pk2 = page2.items[0]["pk"].as_str().unwrap();
+        let pk3 = page3.items[0]["pk"].as_str().unwrap();
+        assert_ne!(pk1, pk2);
+        assert_ne!(pk2, pk3);
+        assert_ne!(pk1, pk3);
+    }
+
+    #[test]
+    fn test_index_pagination_reverse_scan() {
+        let (db, _dir) = create_test_db();
+        setup_table_with_sort_key_and_index(&db);
+
+        for i in 0..6 {
+            db.put_item(
+                "data",
+                json!({
+                    "pk": format!("ITEM#{i:03}"),
+                    "sk": "info",
+                    "status": "active",
+                }),
+            )
+            .unwrap();
+        }
+
+        // Forward scan to collect all items in forward order.
+        let all_forward = db
+            .query_index("data", "status-idx")
+            .key_value("active")
+            .execute()
+            .unwrap();
+        assert_eq!(all_forward.items.len(), 6);
+
+        // Reverse scan, full — should be in reverse order.
+        let all_reverse = db
+            .query_index("data", "status-idx")
+            .key_value("active")
+            .scan_forward(false)
+            .execute()
+            .unwrap();
+        assert_eq!(all_reverse.items.len(), 6);
+
+        let fwd_pks: Vec<&str> = all_forward
+            .items
+            .iter()
+            .map(|v| v["pk"].as_str().unwrap())
+            .collect();
+        let rev_pks: Vec<&str> = all_reverse
+            .items
+            .iter()
+            .map(|v| v["pk"].as_str().unwrap())
+            .collect();
+        let mut fwd_reversed = fwd_pks.clone();
+        fwd_reversed.reverse();
+        assert_eq!(rev_pks, fwd_reversed);
+
+        // Reverse scan with limit 3, then page 2.
+        let page1 = db
+            .query_index("data", "status-idx")
+            .key_value("active")
+            .scan_forward(false)
+            .limit(3)
+            .execute()
+            .unwrap();
+        assert_eq!(page1.items.len(), 3);
+        assert!(page1.last_evaluated_key.is_some());
+
+        let page2 = db
+            .query_index("data", "status-idx")
+            .key_value("active")
+            .scan_forward(false)
+            .limit(3)
+            .exclusive_start_key(page1.last_evaluated_key.unwrap())
+            .execute()
+            .unwrap();
+        assert_eq!(page2.items.len(), 3);
+        assert!(page2.last_evaluated_key.is_none());
+
+        // Combined pages should equal the full reverse scan.
+        let mut combined_pks: Vec<String> = Vec::new();
+        for item in page1.items.iter().chain(page2.items.iter()) {
+            combined_pks.push(item["pk"].as_str().unwrap().to_string());
+        }
+        let full_rev_pks: Vec<String> = all_reverse
+            .items
+            .iter()
+            .map(|v| v["pk"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(combined_pks, full_rev_pks);
+    }
+
+    #[test]
+    fn test_index_pagination_invalid_cursor_missing_index_attr() {
+        let (db, _dir) = create_test_db();
+        setup_table_with_sort_key_and_index(&db);
+
+        db.put_item(
+            "data",
+            json!({"pk": "ITEM#001", "sk": "info", "status": "active"}),
+        )
+        .unwrap();
+
+        // Cursor missing the indexed attribute "status".
+        let result = db
+            .query_index("data", "status-idx")
+            .key_value("active")
+            .limit(1)
+            .exclusive_start_key(json!({"pk": "ITEM#001", "sk": "info"}))
+            .execute();
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("missing indexed attribute"),
+            "error should mention missing indexed attribute, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_index_pagination_invalid_cursor_missing_pk() {
+        let (db, _dir) = create_test_db();
+        setup_table_with_sort_key_and_index(&db);
+
+        db.put_item(
+            "data",
+            json!({"pk": "ITEM#001", "sk": "info", "status": "active"}),
+        )
+        .unwrap();
+
+        // Cursor missing the partition key "pk".
+        let result = db
+            .query_index("data", "status-idx")
+            .key_value("active")
+            .limit(1)
+            .exclusive_start_key(json!({"status": "active", "sk": "info"}))
+            .execute();
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("missing partition key"),
+            "error should mention missing partition key, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_index_pagination_invalid_cursor_type_mismatch() {
+        let (db, _dir) = create_test_db();
+        setup_table_with_sort_key_and_index(&db);
+
+        db.put_item(
+            "data",
+            json!({"pk": "ITEM#001", "sk": "info", "status": "active"}),
+        )
+        .unwrap();
+
+        // Cursor with wrong type for indexed attribute (number instead of string).
+        let result = db
+            .query_index("data", "status-idx")
+            .key_value("active")
+            .limit(1)
+            .exclusive_start_key(json!({"status": 42, "pk": "ITEM#001", "sk": "info"}))
+            .execute();
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("invalid") || err_msg.contains("mismatch"),
+            "error should mention type issue, got: {err_msg}"
+        );
     }
 }

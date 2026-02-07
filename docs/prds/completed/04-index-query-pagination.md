@@ -1,7 +1,7 @@
 # PRD: Index Query Pagination
 
 **Priority:** 4
-**Status:** Approved
+**Status:** Complete
 **Proposal:** [docs/proposals/accepted/index-query-pagination.md](../proposals/accepted/index-query-pagination.md)
 
 ## Summary

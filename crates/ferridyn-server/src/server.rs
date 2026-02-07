@@ -237,6 +237,7 @@ fn dispatch(db: &FerridynDB, req: Request) -> Response {
             limit,
             scan_forward,
             filter,
+            exclusive_start_key,
         } => handle_query_index(
             db,
             &table,
@@ -245,6 +246,7 @@ fn dispatch(db: &FerridynDB, req: Request) -> Response {
             limit,
             scan_forward,
             filter,
+            exclusive_start_key,
         ),
     }
 }
@@ -668,6 +670,7 @@ fn handle_query_index(
     limit: Option<usize>,
     scan_forward: Option<bool>,
     filter: Option<FilterExpr>,
+    exclusive_start_key: Option<serde_json::Value>,
 ) -> Response {
     let mut builder = db.query_index(table, index_name).key_value(key_value);
     if let Some(n) = limit {
@@ -678,6 +681,9 @@ fn handle_query_index(
     }
     if let Some(f) = filter {
         builder = builder.filter(f);
+    }
+    if let Some(esk) = exclusive_start_key {
+        builder = builder.exclusive_start_key(esk);
     }
     match builder.execute() {
         Ok(result) => Response::ok_items(result.items, result.last_evaluated_key),

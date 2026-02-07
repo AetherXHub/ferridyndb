@@ -584,6 +584,7 @@ impl FerridynClient {
     }
 
     /// Query a secondary index.
+    #[allow(clippy::too_many_arguments)]
     pub async fn query_index(
         &mut self,
         table: &str,
@@ -592,6 +593,7 @@ impl FerridynClient {
         limit: Option<usize>,
         scan_forward: Option<bool>,
         filter: Option<FilterExpr>,
+        exclusive_start_key: Option<Value>,
     ) -> Result<QueryResult> {
         let mut req = serde_json::json!({
             "op": "query_index",
@@ -608,6 +610,9 @@ impl FerridynClient {
         }
         if let Some(f) = filter {
             obj.insert("filter".to_string(), serde_json::to_value(f).unwrap());
+        }
+        if let Some(esk) = exclusive_start_key {
+            obj.insert("exclusive_start_key".to_string(), esk);
         }
         let resp = self.send_request(&req).await?;
         items_from_response(&resp)

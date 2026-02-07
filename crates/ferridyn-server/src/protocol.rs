@@ -146,6 +146,8 @@ pub enum Request {
         scan_forward: Option<bool>,
         #[serde(default)]
         filter: Option<FilterExpr>,
+        #[serde(default)]
+        exclusive_start_key: Option<Value>,
     },
 }
 

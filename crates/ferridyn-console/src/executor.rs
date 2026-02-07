@@ -443,6 +443,7 @@ fn exec_query_index(
     desc: bool,
 ) -> Result<CommandResult, ClientError> {
     let fwd = if desc { Some(false) } else { None };
-    let result = rt.block_on(client.query_index(table, index_name, key_value, limit, fwd, None))?;
+    let result =
+        rt.block_on(client.query_index(table, index_name, key_value, limit, fwd, None, None))?;
     Ok(CommandResult::QueryResult(result))
 }
