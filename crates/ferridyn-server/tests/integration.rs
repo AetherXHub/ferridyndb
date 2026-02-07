@@ -4,7 +4,7 @@ use serde_json::json;
 use tempfile::tempdir;
 use tokio::time::{Duration, sleep};
 
-use ferridyn_core::api::FerridynDB;
+use ferridyn_core::api::{FerridynDB, FilterExpr};
 use ferridyn_server::client::{AttributeDefInput, FerridynClient, UpdateActionInput};
 use ferridyn_server::protocol::KeyDef;
 use ferridyn_server::server::FerridynServer;
@@ -998,4 +998,139 @@ async fn test_scan_with_filter_over_wire() {
     for item in &result.items {
         assert!(item["priority"].as_i64().unwrap() > 3);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Condition expression tests (Phase 4)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_server_put_with_condition() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    client
+        .create_table(
+            "items",
+            KeyDef {
+                name: "id".to_string(),
+                key_type: "String".to_string(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Put with attribute_not_exists on new item → passes.
+    client
+        .put_item_with_condition(
+            "items",
+            json!({"id": "a", "val": 1}),
+            FilterExpr::attribute_not_exists("id"),
+        )
+        .await
+        .unwrap();
+
+    let item = client
+        .get_item("items", json!("a"), None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(item["val"], 1);
+
+    // Put with attribute_not_exists on existing item → fails.
+    let result = client
+        .put_item_with_condition(
+            "items",
+            json!({"id": "a", "val": 2}),
+            FilterExpr::attribute_not_exists("id"),
+        )
+        .await;
+    assert!(result.is_err());
+
+    // Original value should remain.
+    let item = client
+        .get_item("items", json!("a"), None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(item["val"], 1);
+}
+
+#[tokio::test]
+async fn test_server_delete_with_condition() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    client
+        .create_table(
+            "items",
+            KeyDef {
+                name: "id".to_string(),
+                key_type: "String".to_string(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    client
+        .put_item("items", json!({"id": "a", "status": "archived"}))
+        .await
+        .unwrap();
+
+    // Delete with matching condition → passes.
+    client
+        .delete_item_with_condition(
+            "items",
+            json!("a"),
+            None,
+            FilterExpr::eq(
+                FilterExpr::attr("status"),
+                FilterExpr::literal(json!("archived")),
+            ),
+        )
+        .await
+        .unwrap();
+
+    let item = client.get_item("items", json!("a"), None).await.unwrap();
+    assert!(item.is_none());
+}
+
+#[tokio::test]
+async fn test_server_condition_check_failed_response() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    client
+        .create_table(
+            "items",
+            KeyDef {
+                name: "id".to_string(),
+                key_type: "String".to_string(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    client
+        .put_item("items", json!({"id": "a", "val": 1}))
+        .await
+        .unwrap();
+
+    // Condition fails → server returns ConditionCheckFailed error.
+    let result = client
+        .put_item_with_condition(
+            "items",
+            json!({"id": "a", "val": 2}),
+            FilterExpr::attribute_not_exists("id"),
+        )
+        .await;
+    assert!(result.is_err());
+    let err = format!("{:?}", result.unwrap_err());
+    assert!(err.contains("ConditionCheckFailed"));
 }

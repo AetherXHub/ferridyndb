@@ -15,7 +15,7 @@ DynamoDB's API is simple and effective for key-value and document workloads, but
 This is a Cargo workspace. Build/test from the repository root:
 
 - `cargo build` — compile all crates
-- `cargo test` — run all tests across the workspace (592 tests)
+- `cargo test` — run all tests across the workspace (614 tests)
 - `cargo test -p ferridyn-core` — test only the core crate
 - `cargo test -p ferridyn-core <test_name>` — run a single test by name
 - `cargo clippy --workspace -- -D warnings` — lint all crates (zero warnings required)
@@ -35,7 +35,7 @@ Six-layer stack, bottom to top:
 5. **Table Catalog** (`catalog/`) — Schema definitions (table name, partition key name+type, optional sort key name+type), partition schemas (prefix-based entity type metadata with attributes), and secondary index definitions. Stored in its own B+Tree rooted from the header.
 6. **MVCC / Transactions** (`mvcc/`) — Snapshot isolation. Single writer, unlimited concurrent readers. Latest document version inline in B+Tree leaf, older versions in overflow chain. Each document carries `created_txn` and `deleted_txn` IDs. Visibility: `created_txn <= snapshot && (deleted_txn is None || deleted_txn > snapshot)`.
 
-Public API (`api/`) sits on top: `put/get/delete/update/query/scan/query_index/transact`, plus server-side filter expressions and introspection for partition schemas and indexes.
+Public API (`api/`) sits on top: `put/get/delete/update/query/scan/query_index/transact`, plus server-side filter expressions, condition expressions on write operations, and introspection for partition schemas and indexes.
 
 Documents are stored on disk as MessagePack (via rmp-serde) for compactness. The public API accepts and returns `serde_json::Value`.
 
@@ -58,7 +58,7 @@ crates/
       client.rs        # FerridynClient — async client for multi-process access
       protocol.rs      # Wire protocol (JSON over length-prefixed frames)
     tests/
-      integration.rs   # Server integration tests (18 tests)
+      integration.rs   # Server integration tests (21 tests)
   ferridyn-console/    # Interactive CLI client (connects to server via Unix socket)
     src/
       parser.rs        # SQL-like command parser

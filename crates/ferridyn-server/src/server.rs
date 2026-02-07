@@ -136,20 +136,23 @@ fn dispatch(db: &FerridynDB, req: Request) -> Response {
             table,
             item,
             expected_version,
-        } => handle_put_item(db, &table, item, expected_version),
+            condition,
+        } => handle_put_item(db, &table, item, expected_version, condition),
 
         Request::DeleteItem {
             table,
             partition_key,
             sort_key,
-        } => handle_delete_item(db, &table, partition_key, sort_key),
+            condition,
+        } => handle_delete_item(db, &table, partition_key, sort_key, condition),
 
         Request::UpdateItem {
             table,
             partition_key,
             sort_key,
             updates,
-        } => handle_update_item(db, &table, partition_key, sort_key, updates),
+            condition,
+        } => handle_update_item(db, &table, partition_key, sort_key, updates, condition),
 
         Request::Query {
             table,
@@ -288,9 +291,12 @@ fn handle_put_item(
     table: &str,
     item: serde_json::Value,
     expected_version: Option<u64>,
+    condition: Option<FilterExpr>,
 ) -> Response {
     let result = if let Some(ev) = expected_version {
         db.put_item_conditional(table, item, ev)
+    } else if let Some(cond) = condition {
+        db.put(table, item).condition(cond).execute()
     } else {
         db.put_item(table, item)
     };
@@ -305,10 +311,14 @@ fn handle_delete_item(
     table: &str,
     partition_key: serde_json::Value,
     sort_key: Option<serde_json::Value>,
+    condition: Option<FilterExpr>,
 ) -> Response {
     let mut builder = db.delete_item(table).partition_key(partition_key);
     if let Some(sk) = sort_key {
         builder = builder.sort_key(sk);
+    }
+    if let Some(cond) = condition {
+        builder = builder.condition(cond);
     }
     match builder.execute() {
         Ok(()) => Response::ok_empty(),
@@ -322,6 +332,7 @@ fn handle_update_item(
     partition_key: serde_json::Value,
     sort_key: Option<serde_json::Value>,
     updates: Vec<UpdateActionWire>,
+    condition: Option<FilterExpr>,
 ) -> Response {
     let mut builder = db.update_item(table).partition_key(partition_key);
     if let Some(sk) = sort_key {
@@ -372,6 +383,9 @@ fn handle_update_item(
                 return Response::error("InvalidUpdateAction", format!("unknown action: {other}"));
             }
         }
+    }
+    if let Some(cond) = condition {
+        builder = builder.condition(cond);
     }
     match builder.execute() {
         Ok(()) => Response::ok_empty(),
@@ -774,6 +788,9 @@ fn dyn_error_to_response(err: DynError) -> Response {
     match &err {
         DynError::Transaction(TxnError::VersionMismatch { expected, actual }) => {
             Response::version_mismatch(*expected, *actual)
+        }
+        DynError::Transaction(TxnError::ConditionCheckFailed(msg)) => {
+            Response::error("ConditionCheckFailed", msg.clone())
         }
         DynError::Schema(SchemaError::TableNotFound(name)) => {
             Response::error("TableNotFound", format!("table not found: {name}"))

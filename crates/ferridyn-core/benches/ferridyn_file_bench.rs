@@ -202,6 +202,7 @@ fn bench_bulk_ops(c: &mut Criterion) {
                     txn.put_item(
                         "events",
                         json!({"pk": format!("user-{}", i / 100), "sk": i as f64, "data": format!("v{i}")}),
+                        None,
                     )?;
                 }
                 Ok(())

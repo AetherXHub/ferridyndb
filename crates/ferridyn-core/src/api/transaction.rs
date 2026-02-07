@@ -2,11 +2,12 @@ use serde_json::Value;
 
 use crate::catalog;
 use crate::encoding::composite;
-use crate::error::{Error, QueryError, SchemaError, StorageError};
+use crate::error::{Error, QueryError, SchemaError, StorageError, TxnError};
 use crate::mvcc::ops as mvcc_ops;
 use crate::storage::tombstone::TombstoneEntry;
 use crate::types::{PageId, TxnId, VersionedItem};
 
+use super::filter::FilterExpr;
 use super::key_utils;
 use super::page_store::BufferedPageStore;
 use super::update::{self, UpdateAction};
@@ -132,9 +133,34 @@ pub struct Transaction {
     pub(crate) tombstones: Vec<TombstoneEntry>,
 }
 
+/// Evaluate a condition expression against an existing document.
+///
+/// If the item does not exist, the condition is evaluated against an empty
+/// object `{}`, matching DynamoDB behavior where `attribute_not_exists`
+/// passes for non-existent items.
+fn evaluate_condition(condition: &FilterExpr, existing_doc: Option<&Value>) -> Result<(), Error> {
+    let empty = Value::Object(serde_json::Map::new());
+    let doc = existing_doc.unwrap_or(&empty);
+    let passed = condition.eval(doc)?;
+    if passed {
+        Ok(())
+    } else {
+        Err(TxnError::ConditionCheckFailed("the conditional request failed".to_string()).into())
+    }
+}
+
 impl Transaction {
     /// Insert or replace an item in a table.
-    pub fn put_item(&mut self, table: &str, document: Value) -> Result<(), Error> {
+    ///
+    /// If `condition` is provided, the existing item (or empty object for
+    /// non-existent items) must satisfy the condition or the operation fails
+    /// with `ConditionCheckFailed`.
+    pub fn put_item(
+        &mut self,
+        table: &str,
+        document: Value,
+        condition: Option<&FilterExpr>,
+    ) -> Result<(), Error> {
         // 1. Validate document size.
         let doc_bytes = key_utils::validate_document_size(&document)?;
 
@@ -168,8 +194,8 @@ impl Transaction {
         // 5. Encode composite key.
         let composite_key = composite::encode_composite(&pk, sk.as_ref())?;
 
-        // 5a. Read old document for index maintenance (before the write).
-        let old_doc: Option<Value> = if !entry.indexes.is_empty() {
+        // 5a. Read old document for condition evaluation and index maintenance.
+        let old_doc: Option<Value> = if condition.is_some() || !entry.indexes.is_empty() {
             mvcc_ops::mvcc_get(
                 &self.store,
                 entry.data_root_page,
@@ -184,6 +210,11 @@ impl Transaction {
         } else {
             None
         };
+
+        // 5b. Evaluate condition expression against existing document.
+        if let Some(cond) = condition {
+            evaluate_condition(cond, old_doc.as_ref())?;
+        }
 
         // 6. Put with MVCC versioning.
         let new_data_root = mvcc_ops::mvcc_put(
@@ -394,11 +425,15 @@ impl Transaction {
     }
 
     /// Delete an item by key.
+    ///
+    /// If `condition` is provided, the existing item must satisfy the condition
+    /// or the operation fails with `ConditionCheckFailed`.
     pub fn delete_item(
         &mut self,
         table: &str,
         partition_key: &Value,
         sort_key: Option<&Value>,
+        condition: Option<&FilterExpr>,
     ) -> Result<(), Error> {
         let entry = catalog::ops::get_table(&self.store, self.catalog_root, table)?;
         let schema = &entry.schema;
@@ -423,8 +458,8 @@ impl Transaction {
 
         let composite_key = composite::encode_composite(&pk, sk.as_ref())?;
 
-        // Read document before delete for index maintenance.
-        let old_doc: Option<Value> = if !entry.indexes.is_empty() {
+        // Read document before delete for condition evaluation and index maintenance.
+        let old_doc: Option<Value> = if condition.is_some() || !entry.indexes.is_empty() {
             mvcc_ops::mvcc_get(
                 &self.store,
                 entry.data_root_page,
@@ -439,6 +474,11 @@ impl Transaction {
         } else {
             None
         };
+
+        // Evaluate condition expression against existing document.
+        if let Some(cond) = condition {
+            evaluate_condition(cond, old_doc.as_ref())?;
+        }
 
         let new_data_root = mvcc_ops::mvcc_delete(
             &mut self.store,
@@ -474,12 +514,17 @@ impl Transaction {
     ///
     /// If the item doesn't exist, an upsert creates it with the key
     /// attributes plus the SET values.
+    ///
+    /// If `condition` is provided, the existing item (or empty object for
+    /// non-existent items) must satisfy the condition or the operation fails
+    /// with `ConditionCheckFailed`.
     pub fn update_item(
         &mut self,
         table: &str,
         partition_key: &Value,
         sort_key: Option<&Value>,
         actions: &[UpdateAction],
+        condition: Option<&FilterExpr>,
     ) -> Result<(), Error> {
         // 1. Look up table schema.
         let entry = catalog::ops::get_table(&self.store, self.catalog_root, table)?;
@@ -535,6 +580,11 @@ impl Transaction {
                 (None, Value::Object(base))
             }
         };
+
+        // 5a. Evaluate condition expression against existing document.
+        if let Some(cond) = condition {
+            evaluate_condition(cond, old_doc.as_ref())?;
+        }
 
         // 6. Apply update actions.
         update::apply_updates(&mut document, actions)?;

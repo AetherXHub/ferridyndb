@@ -77,6 +77,9 @@ pub enum TxnError {
 
     #[error("version mismatch: expected {expected}, actual {actual}")]
     VersionMismatch { expected: u64, actual: u64 },
+
+    #[error("condition check failed: {0}")]
+    ConditionCheckFailed(String),
 }
 
 #[derive(Debug, Error)]

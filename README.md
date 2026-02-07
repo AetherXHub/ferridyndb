@@ -11,6 +11,7 @@ A local, embedded, DynamoDB-style document database written in Rust with single-
 - **Partition schemas & secondary indexes** — Declare entity types with prefix-based schemas, create scoped secondary indexes with automatic backfill, and query by indexed attribute values
 - **Byte-ordered key encoding** — Enables fast `memcmp`-based comparisons for partition and sort keys
 - **TTL support** — Optional time-to-live attributes with automatic expiry filtering
+- **Condition expressions** — Predicates on write operations (`put`, `delete`, `update`) that evaluate against the existing item before proceeding, enabling prevent-overwrite and business rule enforcement
 - **Version-aware API** — Optimistic concurrency control with versioned reads and conditional writes
 - **Unix socket server** — Multi-process access with async client library
 
@@ -135,7 +136,7 @@ assert_eq!(result.items[0]["name"], "Alice");
 # Compile all crates
 cargo build
 
-# Run all tests (592 tests across workspace)
+# Run all tests (614 tests across workspace)
 cargo test
 
 # Run tests for a specific crate

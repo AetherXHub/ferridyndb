@@ -101,14 +101,14 @@ impl<'a> WriteBatch<'a> {
             for op in self.ops {
                 match op {
                     BatchOp::Put { table, document } => {
-                        txn.put_item(&table, document)?;
+                        txn.put_item(&table, document, None)?;
                     }
                     BatchOp::Delete {
                         table,
                         partition_key,
                         sort_key,
                     } => {
-                        txn.delete_item(&table, &partition_key, sort_key.as_ref())?;
+                        txn.delete_item(&table, &partition_key, sort_key.as_ref(), None)?;
                     }
                 }
             }

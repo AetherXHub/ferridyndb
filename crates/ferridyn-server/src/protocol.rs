@@ -27,12 +27,16 @@ pub enum Request {
         item: Value,
         #[serde(default)]
         expected_version: Option<u64>,
+        #[serde(default)]
+        condition: Option<FilterExpr>,
     },
     DeleteItem {
         table: String,
         partition_key: Value,
         #[serde(default)]
         sort_key: Option<Value>,
+        #[serde(default)]
+        condition: Option<FilterExpr>,
     },
     UpdateItem {
         table: String,
@@ -40,6 +44,8 @@ pub enum Request {
         #[serde(default)]
         sort_key: Option<Value>,
         updates: Vec<UpdateActionWire>,
+        #[serde(default)]
+        condition: Option<FilterExpr>,
     },
     Query {
         table: String,

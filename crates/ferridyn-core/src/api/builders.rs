@@ -257,12 +257,49 @@ impl<'a> GetItemVersionedBuilder<'a> {
 // DeleteItemBuilder
 // ---------------------------------------------------------------------------
 
+/// Builder for inserting or replacing an item with optional condition.
+pub struct PutItemBuilder<'a> {
+    db: &'a FerridynDB,
+    table: String,
+    document: Value,
+    condition: Option<FilterExpr>,
+}
+
+impl<'a> PutItemBuilder<'a> {
+    pub(crate) fn new(db: &'a FerridynDB, table: String, document: Value) -> Self {
+        Self {
+            db,
+            table,
+            document,
+            condition: None,
+        }
+    }
+
+    /// Set a condition expression that must be satisfied by the existing item
+    /// (or empty object for non-existent items) for the put to proceed.
+    pub fn condition(mut self, expr: FilterExpr) -> Self {
+        self.condition = Some(expr);
+        self
+    }
+
+    /// Execute the put operation.
+    pub fn execute(self) -> Result<(), Error> {
+        let table = self.table;
+        let document = self.document;
+        let condition = self.condition;
+
+        self.db
+            .transact(move |txn| txn.put_item(&table, document, condition.as_ref()))
+    }
+}
+
 /// Builder for deleting an item by key.
 pub struct DeleteItemBuilder<'a> {
     db: &'a FerridynDB,
     table: String,
     partition_key: Option<Value>,
     sort_key: Option<Value>,
+    condition: Option<FilterExpr>,
 }
 
 impl<'a> DeleteItemBuilder<'a> {
@@ -272,6 +309,7 @@ impl<'a> DeleteItemBuilder<'a> {
             table,
             partition_key: None,
             sort_key: None,
+            condition: None,
         }
     }
 
@@ -287,14 +325,23 @@ impl<'a> DeleteItemBuilder<'a> {
         self
     }
 
+    /// Set a condition expression that must be satisfied by the existing item
+    /// for the delete to proceed.
+    pub fn condition(mut self, expr: FilterExpr) -> Self {
+        self.condition = Some(expr);
+        self
+    }
+
     /// Execute the delete operation.
     pub fn execute(self) -> Result<(), Error> {
         let pk_val = self.partition_key.ok_or(QueryError::PartitionKeyRequired)?;
         let sk_val = self.sort_key;
         let table = self.table;
+        let condition = self.condition;
 
-        self.db
-            .transact(move |txn| txn.delete_item(&table, &pk_val, sk_val.as_ref()))
+        self.db.transact(move |txn| {
+            txn.delete_item(&table, &pk_val, sk_val.as_ref(), condition.as_ref())
+        })
     }
 }
 
@@ -313,6 +360,7 @@ pub struct UpdateItemBuilder<'a> {
     partition_key: Option<Value>,
     sort_key: Option<Value>,
     actions: Vec<UpdateAction>,
+    condition: Option<FilterExpr>,
 }
 
 impl<'a> UpdateItemBuilder<'a> {
@@ -323,6 +371,7 @@ impl<'a> UpdateItemBuilder<'a> {
             partition_key: None,
             sort_key: None,
             actions: Vec::new(),
+            condition: None,
         }
     }
 
@@ -386,15 +435,30 @@ impl<'a> UpdateItemBuilder<'a> {
         self
     }
 
+    /// Set a condition expression that must be satisfied by the existing item
+    /// (or empty object for non-existent items) for the update to proceed.
+    pub fn condition(mut self, expr: FilterExpr) -> Self {
+        self.condition = Some(expr);
+        self
+    }
+
     /// Execute the update operation.
     pub fn execute(self) -> Result<(), Error> {
         let pk_val = self.partition_key.ok_or(QueryError::PartitionKeyRequired)?;
         let sk_val = self.sort_key;
         let table = self.table;
         let actions = self.actions;
+        let condition = self.condition;
 
-        self.db
-            .transact(move |txn| txn.update_item(&table, &pk_val, sk_val.as_ref(), &actions))
+        self.db.transact(move |txn| {
+            txn.update_item(
+                &table,
+                &pk_val,
+                sk_val.as_ref(),
+                &actions,
+                condition.as_ref(),
+            )
+        })
     }
 }
 

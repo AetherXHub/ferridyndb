@@ -168,6 +168,23 @@ impl FerridynClient {
         check_ok(&resp)
     }
 
+    /// Put an item with a condition expression.
+    pub async fn put_item_with_condition(
+        &mut self,
+        table: &str,
+        item: Value,
+        condition: FilterExpr,
+    ) -> Result<()> {
+        let req = serde_json::json!({
+            "op": "put_item",
+            "table": table,
+            "item": item,
+            "condition": condition,
+        });
+        let resp = self.send_request(&req).await?;
+        check_ok(&resp)
+    }
+
     /// Delete an item by key.
     pub async fn delete_item(
         &mut self,
@@ -180,6 +197,25 @@ impl FerridynClient {
             "table": table,
             "partition_key": partition_key,
             "sort_key": sort_key,
+        });
+        let resp = self.send_request(&req).await?;
+        check_ok(&resp)
+    }
+
+    /// Delete an item with a condition expression.
+    pub async fn delete_item_with_condition(
+        &mut self,
+        table: &str,
+        partition_key: Value,
+        sort_key: Option<Value>,
+        condition: FilterExpr,
+    ) -> Result<()> {
+        let req = serde_json::json!({
+            "op": "delete_item",
+            "table": table,
+            "partition_key": partition_key,
+            "sort_key": sort_key,
+            "condition": condition,
         });
         let resp = self.send_request(&req).await?;
         check_ok(&resp)
@@ -214,6 +250,42 @@ impl FerridynClient {
             "partition_key": partition_key,
             "sort_key": sort_key,
             "updates": updates_json,
+        });
+        let resp = self.send_request(&req).await?;
+        check_ok(&resp)
+    }
+
+    /// Update an item with a condition expression.
+    pub async fn update_item_with_condition(
+        &mut self,
+        table: &str,
+        partition_key: Value,
+        sort_key: Option<Value>,
+        updates: &[UpdateActionInput],
+        condition: FilterExpr,
+    ) -> Result<()> {
+        let updates_json: Vec<Value> = updates
+            .iter()
+            .map(|u| {
+                let mut obj = serde_json::json!({
+                    "action": u.action,
+                    "path": u.path,
+                });
+                if let Some(v) = &u.value {
+                    obj.as_object_mut()
+                        .unwrap()
+                        .insert("value".to_string(), v.clone());
+                }
+                obj
+            })
+            .collect();
+        let req = serde_json::json!({
+            "op": "update_item",
+            "table": table,
+            "partition_key": partition_key,
+            "sort_key": sort_key,
+            "updates": updates_json,
+            "condition": condition,
         });
         let resp = self.send_request(&req).await?;
         check_ok(&resp)

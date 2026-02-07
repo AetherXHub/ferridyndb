@@ -1630,12 +1630,12 @@ impl FerridynBenchWriteTransaction {
                             let key_json = bytes_to_json(key);
                             let hex_value = hex_encode(value);
                             let doc = json!({"p": "d", "k": key_json, "v": hex_value});
-                            txn.put_item("bench", doc)?;
+                            txn.put_item("bench", doc, None)?;
                             inserts += 1;
                         }
                         FerridynBenchOp::Remove { key } => {
                             let key_json = bytes_to_json(key);
-                            txn.delete_item("bench", &json!("d"), Some(&key_json))?;
+                            txn.delete_item("bench", &json!("d"), Some(&key_json), None)?;
                             removes += 1;
                         }
                     }

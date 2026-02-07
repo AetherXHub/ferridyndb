@@ -1,7 +1,7 @@
 # PRD: Condition Expressions
 
 **Priority:** 3
-**Status:** Approved
+**Status:** Complete
 **Proposal:** [docs/proposals/accepted/condition-expressions.md](../proposals/accepted/condition-expressions.md)
 
 ## Summary

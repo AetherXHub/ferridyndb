@@ -42,11 +42,25 @@ pub enum FilterExpr {
     Not(Box<FilterExpr>),
 }
 
+/// Maximum nesting depth for filter/condition expressions.
+const MAX_EXPRESSION_DEPTH: usize = 16;
+
 impl FilterExpr {
     /// Evaluate this filter expression against a document.
     ///
     /// Returns `true` if the document passes the filter, `false` otherwise.
+    /// Enforces a maximum nesting depth of 16 levels to prevent stack overflow.
     pub fn eval(&self, doc: &Value) -> Result<bool, FilterError> {
+        self.eval_inner(doc, 0)
+    }
+
+    fn eval_inner(&self, doc: &Value, depth: usize) -> Result<bool, FilterError> {
+        if depth > MAX_EXPRESSION_DEPTH {
+            return Err(FilterError::InvalidExpression(
+                "expression depth exceeds maximum of 16".to_string(),
+            ));
+        }
+
         match self {
             FilterExpr::Attr(_) | FilterExpr::Literal(_) => Err(FilterError::InvalidExpression(
                 "leaf node cannot be evaluated as a boolean".to_string(),
@@ -126,7 +140,7 @@ impl FilterExpr {
 
             FilterExpr::And(exprs) => {
                 for expr in exprs {
-                    if !expr.eval(doc)? {
+                    if !expr.eval_inner(doc, depth + 1)? {
                         return Ok(false);
                     }
                 }
@@ -134,13 +148,13 @@ impl FilterExpr {
             }
             FilterExpr::Or(exprs) => {
                 for expr in exprs {
-                    if expr.eval(doc)? {
+                    if expr.eval_inner(doc, depth + 1)? {
                         return Ok(true);
                     }
                 }
                 Ok(false)
             }
-            FilterExpr::Not(expr) => Ok(!expr.eval(doc)?),
+            FilterExpr::Not(expr) => Ok(!expr.eval_inner(doc, depth + 1)?),
         }
     }
 }

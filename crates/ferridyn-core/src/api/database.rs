@@ -23,7 +23,8 @@ use super::batch::{SyncMode, WriteBatch};
 use super::builders::{
     CreateIndexBuilder, DeleteItemBuilder, GetItemBuilder, GetItemVersionedBuilder,
     IndexQueryBuilder, ListPartitionKeysBuilder, ListSortKeyPrefixesBuilder,
-    PartitionSchemaBuilder, QueryBuilder, ScanBuilder, TableBuilder, UpdateItemBuilder,
+    PartitionSchemaBuilder, PutItemBuilder, QueryBuilder, ScanBuilder, TableBuilder,
+    UpdateItemBuilder,
 };
 use super::page_store::{BufferedPageStore, FilePageStore};
 use super::transaction::Transaction;
@@ -234,7 +235,15 @@ impl FerridynDB {
     /// Put an item into a table.
     pub fn put_item(&self, table: &str, document: Value) -> Result<(), Error> {
         let table = table.to_string();
-        self.transact(move |txn| txn.put_item(&table, document))
+        self.transact(move |txn| txn.put_item(&table, document, None))
+    }
+
+    /// Put an item into a table with an optional condition expression.
+    ///
+    /// Returns a builder that allows setting a `.condition()` predicate
+    /// evaluated against the existing item before the write proceeds.
+    pub fn put(&self, table: &str, document: Value) -> PutItemBuilder<'_> {
+        PutItemBuilder::new(self, table.to_string(), document)
     }
 
     /// Get an item from a table by key.
@@ -482,7 +491,7 @@ impl FerridynDB {
         let table_name = table.to_string();
         self.transact(move |txn| {
             for (pk_val, sk_val) in &expired_keys {
-                txn.delete_item(&table_name, pk_val, sk_val.as_ref())?;
+                txn.delete_item(&table_name, pk_val, sk_val.as_ref(), None)?;
             }
             Ok(())
         })?;
@@ -834,8 +843,8 @@ mod tests {
             .unwrap();
 
         db.transact(|txn| {
-            txn.put_item("items", json!({"id": "a", "v": 1}))?;
-            txn.put_item("items", json!({"id": "b", "v": 2}))?;
+            txn.put_item("items", json!({"id": "a", "v": 1}), None)?;
+            txn.put_item("items", json!({"id": "b", "v": 2}), None)?;
             Ok(())
         })
         .unwrap();
@@ -855,9 +864,9 @@ mod tests {
             .unwrap();
 
         let result = db.transact(|txn| {
-            txn.put_item("items", json!({"id": "a", "v": 1}))?;
+            txn.put_item("items", json!({"id": "a", "v": 1}), None)?;
             // Force an error by trying to put into a non-existent table.
-            txn.put_item("nonexistent", json!({"id": "b"}))?;
+            txn.put_item("nonexistent", json!({"id": "b"}), None)?;
             Ok(())
         });
         assert!(result.is_err());
@@ -1577,8 +1586,8 @@ mod concurrency_stress_tests {
 
         // Insert items A and B atomically via transact.
         db.transact(|txn| {
-            txn.put_item("items", json!({"id": "A", "batch": 1}))?;
-            txn.put_item("items", json!({"id": "B", "batch": 1}))?;
+            txn.put_item("items", json!({"id": "A", "batch": 1}), None)?;
+            txn.put_item("items", json!({"id": "B", "batch": 1}), None)?;
             Ok(())
         })
         .unwrap();
@@ -1629,8 +1638,8 @@ mod concurrency_stress_tests {
         barrier.wait(); // Wait for reader to read A.
         db_writer
             .transact(|txn| {
-                txn.put_item("items", json!({"id": "A", "batch": 2}))?;
-                txn.put_item("items", json!({"id": "B", "batch": 2}))?;
+                txn.put_item("items", json!({"id": "A", "batch": 2}), None)?;
+                txn.put_item("items", json!({"id": "B", "batch": 2}), None)?;
                 Ok(())
             })
             .unwrap();
@@ -4414,5 +4423,533 @@ mod filter_integration_tests {
             .unwrap();
 
         assert_eq!(result.items.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod condition_expression_tests {
+    use super::*;
+    use crate::api::filter::FilterExpr;
+    use crate::types::KeyType;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    fn create_test_db() -> (FerridynDB, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = FerridynDB::create(&db_path).unwrap();
+        db.create_table("items")
+            .partition_key("id", KeyType::String)
+            .execute()
+            .unwrap();
+        (db, dir)
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 1: PutItem conditions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_put_condition_attribute_not_exists_passes() {
+        let (db, _dir) = create_test_db();
+        // Item does not exist yet, so attribute_not_exists("id") should pass
+        // (evaluated against empty object).
+        let result = db
+            .put("items", json!({"id": "new", "val": 1}))
+            .condition(FilterExpr::attribute_not_exists("id"))
+            .execute();
+        assert!(result.is_ok());
+
+        let item = db.get_item("items").partition_key("new").execute().unwrap();
+        assert_eq!(item.unwrap()["val"], 1);
+    }
+
+    #[test]
+    fn test_put_condition_attribute_not_exists_fails() {
+        let (db, _dir) = create_test_db();
+        db.put_item("items", json!({"id": "existing", "val": 1}))
+            .unwrap();
+
+        // Item exists, so attribute_not_exists("id") should fail.
+        let result = db
+            .put("items", json!({"id": "existing", "val": 2}))
+            .condition(FilterExpr::attribute_not_exists("id"))
+            .execute();
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("condition check failed"));
+
+        // Original value should remain unchanged.
+        let item = db
+            .get_item("items")
+            .partition_key("existing")
+            .execute()
+            .unwrap()
+            .unwrap();
+        assert_eq!(item["val"], 1);
+    }
+
+    #[test]
+    fn test_put_condition_attribute_exists_passes() {
+        let (db, _dir) = create_test_db();
+        db.put_item("items", json!({"id": "existing", "val": 1}))
+            .unwrap();
+
+        // Item exists with "id" attribute, so attribute_exists("id") passes.
+        let result = db
+            .put("items", json!({"id": "existing", "val": 2}))
+            .condition(FilterExpr::attribute_exists("id"))
+            .execute();
+        assert!(result.is_ok());
+
+        let item = db
+            .get_item("items")
+            .partition_key("existing")
+            .execute()
+            .unwrap()
+            .unwrap();
+        assert_eq!(item["val"], 2);
+    }
+
+    #[test]
+    fn test_put_without_condition_always_succeeds() {
+        let (db, _dir) = create_test_db();
+        // No condition: unconditional put.
+        db.put("items", json!({"id": "a", "val": 1}))
+            .execute()
+            .unwrap();
+        db.put("items", json!({"id": "a", "val": 2}))
+            .execute()
+            .unwrap();
+
+        let item = db
+            .get_item("items")
+            .partition_key("a")
+            .execute()
+            .unwrap()
+            .unwrap();
+        assert_eq!(item["val"], 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 1: DeleteItem conditions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_delete_condition_eq_passes() {
+        let (db, _dir) = create_test_db();
+        db.put_item("items", json!({"id": "a", "status": "archived"}))
+            .unwrap();
+
+        let result = db
+            .delete_item("items")
+            .partition_key("a")
+            .condition(FilterExpr::eq(
+                FilterExpr::attr("status"),
+                FilterExpr::literal(json!("archived")),
+            ))
+            .execute();
+        assert!(result.is_ok());
+
+        let item = db.get_item("items").partition_key("a").execute().unwrap();
+        assert!(item.is_none());
+    }
+
+    #[test]
+    fn test_delete_condition_eq_fails() {
+        let (db, _dir) = create_test_db();
+        db.put_item("items", json!({"id": "a", "status": "active"}))
+            .unwrap();
+
+        // Condition requires status == "archived", but it's "active".
+        let result = db
+            .delete_item("items")
+            .partition_key("a")
+            .condition(FilterExpr::eq(
+                FilterExpr::attr("status"),
+                FilterExpr::literal(json!("archived")),
+            ))
+            .execute();
+        assert!(result.is_err());
+
+        // Item should still exist.
+        let item = db.get_item("items").partition_key("a").execute().unwrap();
+        assert!(item.is_some());
+    }
+
+    #[test]
+    fn test_condition_on_nonexistent_item() {
+        let (db, _dir) = create_test_db();
+        // Delete with condition on non-existent item: attribute_not_exists passes
+        // against empty object, so delete is a no-op but doesn't error.
+        let result = db
+            .delete_item("items")
+            .partition_key("ghost")
+            .condition(FilterExpr::attribute_not_exists("id"))
+            .execute();
+        // Delete of non-existent item is already a no-op in our implementation,
+        // but the condition should still be evaluated. attribute_not_exists on
+        // empty object passes.
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_condition_compound_and_or() {
+        let (db, _dir) = create_test_db();
+        db.put_item(
+            "items",
+            json!({"id": "x", "status": "active", "priority": 5}),
+        )
+        .unwrap();
+
+        // AND: status == "active" AND priority > 3 → should pass.
+        let cond = FilterExpr::and(vec![
+            FilterExpr::eq(
+                FilterExpr::attr("status"),
+                FilterExpr::literal(json!("active")),
+            ),
+            FilterExpr::gt(FilterExpr::attr("priority"), FilterExpr::literal(json!(3))),
+        ]);
+        let result = db
+            .put("items", json!({"id": "x", "status": "done", "priority": 5}))
+            .condition(cond)
+            .execute();
+        assert!(result.is_ok());
+
+        // OR: status == "active" OR status == "done" → "done" matches.
+        let cond = FilterExpr::or(vec![
+            FilterExpr::eq(
+                FilterExpr::attr("status"),
+                FilterExpr::literal(json!("active")),
+            ),
+            FilterExpr::eq(
+                FilterExpr::attr("status"),
+                FilterExpr::literal(json!("done")),
+            ),
+        ]);
+        let result = db
+            .put(
+                "items",
+                json!({"id": "x", "status": "archived", "priority": 5}),
+            )
+            .condition(cond)
+            .execute();
+        assert!(result.is_ok());
+
+        let item = db
+            .get_item("items")
+            .partition_key("x")
+            .execute()
+            .unwrap()
+            .unwrap();
+        assert_eq!(item["status"], "archived");
+    }
+
+    #[test]
+    fn test_condition_check_failed_error() {
+        let (db, _dir) = create_test_db();
+        db.put_item("items", json!({"id": "a", "val": 1})).unwrap();
+
+        let result = db
+            .put("items", json!({"id": "a", "val": 2}))
+            .condition(FilterExpr::attribute_not_exists("id"))
+            .execute();
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        // Verify it's a ConditionCheckFailed error.
+        match &err {
+            Error::Transaction(crate::error::TxnError::ConditionCheckFailed(_)) => {}
+            other => panic!("expected ConditionCheckFailed, got: {other}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2: UpdateItem conditions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_update_with_condition_passes() {
+        let (db, _dir) = create_test_db();
+        db.put_item("items", json!({"id": "a", "val": 1, "status": "active"}))
+            .unwrap();
+
+        let result = db
+            .update_item("items")
+            .partition_key("a")
+            .set("val", json!(2))
+            .condition(FilterExpr::eq(
+                FilterExpr::attr("status"),
+                FilterExpr::literal(json!("active")),
+            ))
+            .execute();
+        assert!(result.is_ok());
+
+        let item = db
+            .get_item("items")
+            .partition_key("a")
+            .execute()
+            .unwrap()
+            .unwrap();
+        assert_eq!(item["val"], 2);
+    }
+
+    #[test]
+    fn test_update_with_condition_fails() {
+        let (db, _dir) = create_test_db();
+        db.put_item("items", json!({"id": "a", "val": 1, "status": "locked"}))
+            .unwrap();
+
+        let result = db
+            .update_item("items")
+            .partition_key("a")
+            .set("val", json!(2))
+            .condition(FilterExpr::eq(
+                FilterExpr::attr("status"),
+                FilterExpr::literal(json!("active")),
+            ))
+            .execute();
+        assert!(result.is_err());
+
+        // Original value unchanged.
+        let item = db
+            .get_item("items")
+            .partition_key("a")
+            .execute()
+            .unwrap()
+            .unwrap();
+        assert_eq!(item["val"], 1);
+    }
+
+    #[test]
+    fn test_update_with_condition_on_nonexistent() {
+        let (db, _dir) = create_test_db();
+        // Upsert with condition: attribute_not_exists("id") on non-existent item → passes.
+        let result = db
+            .update_item("items")
+            .partition_key("new")
+            .set("val", json!(42))
+            .condition(FilterExpr::attribute_not_exists("id"))
+            .execute();
+        assert!(result.is_ok());
+
+        let item = db
+            .get_item("items")
+            .partition_key("new")
+            .execute()
+            .unwrap()
+            .unwrap();
+        assert_eq!(item["val"], 42);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3: Transaction conditions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_txn_all_conditions_pass() {
+        let (db, _dir) = create_test_db();
+        db.put_item("items", json!({"id": "a", "val": 1})).unwrap();
+        db.put_item("items", json!({"id": "b", "val": 2})).unwrap();
+
+        let result = db.transact(|txn| {
+            txn.put_item(
+                "items",
+                json!({"id": "a", "val": 10}),
+                Some(&FilterExpr::attribute_exists("id")),
+            )?;
+            txn.put_item(
+                "items",
+                json!({"id": "b", "val": 20}),
+                Some(&FilterExpr::attribute_exists("id")),
+            )?;
+            Ok(())
+        });
+        assert!(result.is_ok());
+
+        let a = db
+            .get_item("items")
+            .partition_key("a")
+            .execute()
+            .unwrap()
+            .unwrap();
+        let b = db
+            .get_item("items")
+            .partition_key("b")
+            .execute()
+            .unwrap()
+            .unwrap();
+        assert_eq!(a["val"], 10);
+        assert_eq!(b["val"], 20);
+    }
+
+    #[test]
+    fn test_txn_one_condition_fails_aborts_all() {
+        let (db, _dir) = create_test_db();
+        db.put_item("items", json!({"id": "a", "val": 1})).unwrap();
+        db.put_item("items", json!({"id": "b", "val": 2})).unwrap();
+
+        let result = db.transact(|txn| {
+            // This condition passes (item "a" exists).
+            txn.put_item(
+                "items",
+                json!({"id": "a", "val": 10}),
+                Some(&FilterExpr::attribute_exists("id")),
+            )?;
+            // This condition fails: attribute_not_exists("id") on existing item.
+            txn.put_item(
+                "items",
+                json!({"id": "b", "val": 20}),
+                Some(&FilterExpr::attribute_not_exists("id")),
+            )?;
+            Ok(())
+        });
+        assert!(result.is_err());
+
+        // Neither write should be visible (all-or-nothing).
+        let a = db
+            .get_item("items")
+            .partition_key("a")
+            .execute()
+            .unwrap()
+            .unwrap();
+        let b = db
+            .get_item("items")
+            .partition_key("b")
+            .execute()
+            .unwrap()
+            .unwrap();
+        assert_eq!(a["val"], 1);
+        assert_eq!(b["val"], 2);
+    }
+
+    #[test]
+    fn test_txn_no_partial_writes_on_condition_failure() {
+        let (db, _dir) = create_test_db();
+
+        // Transaction: create "new1" (passes) then create "new2" with failing condition.
+        let result = db.transact(|txn| {
+            txn.put_item("items", json!({"id": "new1", "val": 1}), None)?;
+            // Condition: attribute_exists("id") on non-existent item → fails.
+            txn.put_item(
+                "items",
+                json!({"id": "new2", "val": 2}),
+                Some(&FilterExpr::attribute_exists("id")),
+            )?;
+            Ok(())
+        });
+        assert!(result.is_err());
+
+        // "new1" should NOT exist because the transaction aborted.
+        let item = db
+            .get_item("items")
+            .partition_key("new1")
+            .execute()
+            .unwrap();
+        assert!(item.is_none());
+    }
+
+    #[test]
+    fn test_txn_delete_with_condition() {
+        let (db, _dir) = create_test_db();
+        db.put_item("items", json!({"id": "a", "status": "archived"}))
+            .unwrap();
+
+        let result = db.transact(|txn| {
+            txn.delete_item(
+                "items",
+                &json!("a"),
+                None,
+                Some(&FilterExpr::eq(
+                    FilterExpr::attr("status"),
+                    FilterExpr::literal(json!("archived")),
+                )),
+            )
+        });
+        assert!(result.is_ok());
+
+        let item = db.get_item("items").partition_key("a").execute().unwrap();
+        assert!(item.is_none());
+    }
+
+    #[test]
+    fn test_txn_update_with_condition() {
+        let (db, _dir) = create_test_db();
+        db.put_item("items", json!({"id": "a", "val": 1, "status": "active"}))
+            .unwrap();
+
+        let result = db.transact(|txn| {
+            txn.update_item(
+                "items",
+                &json!("a"),
+                None,
+                &[crate::api::update::UpdateAction::Set {
+                    path: "val".to_string(),
+                    value: json!(99),
+                }],
+                Some(&FilterExpr::eq(
+                    FilterExpr::attr("status"),
+                    FilterExpr::literal(json!("active")),
+                )),
+            )
+        });
+        assert!(result.is_ok());
+
+        let item = db
+            .get_item("items")
+            .partition_key("a")
+            .execute()
+            .unwrap()
+            .unwrap();
+        assert_eq!(item["val"], 99);
+    }
+
+    // -----------------------------------------------------------------------
+    // Depth limit
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_condition_depth_limit() {
+        let (db, _dir) = create_test_db();
+        db.put_item("items", json!({"id": "a", "val": 1})).unwrap();
+
+        // Build a deeply nested AND chain exceeding depth 16.
+        let mut expr = FilterExpr::attribute_exists("val");
+        for _ in 0..20 {
+            expr = FilterExpr::and(vec![expr]);
+        }
+
+        let result = db
+            .put("items", json!({"id": "a", "val": 2}))
+            .condition(expr)
+            .execute();
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("depth"));
+    }
+
+    // -----------------------------------------------------------------------
+    // put_item_conditional (version-based OCC) still works
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_put_item_conditional_still_works() {
+        let (db, _dir) = create_test_db();
+        db.put_item("items", json!({"id": "a", "val": 1})).unwrap();
+
+        let vi = db
+            .get_item_versioned("items")
+            .partition_key("a")
+            .execute()
+            .unwrap()
+            .unwrap();
+
+        // Should succeed with correct version.
+        db.put_item_conditional("items", json!({"id": "a", "val": 2}), vi.version)
+            .unwrap();
+
+        // Should fail with stale version.
+        let result = db.put_item_conditional("items", json!({"id": "a", "val": 3}), vi.version);
+        assert!(result.is_err());
     }
 }
