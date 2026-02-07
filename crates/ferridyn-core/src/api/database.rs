@@ -4048,3 +4048,371 @@ mod update_item_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod filter_integration_tests {
+    use super::*;
+    use crate::api::filter::FilterExpr;
+    use crate::types::KeyType;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    fn create_test_db_with_data() -> (FerridynDB, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = FerridynDB::create(&db_path).unwrap();
+
+        db.create_table("users")
+            .partition_key("pk", KeyType::String)
+            .sort_key("sk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        // Insert 10 users with various attributes.
+        for i in 0..10 {
+            let status = if i % 2 == 0 { "active" } else { "inactive" };
+            let age = 20 + i;
+            db.put_item(
+                "users",
+                json!({
+                    "pk": "ORG#acme",
+                    "sk": format!("USER#{:04}", i),
+                    "name": format!("user{}", i),
+                    "age": age,
+                    "status": status,
+                    "score": i * 10,
+                }),
+            )
+            .unwrap();
+        }
+
+        (db, dir)
+    }
+
+    #[test]
+    fn test_query_with_filter() {
+        let (db, _dir) = create_test_db_with_data();
+
+        // Query with filter: only active users.
+        let result = db
+            .query("users")
+            .partition_key("ORG#acme")
+            .filter(FilterExpr::eq(
+                FilterExpr::attr("status"),
+                FilterExpr::literal("active"),
+            ))
+            .execute()
+            .unwrap();
+
+        // Users 0,2,4,6,8 are active.
+        assert_eq!(result.items.len(), 5);
+        for item in &result.items {
+            assert_eq!(item["status"], "active");
+        }
+    }
+
+    #[test]
+    fn test_scan_with_filter() {
+        let (db, _dir) = create_test_db_with_data();
+
+        // Scan with filter: age >= 25.
+        let result = db
+            .scan("users")
+            .filter(FilterExpr::ge(
+                FilterExpr::attr("age"),
+                FilterExpr::literal(25),
+            ))
+            .execute()
+            .unwrap();
+
+        // Users with age 25..29 (indices 5..9).
+        assert_eq!(result.items.len(), 5);
+        for item in &result.items {
+            assert!(item["age"].as_i64().unwrap() >= 25);
+        }
+    }
+
+    #[test]
+    fn test_query_with_filter_and_sort_condition() {
+        let (db, _dir) = create_test_db_with_data();
+
+        // Query with sort key condition + filter.
+        let result = db
+            .query("users")
+            .partition_key("ORG#acme")
+            .sort_key_lt("USER#0005")
+            .filter(FilterExpr::eq(
+                FilterExpr::attr("status"),
+                FilterExpr::literal("active"),
+            ))
+            .execute()
+            .unwrap();
+
+        // Users 0..4, active ones are 0, 2, 4.
+        assert_eq!(result.items.len(), 3);
+        for item in &result.items {
+            assert_eq!(item["status"], "active");
+            let sk = item["sk"].as_str().unwrap();
+            assert!(sk < "USER#0005");
+        }
+    }
+
+    #[test]
+    fn test_filter_with_limit_dynamo_semantics() {
+        let (db, _dir) = create_test_db_with_data();
+
+        // Limit = 5 means evaluate 5 items. With filter, fewer may be returned.
+        // Items are USER#0000..USER#0009 in order.
+        // First 5 items (USER#0000..USER#0004): active = 0,2,4 (3 items).
+        let result = db
+            .query("users")
+            .partition_key("ORG#acme")
+            .limit(5)
+            .filter(FilterExpr::eq(
+                FilterExpr::attr("status"),
+                FilterExpr::literal("active"),
+            ))
+            .execute()
+            .unwrap();
+
+        // Only 3 active users in the first 5 evaluated.
+        assert_eq!(result.items.len(), 3);
+        // last_evaluated_key should be set (more items exist).
+        assert!(result.last_evaluated_key.is_some());
+    }
+
+    #[test]
+    fn test_filter_with_pagination() {
+        let (db, _dir) = create_test_db_with_data();
+
+        // Page 1: limit=5 with filter.
+        let page1 = db
+            .query("users")
+            .partition_key("ORG#acme")
+            .limit(5)
+            .filter(FilterExpr::eq(
+                FilterExpr::attr("status"),
+                FilterExpr::literal("active"),
+            ))
+            .execute()
+            .unwrap();
+
+        assert_eq!(page1.items.len(), 3); // 0,2,4
+        assert!(page1.last_evaluated_key.is_some());
+
+        // Page 2: continue from last_evaluated_key.
+        let page2 = db
+            .query("users")
+            .partition_key("ORG#acme")
+            .limit(5)
+            .exclusive_start_key(page1.last_evaluated_key.unwrap())
+            .filter(FilterExpr::eq(
+                FilterExpr::attr("status"),
+                FilterExpr::literal("active"),
+            ))
+            .execute()
+            .unwrap();
+
+        assert_eq!(page2.items.len(), 2); // 6,8
+        // No more items after evaluating the remaining 5.
+        assert!(page2.last_evaluated_key.is_none());
+
+        // Combined results should be all 5 active users.
+        let all_names: Vec<&str> = page1
+            .items
+            .iter()
+            .chain(page2.items.iter())
+            .map(|i| i["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(all_names, vec!["user0", "user2", "user4", "user6", "user8"]);
+    }
+
+    #[test]
+    fn test_filter_no_matches() {
+        let (db, _dir) = create_test_db_with_data();
+
+        // Filter that matches nothing.
+        let result = db
+            .query("users")
+            .partition_key("ORG#acme")
+            .limit(5)
+            .filter(FilterExpr::eq(
+                FilterExpr::attr("status"),
+                FilterExpr::literal("deleted"),
+            ))
+            .execute()
+            .unwrap();
+
+        assert!(result.items.is_empty());
+        // Should still have pagination cursor (5 items were evaluated).
+        assert!(result.last_evaluated_key.is_some());
+    }
+
+    #[test]
+    fn test_scan_with_filter_and_limit() {
+        let (db, _dir) = create_test_db_with_data();
+
+        let result = db
+            .scan("users")
+            .limit(4)
+            .filter(FilterExpr::gt(
+                FilterExpr::attr("score"),
+                FilterExpr::literal(50),
+            ))
+            .execute()
+            .unwrap();
+
+        // First 4 evaluated: scores 0, 10, 20, 30 — only scores > 50 pass.
+        // None pass in the first 4.
+        assert!(result.items.is_empty());
+        assert!(result.last_evaluated_key.is_some());
+    }
+
+    #[test]
+    fn test_filter_complex_expression() {
+        let (db, _dir) = create_test_db_with_data();
+
+        // (status == "active" AND age > 24) OR score >= 80
+        let filter = FilterExpr::or(vec![
+            FilterExpr::and(vec![
+                FilterExpr::eq(FilterExpr::attr("status"), FilterExpr::literal("active")),
+                FilterExpr::gt(FilterExpr::attr("age"), FilterExpr::literal(24)),
+            ]),
+            FilterExpr::ge(FilterExpr::attr("score"), FilterExpr::literal(80)),
+        ]);
+
+        let result = db
+            .query("users")
+            .partition_key("ORG#acme")
+            .filter(filter)
+            .execute()
+            .unwrap();
+
+        // Active AND age > 24: users 6(26,active), 8(28,active) — users 4(24) doesn't pass age>24
+        // Wait: user4 has age=24, which is NOT > 24. user6 has age=26, user8 has age=28.
+        // Score >= 80: user8(80), user9(90).
+        // Union: user6, user8, user9 — but user8 is in both sets.
+        // So: user6, user8, user9.
+        assert_eq!(result.items.len(), 3);
+    }
+
+    #[test]
+    fn test_index_query_with_filter() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = FerridynDB::create(&db_path).unwrap();
+
+        db.create_table("items")
+            .partition_key("pk", KeyType::String)
+            .sort_key("sk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_partition_schema("items")
+            .prefix("ITEM")
+            .attribute("category", crate::types::AttrType::String, true)
+            .execute()
+            .unwrap();
+
+        db.create_index("items")
+            .name("by_category")
+            .partition_schema("ITEM")
+            .index_key("category", KeyType::String)
+            .execute()
+            .unwrap();
+
+        // Insert items.
+        for i in 0..6 {
+            let price = (i + 1) * 10;
+            db.put_item(
+                "items",
+                json!({
+                    "pk": format!("ITEM#{}", i),
+                    "sk": "DETAIL",
+                    "category": "electronics",
+                    "price": price,
+                    "name": format!("item{}", i),
+                }),
+            )
+            .unwrap();
+        }
+
+        // Query index with filter: price > 30.
+        let result = db
+            .query_index("items", "by_category")
+            .key_value("electronics")
+            .filter(FilterExpr::gt(
+                FilterExpr::attr("price"),
+                FilterExpr::literal(30),
+            ))
+            .execute()
+            .unwrap();
+
+        // Items with price > 30: item3(40), item4(50), item5(60).
+        assert_eq!(result.items.len(), 3);
+        for item in &result.items {
+            assert!(item["price"].as_i64().unwrap() > 30);
+        }
+    }
+
+    #[test]
+    fn test_query_without_filter_unchanged() {
+        let (db, _dir) = create_test_db_with_data();
+
+        // Without filter, behavior is unchanged.
+        let result = db
+            .query("users")
+            .partition_key("ORG#acme")
+            .limit(3)
+            .execute()
+            .unwrap();
+
+        assert_eq!(result.items.len(), 3);
+        assert!(result.last_evaluated_key.is_some());
+
+        // Scan without filter.
+        let result = db.scan("users").execute().unwrap();
+        assert_eq!(result.items.len(), 10);
+        assert!(result.last_evaluated_key.is_none());
+    }
+
+    #[test]
+    fn test_filter_begins_with_integration() {
+        let (db, _dir) = create_test_db_with_data();
+
+        let result = db
+            .scan("users")
+            .filter(FilterExpr::begins_with(FilterExpr::attr("name"), "user3"))
+            .execute()
+            .unwrap();
+
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["name"], "user3");
+    }
+
+    #[test]
+    fn test_filter_attribute_exists_integration() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = FerridynDB::create(&db_path).unwrap();
+
+        db.create_table("docs")
+            .partition_key("id", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put_item("docs", json!({"id": "a", "email": "a@test.com"}))
+            .unwrap();
+        db.put_item("docs", json!({"id": "b"})).unwrap();
+        db.put_item("docs", json!({"id": "c", "email": "c@test.com"}))
+            .unwrap();
+
+        let result = db
+            .scan("docs")
+            .filter(FilterExpr::attribute_exists("email"))
+            .execute()
+            .unwrap();
+
+        assert_eq!(result.items.len(), 2);
+    }
+}

@@ -3,6 +3,7 @@
 pub mod batch;
 pub mod builders;
 pub mod database;
+pub mod filter;
 pub mod key_utils;
 pub mod page_store;
 pub mod query;
@@ -15,6 +16,7 @@ pub use builders::{
     PartitionSchemaBuilder, QueryBuilder, ScanBuilder, TableBuilder, UpdateItemBuilder,
 };
 pub use database::FerridynDB;
+pub use filter::FilterExpr;
 pub use query::{QueryResult, SortCondition};
 pub use transaction::Transaction;
 pub use update::UpdateAction;

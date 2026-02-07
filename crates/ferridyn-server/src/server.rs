@@ -10,7 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tracing::{error, info, warn};
 
-use ferridyn_core::api::FerridynDB;
+use ferridyn_core::api::{FerridynDB, FilterExpr};
 use ferridyn_core::error::{Error as DynError, SchemaError, TxnError};
 use ferridyn_core::types::{AttrType, IndexDefinition, KeyType, PartitionSchema, TableSchema};
 
@@ -158,6 +158,7 @@ fn dispatch(db: &FerridynDB, req: Request) -> Response {
             limit,
             scan_forward,
             exclusive_start_key,
+            filter,
         } => handle_query(
             db,
             &table,
@@ -166,13 +167,15 @@ fn dispatch(db: &FerridynDB, req: Request) -> Response {
             limit,
             scan_forward,
             exclusive_start_key,
+            filter,
         ),
 
         Request::Scan {
             table,
             limit,
             exclusive_start_key,
-        } => handle_scan(db, &table, limit, exclusive_start_key),
+            filter,
+        } => handle_scan(db, &table, limit, exclusive_start_key, filter),
 
         Request::CreateTable {
             table,
@@ -230,7 +233,16 @@ fn dispatch(db: &FerridynDB, req: Request) -> Response {
             key_value,
             limit,
             scan_forward,
-        } => handle_query_index(db, &table, &index_name, key_value, limit, scan_forward),
+            filter,
+        } => handle_query_index(
+            db,
+            &table,
+            &index_name,
+            key_value,
+            limit,
+            scan_forward,
+            filter,
+        ),
     }
 }
 
@@ -367,6 +379,7 @@ fn handle_update_item(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_query(
     db: &FerridynDB,
     table: &str,
@@ -375,6 +388,7 @@ fn handle_query(
     limit: Option<usize>,
     scan_forward: Option<bool>,
     exclusive_start_key: Option<serde_json::Value>,
+    filter: Option<FilterExpr>,
 ) -> Response {
     let mut builder = db.query(table).partition_key(partition_key);
 
@@ -399,6 +413,9 @@ fn handle_query(
     if let Some(esk) = exclusive_start_key {
         builder = builder.exclusive_start_key(esk);
     }
+    if let Some(f) = filter {
+        builder = builder.filter(f);
+    }
 
     match builder.execute() {
         Ok(result) => Response::ok_items(result.items, result.last_evaluated_key),
@@ -411,6 +428,7 @@ fn handle_scan(
     table: &str,
     limit: Option<usize>,
     exclusive_start_key: Option<serde_json::Value>,
+    filter: Option<FilterExpr>,
 ) -> Response {
     let mut builder = db.scan(table);
     if let Some(n) = limit {
@@ -418,6 +436,9 @@ fn handle_scan(
     }
     if let Some(esk) = exclusive_start_key {
         builder = builder.exclusive_start_key(esk);
+    }
+    if let Some(f) = filter {
+        builder = builder.filter(f);
     }
     match builder.execute() {
         Ok(result) => Response::ok_items(result.items, result.last_evaluated_key),
@@ -624,6 +645,7 @@ fn handle_describe_index(db: &FerridynDB, table: &str, name: &str) -> Response {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_query_index(
     db: &FerridynDB,
     table: &str,
@@ -631,6 +653,7 @@ fn handle_query_index(
     key_value: serde_json::Value,
     limit: Option<usize>,
     scan_forward: Option<bool>,
+    filter: Option<FilterExpr>,
 ) -> Response {
     let mut builder = db.query_index(table, index_name).key_value(key_value);
     if let Some(n) = limit {
@@ -638,6 +661,9 @@ fn handle_query_index(
     }
     if let Some(fwd) = scan_forward {
         builder = builder.scan_forward(fwd);
+    }
+    if let Some(f) = filter {
+        builder = builder.filter(f);
     }
     match builder.execute() {
         Ok(result) => Response::ok_items(result.items, result.last_evaluated_key),

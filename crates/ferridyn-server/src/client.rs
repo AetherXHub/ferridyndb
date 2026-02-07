@@ -12,6 +12,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
 use crate::error::ClientError;
 use crate::protocol::{ErrorResponse, KeyDef, SortKeyCondition};
+use ferridyn_core::api::FilterExpr;
 
 /// Result type alias for client operations.
 pub type Result<T> = std::result::Result<T, ClientError>;
@@ -219,6 +220,7 @@ impl FerridynClient {
     }
 
     /// Query items with partition key and optional sort key conditions.
+    #[allow(clippy::too_many_arguments)]
     pub async fn query(
         &mut self,
         table: &str,
@@ -227,6 +229,7 @@ impl FerridynClient {
         limit: Option<usize>,
         scan_forward: Option<bool>,
         exclusive_start_key: Option<Value>,
+        filter: Option<FilterExpr>,
     ) -> Result<QueryResult> {
         let mut req = serde_json::json!({
             "op": "query",
@@ -249,6 +252,9 @@ impl FerridynClient {
         if let Some(esk) = exclusive_start_key {
             obj.insert("exclusive_start_key".to_string(), esk);
         }
+        if let Some(f) = filter {
+            obj.insert("filter".to_string(), serde_json::to_value(f).unwrap());
+        }
 
         let resp = self.send_request(&req).await?;
         items_from_response(&resp)
@@ -260,6 +266,7 @@ impl FerridynClient {
         table: &str,
         limit: Option<usize>,
         exclusive_start_key: Option<Value>,
+        filter: Option<FilterExpr>,
     ) -> Result<QueryResult> {
         let mut req = serde_json::json!({
             "op": "scan",
@@ -271,6 +278,9 @@ impl FerridynClient {
         }
         if let Some(esk) = exclusive_start_key {
             obj.insert("exclusive_start_key".to_string(), esk);
+        }
+        if let Some(f) = filter {
+            obj.insert("filter".to_string(), serde_json::to_value(f).unwrap());
         }
 
         let resp = self.send_request(&req).await?;
@@ -509,6 +519,7 @@ impl FerridynClient {
         key_value: Value,
         limit: Option<usize>,
         scan_forward: Option<bool>,
+        filter: Option<FilterExpr>,
     ) -> Result<QueryResult> {
         let mut req = serde_json::json!({
             "op": "query_index",
@@ -522,6 +533,9 @@ impl FerridynClient {
         }
         if let Some(fwd) = scan_forward {
             obj.insert("scan_forward".to_string(), serde_json::json!(fwd));
+        }
+        if let Some(f) = filter {
+            obj.insert("filter".to_string(), serde_json::to_value(f).unwrap());
         }
         let resp = self.send_request(&req).await?;
         items_from_response(&resp)

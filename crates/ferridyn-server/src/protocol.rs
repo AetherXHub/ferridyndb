@@ -2,6 +2,7 @@
 //!
 //! Each request is a single JSON line; each response is a single JSON line.
 
+use ferridyn_core::api::FilterExpr;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -51,6 +52,8 @@ pub enum Request {
         scan_forward: Option<bool>,
         #[serde(default)]
         exclusive_start_key: Option<Value>,
+        #[serde(default)]
+        filter: Option<FilterExpr>,
     },
     Scan {
         table: String,
@@ -58,6 +61,8 @@ pub enum Request {
         limit: Option<usize>,
         #[serde(default)]
         exclusive_start_key: Option<Value>,
+        #[serde(default)]
+        filter: Option<FilterExpr>,
     },
     CreateTable {
         table: String,
@@ -133,6 +138,8 @@ pub enum Request {
         limit: Option<usize>,
         #[serde(default)]
         scan_forward: Option<bool>,
+        #[serde(default)]
+        filter: Option<FilterExpr>,
     },
 }
 

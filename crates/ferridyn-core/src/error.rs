@@ -20,6 +20,9 @@ pub enum Error {
 
     #[error(transparent)]
     Query(#[from] QueryError),
+
+    #[error(transparent)]
+    Filter(#[from] FilterError),
 }
 
 #[derive(Debug, Error)]
@@ -123,6 +126,12 @@ pub enum SchemaError {
 
     #[error("type mismatch for update action on '{attribute}': {message}")]
     UpdateTypeMismatch { attribute: String, message: String },
+}
+
+#[derive(Debug, Error)]
+pub enum FilterError {
+    #[error("invalid filter expression: {0}")]
+    InvalidExpression(String),
 }
 
 #[derive(Debug, Error)]

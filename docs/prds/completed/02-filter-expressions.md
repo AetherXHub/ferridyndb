@@ -1,7 +1,7 @@
 # PRD: Filter Expressions
 
 **Priority:** 2
-**Status:** Approved
+**Status:** Complete
 **Proposal:** [docs/proposals/accepted/filter-expressions.md](../proposals/accepted/filter-expressions.md)
 
 ## Summary

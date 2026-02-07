@@ -246,25 +246,25 @@ async fn test_query_and_scan() {
 
     // Query all for user1.
     let result = client
-        .query("events", json!("user1"), None, None, None, None)
+        .query("events", json!("user1"), None, None, None, None, None)
         .await
         .unwrap();
     assert_eq!(result.items.len(), 10);
 
     // Query with limit.
     let result = client
-        .query("events", json!("user1"), None, Some(3), None, None)
+        .query("events", json!("user1"), None, Some(3), None, None, None)
         .await
         .unwrap();
     assert_eq!(result.items.len(), 3);
     assert!(result.last_evaluated_key.is_some());
 
     // Scan all.
-    let result = client.scan("events", None, None).await.unwrap();
+    let result = client.scan("events", None, None, None).await.unwrap();
     assert_eq!(result.items.len(), 10);
 
     // Scan with limit.
-    let result = client.scan("events", Some(5), None).await.unwrap();
+    let result = client.scan("events", Some(5), None, None).await.unwrap();
     assert_eq!(result.items.len(), 5);
 }
 
@@ -772,14 +772,28 @@ async fn test_query_index() {
 
     // Query index for alice — should get 2 items.
     let result = client
-        .query_index("data", "email-idx", json!("alice@example.com"), None, None)
+        .query_index(
+            "data",
+            "email-idx",
+            json!("alice@example.com"),
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(result.items.len(), 2);
 
     // Query index for bob — should get 1 item.
     let result = client
-        .query_index("data", "email-idx", json!("bob@example.com"), None, None)
+        .query_index(
+            "data",
+            "email-idx",
+            json!("bob@example.com"),
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(result.items.len(), 1);
@@ -787,7 +801,14 @@ async fn test_query_index() {
 
     // Query index for nonexistent — should get 0 items.
     let result = client
-        .query_index("data", "email-idx", json!("nobody@example.com"), None, None)
+        .query_index(
+            "data",
+            "email-idx",
+            json!("nobody@example.com"),
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
     assert!(result.items.is_empty());
@@ -857,8 +878,124 @@ async fn test_query_index_with_limit() {
 
     // Query with limit 2.
     let result = client
-        .query_index("data", "status-idx", json!("active"), Some(2), None)
+        .query_index("data", "status-idx", json!("active"), Some(2), None, None)
         .await
         .unwrap();
     assert_eq!(result.items.len(), 2);
+}
+
+#[tokio::test]
+async fn test_query_with_filter_over_wire() {
+    use ferridyn_core::api::FilterExpr;
+
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    client
+        .create_table(
+            "items",
+            KeyDef {
+                name: "pk".to_string(),
+                key_type: "String".to_string(),
+            },
+            Some(KeyDef {
+                name: "sk".to_string(),
+                key_type: "String".to_string(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Insert items with varying status.
+    for i in 0..6 {
+        let status = if i % 2 == 0 { "active" } else { "inactive" };
+        client
+            .put_item(
+                "items",
+                json!({
+                    "pk": "org1",
+                    "sk": format!("user#{:04}", i),
+                    "status": status,
+                    "score": i * 10,
+                }),
+            )
+            .await
+            .unwrap();
+    }
+
+    // Query with filter: only active items.
+    let filter = FilterExpr::eq(FilterExpr::attr("status"), FilterExpr::literal("active"));
+    let result = client
+        .query("items", json!("org1"), None, None, None, None, Some(filter))
+        .await
+        .unwrap();
+
+    assert_eq!(result.items.len(), 3);
+    for item in &result.items {
+        assert_eq!(item["status"], "active");
+    }
+
+    // Query with filter + limit (DynamoDB semantics: limit counts evaluated).
+    let filter = FilterExpr::eq(FilterExpr::attr("status"), FilterExpr::literal("active"));
+    let result = client
+        .query(
+            "items",
+            json!("org1"),
+            None,
+            Some(4),
+            None,
+            None,
+            Some(filter),
+        )
+        .await
+        .unwrap();
+
+    // 4 items evaluated (user#0000..user#0003), 2 active (0, 2).
+    assert_eq!(result.items.len(), 2);
+    assert!(result.last_evaluated_key.is_some());
+}
+
+#[tokio::test]
+async fn test_scan_with_filter_over_wire() {
+    use ferridyn_core::api::FilterExpr;
+
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    client
+        .create_table(
+            "docs",
+            KeyDef {
+                name: "id".to_string(),
+                key_type: "String".to_string(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    for i in 0..5 {
+        client
+            .put_item(
+                "docs",
+                json!({
+                    "id": format!("doc{}", i),
+                    "priority": i + 1,
+                }),
+            )
+            .await
+            .unwrap();
+    }
+
+    // Scan with filter: priority > 3.
+    let filter = FilterExpr::gt(FilterExpr::attr("priority"), FilterExpr::literal(3));
+    let result = client.scan("docs", None, None, Some(filter)).await.unwrap();
+
+    // priority 4 and 5.
+    assert_eq!(result.items.len(), 2);
+    for item in &result.items {
+        assert!(item["priority"].as_i64().unwrap() > 3);
+    }
 }

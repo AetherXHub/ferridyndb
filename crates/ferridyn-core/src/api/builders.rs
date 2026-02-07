@@ -10,6 +10,7 @@ use crate::mvcc::ops as mvcc_ops;
 use crate::types::{AttrType, AttributeDef, KeyDefinition, KeyType, TableSchema, VersionedItem};
 
 use super::database::FerridynDB;
+use super::filter::FilterExpr;
 use super::key_utils;
 use super::query::{QueryResult, SortCondition, compute_scan_bounds};
 use super::update::UpdateAction;
@@ -410,6 +411,7 @@ pub struct QueryBuilder<'a> {
     limit: Option<usize>,
     scan_forward: bool,
     exclusive_start_key: Option<Value>,
+    filter: Option<FilterExpr>,
 }
 
 impl<'a> QueryBuilder<'a> {
@@ -422,11 +424,17 @@ impl<'a> QueryBuilder<'a> {
             limit: None,
             scan_forward: true,
             exclusive_start_key: None,
+            filter: None,
         }
     }
 
     pub fn partition_key(mut self, value: impl Into<Value>) -> Self {
         self.partition_key = Some(value.into());
+        self
+    }
+
+    pub fn filter(mut self, expr: FilterExpr) -> Self {
+        self.filter = Some(expr);
         self
     }
 
@@ -522,7 +530,7 @@ impl<'a> QueryBuilder<'a> {
                 None
             };
 
-            // Filter, reverse, limit.
+            // Deserialize, TTL-filter, collect.
             let mut items: Vec<(Vec<u8>, Value)> = Vec::new();
             for (key_bytes, value_bytes) in raw_results {
                 // Skip items <= exclusive_start_key.
@@ -547,26 +555,41 @@ impl<'a> QueryBuilder<'a> {
                 items.reverse();
             }
 
-            // Apply limit and compute last_evaluated_key.
-            let (limited, last_key) = if let Some(limit) = self.limit {
-                if items.len() > limit {
-                    let last = items[limit - 1].0.clone();
-                    items.truncate(limit);
-                    (items, Some(last))
-                } else {
-                    (items, None)
-                }
-            } else {
-                (items, None)
-            };
+            // Evaluate limit (counts evaluated items) and filter.
+            let mut result_items = Vec::new();
+            let mut last_evaluated_bytes: Option<Vec<u8>> = None;
+            let mut has_more = false;
 
-            let last_evaluated_key = if let Some(last_key_bytes) = last_key {
-                Some(build_last_evaluated_key(&last_key_bytes, schema)?)
+            for (evaluated, (key_bytes, val)) in items.iter().enumerate() {
+                if let Some(limit) = self.limit
+                    && evaluated >= limit
+                {
+                    has_more = true;
+                    break;
+                }
+
+                last_evaluated_bytes = Some(key_bytes.clone());
+
+                let passes = match &self.filter {
+                    Some(filter) => filter.eval(val).unwrap_or(false),
+                    None => true,
+                };
+
+                if passes {
+                    result_items.push(val.clone());
+                }
+            }
+
+            // If no limit was hit but we consumed all items, no pagination needed.
+            let last_evaluated_key = if has_more {
+                if let Some(ref last_key_bytes) = last_evaluated_bytes {
+                    Some(build_last_evaluated_key(last_key_bytes, schema)?)
+                } else {
+                    None
+                }
             } else {
                 None
             };
-
-            let result_items: Vec<Value> = limited.into_iter().map(|(_, v)| v).collect();
 
             Ok(QueryResult {
                 items: result_items,
@@ -586,6 +609,7 @@ pub struct ScanBuilder<'a> {
     table: String,
     limit: Option<usize>,
     exclusive_start_key: Option<Value>,
+    filter: Option<FilterExpr>,
 }
 
 impl<'a> ScanBuilder<'a> {
@@ -595,6 +619,7 @@ impl<'a> ScanBuilder<'a> {
             table,
             limit: None,
             exclusive_start_key: None,
+            filter: None,
         }
     }
 
@@ -605,6 +630,11 @@ impl<'a> ScanBuilder<'a> {
 
     pub fn exclusive_start_key(mut self, key: impl Into<Value>) -> Self {
         self.exclusive_start_key = Some(key.into());
+        self
+    }
+
+    pub fn filter(mut self, expr: FilterExpr) -> Self {
+        self.filter = Some(expr);
         self
     }
 
@@ -641,25 +671,40 @@ impl<'a> ScanBuilder<'a> {
                 items.push((key_bytes, val));
             }
 
-            let (limited, last_key) = if let Some(limit) = self.limit {
-                if items.len() > limit {
-                    let last = items[limit - 1].0.clone();
-                    items.truncate(limit);
-                    (items, Some(last))
-                } else {
-                    (items, None)
-                }
-            } else {
-                (items, None)
-            };
+            // Evaluate limit (counts evaluated items) and filter.
+            let mut result_items = Vec::new();
+            let mut last_evaluated_bytes: Option<Vec<u8>> = None;
+            let mut has_more = false;
 
-            let last_evaluated_key = if let Some(last_key_bytes) = last_key {
-                Some(build_last_evaluated_key(&last_key_bytes, schema)?)
+            for (evaluated, (key_bytes, val)) in items.iter().enumerate() {
+                if let Some(limit) = self.limit
+                    && evaluated >= limit
+                {
+                    has_more = true;
+                    break;
+                }
+
+                last_evaluated_bytes = Some(key_bytes.clone());
+
+                let passes = match &self.filter {
+                    Some(filter) => filter.eval(val).unwrap_or(false),
+                    None => true,
+                };
+
+                if passes {
+                    result_items.push(val.clone());
+                }
+            }
+
+            let last_evaluated_key = if has_more {
+                if let Some(ref last_key_bytes) = last_evaluated_bytes {
+                    Some(build_last_evaluated_key(last_key_bytes, schema)?)
+                } else {
+                    None
+                }
             } else {
                 None
             };
-
-            let result_items: Vec<Value> = limited.into_iter().map(|(_, v)| v).collect();
 
             Ok(QueryResult {
                 items: result_items,
@@ -864,6 +909,7 @@ pub struct IndexQueryBuilder<'a> {
     key_value: Option<Value>,
     limit: Option<usize>,
     scan_forward: bool,
+    filter: Option<FilterExpr>,
 }
 
 impl<'a> IndexQueryBuilder<'a> {
@@ -875,6 +921,7 @@ impl<'a> IndexQueryBuilder<'a> {
             key_value: None,
             limit: None,
             scan_forward: true,
+            filter: None,
         }
     }
 
@@ -893,6 +940,12 @@ impl<'a> IndexQueryBuilder<'a> {
     /// Set scan direction (default: forward/ascending).
     pub fn scan_forward(mut self, forward: bool) -> Self {
         self.scan_forward = forward;
+        self
+    }
+
+    /// Set a filter expression to apply to results.
+    pub fn filter(mut self, expr: FilterExpr) -> Self {
+        self.filter = Some(expr);
         self
     }
 
@@ -970,13 +1023,34 @@ impl<'a> IndexQueryBuilder<'a> {
                 items.reverse();
             }
 
-            // Apply limit.
-            if let Some(limit) = self.limit {
-                items.truncate(limit);
+            // Evaluate limit (counts evaluated items) and filter.
+            let mut result_items = Vec::new();
+            let mut has_more = false;
+
+            for (evaluated, val) in items.iter().enumerate() {
+                if let Some(limit) = self.limit
+                    && evaluated >= limit
+                {
+                    has_more = true;
+                    break;
+                }
+
+                let passes = match &self.filter {
+                    Some(filter) => filter.eval(val).unwrap_or(false),
+                    None => true,
+                };
+
+                if passes {
+                    result_items.push(val.clone());
+                }
             }
 
+            // IndexQueryBuilder doesn't support pagination cursors yet,
+            // but signal that more results exist if limit was hit.
+            let _ = has_more;
+
             Ok(QueryResult {
-                items,
+                items: result_items,
                 last_evaluated_key: None,
             })
         })
