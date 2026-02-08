@@ -91,3 +91,13 @@ Add `ProjectionExpression` support so clients can specify which attributes to re
 ## Dependents
 
 - PRD #5 (BatchGetItem) could integrate `.projection()` on batch reads
+
+## Documentation
+
+**IMPORTANT:** Documentation MUST be updated to reflect the changes introduced by this PRD. This includes:
+
+- **Root README** (`README.md`) — Feature list, code examples, design decisions
+- **Server README** (`crates/ferridyn-server/README.md`) — Protocol examples, client usage, features list
+- **CLAUDE.md** — Architecture description, workspace layout, test counts, API patterns
+
+Documentation updates should be included in the same commit as the code or as an immediate follow-up commit.

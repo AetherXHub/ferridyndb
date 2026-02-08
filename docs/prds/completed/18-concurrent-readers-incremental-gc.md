@@ -115,3 +115,13 @@ Replace full-scan GC with a targeted approach. Options:
 - [ ] `SnapshotTracker` and `PendingFreeList` are actively used (no more `#[allow(dead_code)]`)
 - [ ] All existing tests pass
 - [ ] No increase in memory usage per reader beyond ~100 bytes (header copy)
+
+## Documentation
+
+**IMPORTANT:** Documentation MUST be updated to reflect the changes introduced by this PRD. This includes:
+
+- **Root README** (`README.md`) — Feature list, code examples, design decisions
+- **Server README** (`crates/ferridyn-server/README.md`) — Protocol examples, client usage, features list
+- **CLAUDE.md** — Architecture description, workspace layout, test counts, API patterns
+
+Documentation updates should be included in the same commit as the code or as an immediate follow-up commit.
