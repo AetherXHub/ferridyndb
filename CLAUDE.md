@@ -35,7 +35,9 @@ Six-layer stack, bottom to top:
 5. **Table Catalog** (`catalog/`) — Schema definitions (table name, partition key name+type, optional sort key name+type), partition schemas (prefix-based entity type metadata with attributes), and secondary index definitions. Stored in its own B+Tree rooted from the header.
 6. **MVCC / Transactions** (`mvcc/`) — Snapshot isolation. Single writer, unlimited concurrent readers. Latest document version inline in B+Tree leaf, older versions in overflow chain. Each document carries `created_txn` and `deleted_txn` IDs. Visibility: `created_txn <= snapshot && (deleted_txn is None || deleted_txn > snapshot)`.
 
-Public API (`api/`) sits on top: `put/get/delete/update/query/scan/query_index/batch_get_item/transact`, plus server-side filter expressions, condition expressions on write operations, return values on writes (type-state builders for old/new document retrieval), and introspection for partition schemas and indexes.
+7. **Change Streams** (`stream/`) — Per-table change data capture. Dedicated B+Tree per stream keyed by `(txn_id, sub_sequence)`. Records commit atomically with data writes in the same CoW commit. Configurable view types: KeysOnly, NewImage, OldImage, NewAndOldImages. Poll-based consumption by sequence number with retention pruning (max age, max count).
+
+Public API (`api/`) sits on top: `put/get/delete/update/query/scan/query_index/batch_get_item/transact`, plus server-side filter expressions, condition expressions on write operations, return values on writes (type-state builders for old/new document retrieval), introspection for partition schemas and indexes, and change stream management (enable/disable/query/prune).
 
 Documents are stored on disk as MessagePack (via rmp-serde) for compactness. The public API accepts and returns `serde_json::Value`.
 
@@ -49,6 +51,7 @@ crates/
       btree/           # B+Tree: node layout, ops, overflow
       mvcc/            # Transaction manager, snapshots, version chains, GC
       catalog/         # Table schemas, partition schemas, secondary indexes
+      stream/          # Change streams: record types, stream B+Tree ops, pruning
       api/             # Public API: FerridynDB, builders, batch, query, filter
       encoding/        # Key encoding: string, number, binary, composite
     benches/           # Criterion benchmarks (ferridyn_bench, ferridyn_file_bench)
@@ -58,7 +61,7 @@ crates/
       client.rs        # FerridynClient — async client for multi-process access
       protocol.rs      # Wire protocol (JSON over length-prefixed frames)
     tests/
-      integration.rs   # Server integration tests (21 tests)
+      integration.rs   # Server integration tests (33 tests)
   ferridyn-console/    # Interactive CLI client (connects to server via Unix socket)
     src/
       parser.rs        # SQL-like command parser
@@ -87,6 +90,7 @@ PRDs live in `docs/prds/` and track feature implementation across phases.
 - **Slotted pages** — Slot array grows forward, cell data grows backward
 - **Partition schemas & scoped secondary indexes** — Prefix-based entity type metadata with attribute definitions, scoped secondary indexes backed by plain B+Tree lookups with lazy GC
 - **Global and local secondary indexes** — GSI indexes alternate attributes across the table; LSI shares the table's partition key with an alternate sort key. Both support composite keys, range queries, and projections (KeysOnly, Include, All)
+- **Change streams** — Per-table CDC with dedicated B+Tree per stream, keyed by `(txn_id, sub_sequence)`. Atomic capture in same CoW commit. Configurable view types (KeysOnly, NewImage, OldImage, NewAndOldImages). Retention pruning by age or count
 - **No B+Tree rebalancing in v1** — Mark-as-dead delete, reclaim fully empty pages
 
 ## Dependencies

@@ -13,6 +13,7 @@ A local, embedded, DynamoDB-style document database written in Rust with single-
 - **TTL support** — Optional time-to-live attributes with automatic expiry filtering
 - **Condition expressions** — Predicates on write operations (`put`, `delete`, `update`) that evaluate against the existing item before proceeding, enabling prevent-overwrite and business rule enforcement
 - **ReturnValues** — Write operations optionally return the old or new document via type-state builders (`.return_old()`, `.return_new()`) with compile-time return type safety
+- **Change streams** — Per-table change data capture (CDC) with configurable view types (KeysOnly, NewImage, OldImage, NewAndOldImages), poll-based consumption by sequence number, retention pruning, and atomic capture (stream records commit with data writes)
 - **Version-aware API** — Optimistic concurrency control with versioned reads and conditional writes
 - **Unix socket server** — Multi-process access with async client library
 
@@ -252,13 +253,80 @@ assert_eq!(result.items.len(), 1);
 assert_eq!(result.items[0]["timestamp"], 200.0);
 ```
 
+### Change Streams
+
+```rust
+use ferridyn_core::api::FerridynDB;
+use ferridyn_core::stream::StreamViewType;
+use ferridyn_core::types::KeyType;
+use serde_json::json;
+
+let db = FerridynDB::create("stream_demo.db").unwrap();
+
+// Create a table with a change stream enabled
+db.create_table("orders")
+    .partition_key("order_id", KeyType::String)
+    .stream(StreamViewType::NewAndOldImages)
+    .execute()
+    .unwrap();
+
+// Writes automatically generate stream records
+db.put_item("orders", json!({
+    "order_id": "o1", "status": "pending", "total": 42.0
+})).unwrap();
+
+db.update_item("orders")
+    .partition_key("o1")
+    .set("status", "shipped")
+    .execute()
+    .unwrap();
+
+db.delete_item("orders")
+    .partition_key("o1")
+    .execute()
+    .unwrap();
+
+// Poll for changes
+let records = db.get_stream_records("orders").execute().unwrap();
+assert_eq!(records.len(), 3);
+assert_eq!(records[0].event_type, ferridyn_core::stream::EventType::Insert);
+assert_eq!(records[1].event_type, ferridyn_core::stream::EventType::Modify);
+assert_eq!(records[2].event_type, ferridyn_core::stream::EventType::Remove);
+
+// Modify event captures both old and new images
+assert_eq!(records[1].old_image.as_ref().unwrap()["status"], "pending");
+assert_eq!(records[1].new_image.as_ref().unwrap()["status"], "shipped");
+
+// Paginate with after_sequence
+let first_seq = records[0].sequence_number;
+let remaining = db.get_stream_records("orders")
+    .after_sequence(first_seq)
+    .limit(10)
+    .execute()
+    .unwrap();
+assert_eq!(remaining.len(), 2);
+
+// Stream info
+let info = db.get_stream_info("orders").unwrap();
+assert_eq!(info.record_count, 3);
+
+// Enable/disable on existing tables
+let db2 = FerridynDB::create("existing.db").unwrap();
+db2.create_table("users")
+    .partition_key("id", KeyType::String)
+    .execute()
+    .unwrap();
+db2.enable_stream("users", StreamViewType::KeysOnly).unwrap();
+db2.disable_stream("users").unwrap(); // preserves existing records
+```
+
 ### Build and Test
 
 ```bash
 # Compile all crates
 cargo build
 
-# Run all tests (691 tests across workspace)
+# Run all tests (723 tests across workspace)
 cargo test
 
 # Run tests for a specific crate
@@ -474,6 +542,10 @@ FerridynDB follows the LMDB concurrency model: one writer at a time (via file lo
 ### Partition Schemas & Secondary Indexes
 
 Secondary indexes can be **scoped** (limited to a partition schema prefix) or **global** (spanning all items in the table). Scoped indexes are tied to partition schemas — prefix-based entity type declarations that define expected attributes. Global indexes match any item that has the indexed attribute, regardless of partition key prefix. **Local secondary indexes** (LSI) share the table's partition key but use an alternate sort key, enabling queries like "find all items in partition X, sorted by timestamp". All index types support composite keys, range queries, projections (KeysOnly, Include, All), and are backed by plain B+Tree lookups with lazy GC for orphaned entries. Dropping an index reclaims all of its B+Tree pages.
+
+### Change Streams
+
+Per-table change data capture uses a dedicated B+Tree per stream, keyed by `(txn_id, sub_sequence)`. Stream records commit atomically with data writes in the same CoW page commit, guaranteeing no phantom records. View types control what data is captured: KeysOnly avoids storing full documents; NewAndOldImages stores both the before and after states. Retention pruning removes records by age or count. The design matches DynamoDB Streams semantics: one record per item per write, sequence numbers derived from transaction IDs.
 
 ### No B+Tree Rebalancing (v1)
 

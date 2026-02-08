@@ -40,6 +40,12 @@ JSON-over-newlines on Unix domain socket. Each request is one JSON line, each re
 {"op":"drop_index","table":"data","index_name":"status-idx"}
 {"op":"list_partition_keys","table":"users","limit":20}
 {"op":"list_sort_key_prefixes","table":"users","partition_key":"alice","limit":20}
+{"op":"enable_stream","table":"orders","view_type":"NEW_AND_OLD_IMAGES"}
+{"op":"disable_stream","table":"orders"}
+{"op":"get_stream_records","table":"orders"}
+{"op":"get_stream_records","table":"orders","after_sequence":5,"limit":100}
+{"op":"get_stream_info","table":"orders"}
+{"op":"prune_stream","table":"orders"}
 ```
 
 ### Response Examples
@@ -52,6 +58,8 @@ JSON-over-newlines on Unix domain socket. Each request is one JSON line, each re
 {"ok":true}
 {"error":"VersionMismatch","message":"expected version 5, actual 8","expected":5,"actual":8}
 {"error":"TableNotFound","message":"table not found: nonexistent"}
+{"ok":true,"records":[{"sequence_number":3,"sub_sequence":0,"event_type":"INSERT","keys":{"order_id":"o1"},"timestamp":1700000000.0}]}
+{"ok":true,"stream_info":{"enabled":true,"view_type":"NEW_AND_OLD_IMAGES","oldest_sequence":3,"latest_sequence":5,"record_count":3}}
 ```
 
 ## Client Library
@@ -95,6 +103,13 @@ client.put_item_conditional(
     json!({"user_id": "alice", "name": "Updated"}),
     v.unwrap().version
 ).await?;
+
+// Change streams
+client.enable_stream("orders", "NEW_AND_OLD_IMAGES").await?;
+let records = client.get_stream_records("orders", None, Some(100)).await?;
+let info = client.get_stream_info("orders").await?;
+client.prune_stream("orders").await?;
+client.disable_stream("orders").await?;
 ```
 
 ## Server Binary
@@ -122,6 +137,7 @@ ferridyn-server [--db PATH] [--socket PATH]
 - **Version tracking**: Optimistic locking with version numbers for conditional updates
 - **Projection expressions**: Return only selected attributes from read operations (get, query, scan, batch_get, query_index)
 - **Secondary indexes**: Scoped (partition schema prefix), global (table-wide), and local (same partition key, alternate sort key) secondary indexes with composite keys (partition + sort), index projections (KEYS_ONLY, INCLUDE, ALL), automatic backfill, sort key range conditions, and page reclamation on drop
+- **Change streams**: Per-table change data capture with configurable view types (KEYS_ONLY, NEW_IMAGE, OLD_IMAGE, NEW_AND_OLD_IMAGES), poll-based consumption with sequence pagination, stream info, retention pruning, and enable/disable on existing tables
 
 ## Concurrency Model
 
