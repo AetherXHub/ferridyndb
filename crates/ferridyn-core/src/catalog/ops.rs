@@ -158,7 +158,7 @@ pub fn drop_partition_schema(
     if entry
         .indexes
         .iter()
-        .any(|idx| idx.partition_schema == prefix)
+        .any(|idx| idx.partition_schema.as_deref() == Some(prefix))
     {
         return Err(SchemaError::PartitionSchemaHasIndexes {
             prefix: prefix.to_string(),
@@ -194,15 +194,16 @@ pub fn list_partition_schemas(
 
 /// Create a secondary index on a table, with synchronous backfill.
 ///
-/// The index is scoped to a partition schema. All existing documents whose
-/// partition key prefix matches the schema and that contain the indexed
-/// attribute with the correct type will be indexed.
+/// When `partition_schema` is `Some(prefix)`, the index is scoped to that
+/// partition schema and only documents whose partition key starts with the
+/// prefix are indexed. When `None`, the index is global and all documents
+/// with the indexed attribute are included.
 pub fn create_index(
     store: &mut impl PageStore,
     catalog_root: PageId,
     table_name: &str,
     name: String,
-    partition_schema: String,
+    partition_schema: Option<String>,
     index_key: KeyDefinition,
     txn_id: TxnId,
 ) -> Result<PageId, Error> {
@@ -211,13 +212,14 @@ pub fn create_index(
 
     let mut entry = get_table(store, catalog_root, table_name)?;
 
-    // Validate partition schema exists.
-    if !entry
-        .partition_schemas
-        .iter()
-        .any(|ps| ps.prefix == partition_schema)
+    // Validate partition schema exists (only for scoped indexes).
+    if let Some(ref ps) = partition_schema
+        && !entry
+            .partition_schemas
+            .iter()
+            .any(|schema| schema.prefix == *ps)
     {
-        return Err(SchemaError::PartitionSchemaNotFound(partition_schema).into());
+        return Err(SchemaError::PartitionSchemaNotFound(ps.clone()).into());
     }
 
     // Check for duplicate index name.
@@ -240,15 +242,15 @@ pub fn create_index(
     let all_entries = mvcc_ops::mvcc_range_scan(store, entry.data_root_page, None, None, txn_id)?;
 
     for (key_bytes, value_bytes) in &all_entries {
-        // Decode the primary key to check the prefix.
-        let has_sort_key = entry.schema.sort_key.is_some();
-        let (pk_kv, _sk_kv) =
-            crate::encoding::composite::decode_composite(key_bytes, has_sort_key)?;
-
-        // Check if this document's prefix matches the partition schema.
-        let prefix = key_utils::extract_pk_prefix(&pk_kv);
-        if prefix.as_deref() != Some(&partition_schema) {
-            continue; // Different prefix — skip.
+        // For scoped indexes, check if the document's prefix matches.
+        if let Some(ref ps) = partition_schema {
+            let has_sort_key = entry.schema.sort_key.is_some();
+            let (pk_kv, _sk_kv) =
+                crate::encoding::composite::decode_composite(key_bytes, has_sort_key)?;
+            let prefix = key_utils::extract_pk_prefix(&pk_kv);
+            if prefix.as_deref() != Some(ps.as_str()) {
+                continue; // Different prefix — skip.
+            }
         }
 
         // Deserialize the document.
@@ -280,7 +282,7 @@ pub fn create_index(
 }
 
 /// Remove an index from a table's catalog entry.
-/// Does not free the index B+Tree pages (deferred cleanup).
+/// Frees all B+Tree pages used by the index.
 pub fn drop_index(
     store: &mut impl PageStore,
     catalog_root: PageId,
@@ -289,12 +291,18 @@ pub fn drop_index(
 ) -> Result<PageId, Error> {
     let mut entry = get_table(store, catalog_root, table_name)?;
 
-    let original_len = entry.indexes.len();
-    entry.indexes.retain(|idx| idx.name != index_name);
+    // Find the index to get its root page before removing.
+    let idx_pos = entry.indexes.iter().position(|idx| idx.name == index_name);
+    let idx_pos = match idx_pos {
+        Some(pos) => pos,
+        None => return Err(SchemaError::IndexNotFound(index_name.to_string()).into()),
+    };
 
-    if entry.indexes.len() == original_len {
-        return Err(SchemaError::IndexNotFound(index_name.to_string()).into());
-    }
+    // Free the index B+Tree pages.
+    let index_root = entry.indexes[idx_pos].root_page;
+    ops::free_tree(store, index_root)?;
+
+    entry.indexes.remove(idx_pos);
 
     let json_bytes = serde_json::to_vec(&entry).map_err(|e| {
         StorageError::CorruptedPage(format!("failed to serialize catalog entry: {e}"))
@@ -625,7 +633,7 @@ mod tests {
             root,
             "data",
             "email-idx".to_string(),
-            "CONTACT".to_string(),
+            Some("CONTACT".to_string()),
             KeyDefinition {
                 name: "email".to_string(),
                 key_type: KeyType::String,
@@ -660,7 +668,7 @@ mod tests {
             root,
             "data",
             "email-idx".to_string(),
-            "CONTACT".to_string(),
+            Some("CONTACT".to_string()),
             KeyDefinition {
                 name: "email".to_string(),
                 key_type: KeyType::String,
@@ -672,7 +680,7 @@ mod tests {
         let indexes = list_indexes(&store, root, "data").unwrap();
         assert_eq!(indexes.len(), 1);
         assert_eq!(indexes[0].name, "email-idx");
-        assert_eq!(indexes[0].partition_schema, "CONTACT");
+        assert_eq!(indexes[0].partition_schema, Some("CONTACT".to_string()));
     }
 
     #[test]
@@ -694,7 +702,7 @@ mod tests {
             root,
             "data",
             "email-idx".to_string(),
-            "CONTACT".to_string(),
+            Some("CONTACT".to_string()),
             KeyDefinition {
                 name: "email".to_string(),
                 key_type: KeyType::String,
@@ -708,7 +716,7 @@ mod tests {
             root,
             "data",
             "email-idx".to_string(),
-            "CONTACT".to_string(),
+            Some("CONTACT".to_string()),
             KeyDefinition {
                 name: "email".to_string(),
                 key_type: KeyType::String,
@@ -730,7 +738,7 @@ mod tests {
             root,
             "data",
             "email-idx".to_string(),
-            "NONEXISTENT".to_string(),
+            Some("NONEXISTENT".to_string()),
             KeyDefinition {
                 name: "email".to_string(),
                 key_type: KeyType::String,
@@ -794,7 +802,7 @@ mod tests {
             root,
             "data",
             "email-idx".to_string(),
-            "CONTACT".to_string(),
+            Some("CONTACT".to_string()),
             KeyDefinition {
                 name: "email".to_string(),
                 key_type: KeyType::String,
@@ -859,7 +867,7 @@ mod tests {
             root,
             "data",
             "email-idx".to_string(),
-            "CONTACT".to_string(),
+            Some("CONTACT".to_string()),
             KeyDefinition {
                 name: "email".to_string(),
                 key_type: KeyType::String,
@@ -893,7 +901,7 @@ mod tests {
             root,
             "data",
             "email-idx".to_string(),
-            "CONTACT".to_string(),
+            Some("CONTACT".to_string()),
             KeyDefinition {
                 name: "email".to_string(),
                 key_type: KeyType::String,

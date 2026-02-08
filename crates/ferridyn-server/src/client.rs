@@ -63,7 +63,7 @@ pub struct AttributeInfo {
 #[derive(Debug, Clone)]
 pub struct IndexInfo {
     pub name: String,
-    pub partition_schema: String,
+    pub partition_schema: Option<String>,
     pub index_key_name: String,
     pub index_key_type: String,
 }
@@ -623,20 +623,22 @@ impl FerridynClient {
         &mut self,
         table: &str,
         name: &str,
-        partition_schema: &str,
+        partition_schema: Option<&str>,
         index_key_name: &str,
         index_key_type: &str,
     ) -> Result<()> {
-        let req = serde_json::json!({
+        let mut req = serde_json::json!({
             "op": "create_index",
             "table": table,
             "name": name,
-            "partition_schema": partition_schema,
             "index_key": {
                 "name": index_key_name,
                 "type": index_key_type,
             },
         });
+        if let Some(ps) = partition_schema {
+            req["partition_schema"] = serde_json::Value::String(ps.to_string());
+        }
         let resp = self.send_request(&req).await?;
         check_ok(&resp)
     }
@@ -1023,8 +1025,7 @@ fn parse_index_info(v: &Value) -> IndexInfo {
         partition_schema: v
             .get("partition_schema")
             .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
+            .map(|s| s.to_string()),
         index_key_name: v
             .get("index_key")
             .and_then(|v| v.get("name"))

@@ -401,7 +401,7 @@ mod tests {
         };
         let index = IndexDefinition {
             name: "email-index".to_string(),
-            partition_schema: "CONTACT".to_string(),
+            partition_schema: Some("CONTACT".to_string()),
             index_key: KeyDefinition {
                 name: "email".to_string(),
                 key_type: KeyType::String,
@@ -444,7 +444,7 @@ mod tests {
         };
         let index = IndexDefinition {
             name: "email-index".to_string(),
-            partition_schema: "CONTACT".to_string(),
+            partition_schema: Some("CONTACT".to_string()),
             index_key: KeyDefinition {
                 name: "email".to_string(),
                 key_type: KeyType::String,
@@ -470,7 +470,7 @@ mod tests {
         };
         let index = IndexDefinition {
             name: "email-index".to_string(),
-            partition_schema: "CONTACT".to_string(),
+            partition_schema: Some("CONTACT".to_string()),
             index_key: KeyDefinition {
                 name: "email".to_string(),
                 key_type: KeyType::String,
@@ -497,7 +497,7 @@ mod tests {
         };
         let index = IndexDefinition {
             name: "email-index".to_string(),
-            partition_schema: "CONTACT".to_string(),
+            partition_schema: Some("CONTACT".to_string()),
             index_key: KeyDefinition {
                 name: "email".to_string(),
                 key_type: KeyType::String,

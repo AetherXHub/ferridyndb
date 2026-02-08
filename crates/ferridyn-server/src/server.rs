@@ -244,7 +244,7 @@ fn dispatch(db: &FerridynDB, req: Request) -> Response {
             name,
             partition_schema,
             index_key,
-        } => handle_create_index(db, &table, &name, &partition_schema, index_key),
+        } => handle_create_index(db, &table, &name, partition_schema.as_deref(), index_key),
 
         Request::DropIndex { table, name } => handle_drop_index(db, &table, &name),
 
@@ -725,7 +725,7 @@ fn handle_create_index(
     db: &FerridynDB,
     table: &str,
     name: &str,
-    partition_schema: &str,
+    partition_schema: Option<&str>,
     index_key: KeyDef,
 ) -> Response {
     let key_type = match parse_key_type(&index_key.key_type) {
@@ -737,13 +737,11 @@ fn handle_create_index(
             );
         }
     };
-    match db
-        .create_index(table)
-        .name(name)
-        .partition_schema(partition_schema)
-        .index_key(&index_key.name, key_type)
-        .execute()
-    {
+    let mut builder = db.create_index(table).name(name);
+    if let Some(ps) = partition_schema {
+        builder = builder.partition_schema(ps);
+    }
+    match builder.index_key(&index_key.name, key_type).execute() {
         Ok(()) => Response::ok_empty(),
         Err(e) => dyn_error_to_response(e),
     }

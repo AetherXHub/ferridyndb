@@ -72,18 +72,20 @@ fn maintain_indexes(
         return Ok(entry.clone());
     }
 
-    // Extract prefix - if None (non-String PK), no indexes can apply.
-    let prefix = match key_utils::extract_pk_prefix(pk) {
-        Some(p) => p,
-        None => return Ok(entry.clone()),
-    };
+    // Extract prefix for scoped index matching.
+    let prefix = key_utils::extract_pk_prefix(pk);
 
-    // Find indexes that match this prefix.
+    // Find indexes that apply to this document:
+    // - Global indexes (partition_schema=None) always apply.
+    // - Scoped indexes apply only when prefix matches.
     let relevant: Vec<usize> = entry
         .indexes
         .iter()
         .enumerate()
-        .filter(|(_, idx)| idx.partition_schema == prefix)
+        .filter(|(_, idx)| match &idx.partition_schema {
+            None => true,
+            Some(schema_prefix) => prefix.as_deref() == Some(schema_prefix.as_str()),
+        })
         .map(|(i, _)| i)
         .collect();
 
@@ -1021,7 +1023,7 @@ mod tests {
             catalog_root,
             "data",
             "email-idx".to_string(),
-            "CONTACT".to_string(),
+            Some("CONTACT".to_string()),
             KeyDefinition {
                 name: "email".to_string(),
                 key_type: KeyType::String,
@@ -1060,7 +1062,7 @@ mod tests {
             catalog_root,
             "data",
             "email-idx".to_string(),
-            "CONTACT".to_string(),
+            Some("CONTACT".to_string()),
             KeyDefinition {
                 name: "email".to_string(),
                 key_type: KeyType::String,
@@ -1102,7 +1104,7 @@ mod tests {
             catalog_root,
             "data",
             "email-idx".to_string(),
-            "CONTACT".to_string(),
+            Some("CONTACT".to_string()),
             KeyDefinition {
                 name: "email".to_string(),
                 key_type: KeyType::String,
@@ -1161,7 +1163,7 @@ mod tests {
             catalog_root,
             "data",
             "email-idx".to_string(),
-            "CONTACT".to_string(),
+            Some("CONTACT".to_string()),
             KeyDefinition {
                 name: "email".to_string(),
                 key_type: KeyType::String,
@@ -1200,7 +1202,7 @@ mod tests {
             catalog_root,
             "data",
             "email-idx".to_string(),
-            "CONTACT".to_string(),
+            Some("CONTACT".to_string()),
             KeyDefinition {
                 name: "email".to_string(),
                 key_type: KeyType::String,

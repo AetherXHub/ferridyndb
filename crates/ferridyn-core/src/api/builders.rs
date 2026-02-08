@@ -1570,13 +1570,12 @@ impl<'a> PartitionSchemaBuilder<'a> {
 
 /// Builder for creating a secondary index on a table.
 ///
-/// The index is scoped to a partition schema (prefix). Documents whose
-/// partition key starts with the prefix AND contain the indexed attribute
-/// will have entries in the index B+Tree.
+/// When `.partition_schema()` is called, the index is scoped to that prefix:
+/// only documents whose partition key starts with the prefix are indexed.
+/// When omitted, a global index is created that spans the entire table.
 ///
-/// If the table already has data matching the prefix, a synchronous backfill
-/// is performed within the transaction. This blocks all reads and writes
-/// for the duration.
+/// If the table already has matching data, a synchronous backfill is performed
+/// within the transaction. This blocks all reads and writes for the duration.
 pub struct CreateIndexBuilder<'a> {
     db: &'a FerridynDB,
     table: String,
@@ -1619,9 +1618,7 @@ impl<'a> CreateIndexBuilder<'a> {
         let name = self.name.ok_or(QueryError::InvalidCondition(
             "index name required".to_string(),
         ))?;
-        let partition_schema = self.partition_schema.ok_or(QueryError::InvalidCondition(
-            "partition_schema required".to_string(),
-        ))?;
+        let partition_schema = self.partition_schema;
         let (attr_name, key_type) = self.index_key.ok_or(QueryError::IndexKeyRequired)?;
 
         let key_def = KeyDefinition {

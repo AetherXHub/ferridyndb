@@ -749,6 +749,45 @@ fn clear_page_slots(page: &mut Page, data_offset: usize) {
     page.mark_dirty();
 }
 
+/// Recursively free all pages in a B+Tree (internal nodes, leaf nodes).
+///
+/// Walks the tree depth-first, freeing each page. After this call the
+/// tree's pages are returned to the free list and the root page ID is
+/// no longer valid.
+pub fn free_tree(store: &mut impl PageStore, page_id: PageId) -> Result<(), StorageError> {
+    let page = store.read_page(page_id)?;
+    match page.page_type()? {
+        PageType::BTreeInternal => {
+            let sp = SlottedPageRef::new(&page, INTERNAL_DATA_OFFSET);
+            // Free each child referenced by cells.
+            for i in 0..sp.slot_count() {
+                let cell = sp.cell(i).expect("cell missing in internal node");
+                let child_id = internal_cell_child(cell);
+                free_tree(store, child_id)?;
+            }
+            // Free the rightmost child.
+            let rightmost = internal_rightmost_child(&page);
+            if rightmost != 0 {
+                free_tree(store, rightmost)?;
+            }
+            // Free this internal page.
+            store.free_page(page_id)?;
+        }
+        PageType::BTreeLeaf => {
+            // Leaf node — just free it. No overflow pages in index trees
+            // (index values are empty).
+            store.free_page(page_id)?;
+        }
+        other => {
+            return Err(StorageError::CorruptedPage(format!(
+                "unexpected page type {:?} in tree walk",
+                other
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Create an initial empty B+Tree. Returns the root page ID.
 pub fn create_tree(store: &mut impl PageStore) -> Result<PageId, StorageError> {
     let page = store.allocate_page(PageType::BTreeLeaf)?;

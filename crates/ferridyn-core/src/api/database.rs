@@ -384,7 +384,8 @@ impl FerridynDB {
 
     /// Drop a secondary index from a table.
     ///
-    /// The index B+Tree pages are leaked (not reclaimed) in v1.
+    /// All B+Tree pages used by the index are freed and returned to the
+    /// free list for reuse.
     pub fn drop_index(&self, table: &str, index_name: &str) -> Result<(), Error> {
         let table = table.to_string();
         let index_name = index_name.to_string();
@@ -2402,7 +2403,7 @@ mod partition_schema_and_index_tests {
         let indexes = db.list_indexes("data").unwrap();
         assert_eq!(indexes.len(), 1);
         assert_eq!(indexes[0].name, "email-idx");
-        assert_eq!(indexes[0].partition_schema, "CONTACT");
+        assert_eq!(indexes[0].partition_schema, Some("CONTACT".to_string()));
         assert_eq!(indexes[0].index_key.name, "email");
     }
 
@@ -2413,7 +2414,7 @@ mod partition_schema_and_index_tests {
 
         let index = db.describe_index("data", "email-idx").unwrap();
         assert_eq!(index.name, "email-idx");
-        assert_eq!(index.partition_schema, "CONTACT");
+        assert_eq!(index.partition_schema, Some("CONTACT".to_string()));
     }
 
     #[test]
@@ -6043,5 +6044,471 @@ mod projection_tests {
             assert!(item.get("age").is_none()); // not projected
             assert!(item.get("email").is_none()); // not projected (not a key attr)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Global index tests (PRD-09 Phase 1)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod global_index_tests {
+    use super::*;
+    use crate::types::{AttrType, KeyType};
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    fn create_test_db() -> (FerridynDB, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = FerridynDB::create(&db_path).unwrap();
+        (db, dir)
+    }
+
+    #[test]
+    fn test_create_global_index() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        // Create a global index (no partition_schema).
+        db.create_index("data")
+            .name("status-idx")
+            .index_key("status", KeyType::String)
+            .execute()
+            .unwrap();
+
+        let indexes = db.list_indexes("data").unwrap();
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes[0].name, "status-idx");
+        assert_eq!(indexes[0].partition_schema, None);
+    }
+
+    #[test]
+    fn test_global_index_backfill() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        // Insert documents with different prefixes.
+        db.put_item("data", json!({"pk": "USER#alice", "status": "active"}))
+            .unwrap();
+        db.put_item("data", json!({"pk": "ORDER#100", "status": "shipped"}))
+            .unwrap();
+        db.put_item("data", json!({"pk": "PRODUCT#42", "status": "active"}))
+            .unwrap();
+
+        // Create a global index AFTER data exists — should backfill all.
+        db.create_index("data")
+            .name("status-idx")
+            .index_key("status", KeyType::String)
+            .execute()
+            .unwrap();
+
+        // Query for "active" should find items across entity types.
+        let result = db
+            .query_index("data", "status-idx")
+            .key_value("active")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 2);
+        let pks: Vec<&str> = result
+            .items
+            .iter()
+            .map(|i| i["pk"].as_str().unwrap())
+            .collect();
+        assert!(pks.contains(&"USER#alice"));
+        assert!(pks.contains(&"PRODUCT#42"));
+
+        // Query for "shipped" should find the order.
+        let result = db
+            .query_index("data", "status-idx")
+            .key_value("shipped")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["pk"], "ORDER#100");
+    }
+
+    #[test]
+    fn test_global_index_query() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("category-idx")
+            .index_key("category", KeyType::String)
+            .execute()
+            .unwrap();
+
+        // Insert documents with different prefixes but same category.
+        db.put_item(
+            "data",
+            json!({"pk": "ITEM#1", "category": "electronics", "name": "Phone"}),
+        )
+        .unwrap();
+        db.put_item(
+            "data",
+            json!({"pk": "ITEM#2", "category": "books", "name": "Novel"}),
+        )
+        .unwrap();
+        db.put_item(
+            "data",
+            json!({"pk": "SALE#99", "category": "electronics", "name": "Laptop Sale"}),
+        )
+        .unwrap();
+
+        let result = db
+            .query_index("data", "category-idx")
+            .key_value("electronics")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 2);
+    }
+
+    #[test]
+    fn test_global_index_sparse() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("email-idx")
+            .index_key("email", KeyType::String)
+            .execute()
+            .unwrap();
+
+        // Some docs have email, some don't.
+        db.put_item("data", json!({"pk": "a", "email": "a@test.com"}))
+            .unwrap();
+        db.put_item("data", json!({"pk": "b", "name": "no-email"}))
+            .unwrap();
+        db.put_item("data", json!({"pk": "c", "email": "c@test.com"}))
+            .unwrap();
+
+        // Only docs with email should be in the index.
+        let result = db
+            .query_index("data", "email-idx")
+            .key_value("a@test.com")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["pk"], "a");
+
+        let result = db
+            .query_index("data", "email-idx")
+            .key_value("c@test.com")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["pk"], "c");
+    }
+
+    #[test]
+    fn test_global_index_type_mismatch_skipped() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        // Index expects Number type for "score".
+        db.create_index("data")
+            .name("score-idx")
+            .index_key("score", KeyType::Number)
+            .execute()
+            .unwrap();
+
+        // Insert a doc with score as Number (indexed) and one with score as String (skipped).
+        db.put_item("data", json!({"pk": "a", "score": 95}))
+            .unwrap();
+        db.put_item("data", json!({"pk": "b", "score": "not-a-number"}))
+            .unwrap();
+
+        let result = db
+            .query_index("data", "score-idx")
+            .key_value(95)
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["pk"], "a");
+    }
+
+    #[test]
+    fn test_scoped_index_still_works() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_partition_schema("data")
+            .prefix("USER")
+            .description("User entities")
+            .attribute("email", AttrType::String, true)
+            .validate(false)
+            .execute()
+            .unwrap();
+
+        // Scoped index.
+        db.create_index("data")
+            .name("user-email-idx")
+            .partition_schema("USER")
+            .index_key("email", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put_item(
+            "data",
+            json!({"pk": "USER#alice", "email": "alice@test.com"}),
+        )
+        .unwrap();
+        db.put_item(
+            "data",
+            json!({"pk": "ORDER#100", "email": "order@test.com"}),
+        )
+        .unwrap();
+
+        // Scoped index should only find the USER doc.
+        let result = db
+            .query_index("data", "user-email-idx")
+            .key_value("alice@test.com")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["pk"], "USER#alice");
+
+        // ORDER doc not in the scoped index.
+        let result = db
+            .query_index("data", "user-email-idx")
+            .key_value("order@test.com")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 0);
+
+        let indexes = db.list_indexes("data").unwrap();
+        assert_eq!(indexes[0].partition_schema, Some("USER".to_string()));
+    }
+
+    #[test]
+    fn test_global_index_maintained_on_put_and_delete() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("tag-idx")
+            .index_key("tag", KeyType::String)
+            .execute()
+            .unwrap();
+
+        // Put a doc.
+        db.put_item("data", json!({"pk": "x", "tag": "important"}))
+            .unwrap();
+        let result = db
+            .query_index("data", "tag-idx")
+            .key_value("important")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+
+        // Update the tag via put.
+        db.put_item("data", json!({"pk": "x", "tag": "archived"}))
+            .unwrap();
+        let result = db
+            .query_index("data", "tag-idx")
+            .key_value("important")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 0);
+        let result = db
+            .query_index("data", "tag-idx")
+            .key_value("archived")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+
+        // Delete the doc.
+        db.delete_item("data").partition_key("x").execute().unwrap();
+        let result = db
+            .query_index("data", "tag-idx")
+            .key_value("archived")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 0);
+    }
+
+    #[test]
+    fn test_drop_index_reclaims_pages() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("status-idx")
+            .index_key("status", KeyType::String)
+            .execute()
+            .unwrap();
+
+        // Insert enough docs to create multiple index pages.
+        for i in 0..100 {
+            db.put_item(
+                "data",
+                json!({"pk": format!("item#{i}"), "status": format!("status_{i}")}),
+            )
+            .unwrap();
+        }
+
+        // Verify the index works.
+        let result = db
+            .query_index("data", "status-idx")
+            .key_value("status_50")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+
+        // Drop the index — should not error (pages freed).
+        db.drop_index("data", "status-idx").unwrap();
+
+        // Index should be gone.
+        let indexes = db.list_indexes("data").unwrap();
+        assert!(indexes.is_empty());
+
+        // Can create a new index with the same name (reuse freed pages).
+        db.create_index("data")
+            .name("status-idx")
+            .index_key("status", KeyType::String)
+            .execute()
+            .unwrap();
+
+        // New index should work via backfill.
+        let result = db
+            .query_index("data", "status-idx")
+            .key_value("status_50")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+    }
+
+    #[test]
+    fn test_global_and_scoped_indexes_coexist() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_partition_schema("data")
+            .prefix("USER")
+            .description("User entities")
+            .attribute("email", AttrType::String, true)
+            .attribute("status", AttrType::String, false)
+            .validate(false)
+            .execute()
+            .unwrap();
+
+        // Global index on "status" — indexes ALL documents.
+        db.create_index("data")
+            .name("global-status-idx")
+            .index_key("status", KeyType::String)
+            .execute()
+            .unwrap();
+
+        // Scoped index on "email" — only USER# documents.
+        db.create_index("data")
+            .name("user-email-idx")
+            .partition_schema("USER")
+            .index_key("email", KeyType::String)
+            .execute()
+            .unwrap();
+
+        // Insert a USER doc (should appear in BOTH indexes).
+        db.put_item(
+            "data",
+            json!({"pk": "USER#alice", "email": "alice@test.com", "status": "active"}),
+        )
+        .unwrap();
+
+        // Insert an ORDER doc (should appear only in global index).
+        db.put_item(
+            "data",
+            json!({"pk": "ORDER#100", "email": "order@shop.com", "status": "shipped"}),
+        )
+        .unwrap();
+
+        // Global index finds both.
+        let result = db
+            .query_index("data", "global-status-idx")
+            .key_value("active")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["pk"], "USER#alice");
+
+        let result = db
+            .query_index("data", "global-status-idx")
+            .key_value("shipped")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["pk"], "ORDER#100");
+
+        // Scoped index only finds the USER doc.
+        let result = db
+            .query_index("data", "user-email-idx")
+            .key_value("alice@test.com")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["pk"], "USER#alice");
+
+        // ORDER doc's email is NOT in the scoped index.
+        let result = db
+            .query_index("data", "user-email-idx")
+            .key_value("order@shop.com")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 0);
+
+        // Delete the USER doc — both indexes should be updated.
+        db.delete_item("data")
+            .partition_key("USER#alice")
+            .execute()
+            .unwrap();
+
+        let result = db
+            .query_index("data", "global-status-idx")
+            .key_value("active")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 0);
+
+        let result = db
+            .query_index("data", "user-email-idx")
+            .key_value("alice@test.com")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 0);
+
+        // ORDER doc still in global index.
+        let result = db
+            .query_index("data", "global-status-idx")
+            .key_value("shipped")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
     }
 }

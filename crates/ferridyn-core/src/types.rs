@@ -119,17 +119,21 @@ pub struct PartitionSchema {
     pub validate: bool,
 }
 
-/// A secondary index definition scoped to a partition schema.
+/// A secondary index definition, optionally scoped to a partition schema.
 ///
 /// Each index maintains a separate B+Tree keyed by
 /// `encode_composite(indexed_value, primary_key_as_binary)`.
-/// V1 supports single-attribute indexes with KeysOnly projection.
+/// When `partition_schema` is `Some(prefix)`, only documents whose partition
+/// key starts with that prefix are indexed (scoped index). When `None`, all
+/// documents with the indexed attribute are indexed (global index).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IndexDefinition {
     /// Unique index name (e.g., `"contact-email-index"`).
     pub name: String,
-    /// The partition schema prefix this index is scoped to.
-    pub partition_schema: String,
+    /// The partition schema prefix this index is scoped to, or `None` for
+    /// global indexes that span the entire table.
+    #[serde(default)]
+    pub partition_schema: Option<String>,
     /// The document attribute to index on.
     pub index_key: KeyDefinition,
     /// B+Tree root page for this index.

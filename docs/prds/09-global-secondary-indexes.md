@@ -1,7 +1,7 @@
 # PRD: Global Secondary Indexes
 
 **Priority:** 9
-**Status:** Approved
+**Status:** In Progress (Phase 1 complete)
 **Proposal:** [docs/proposals/accepted/global-secondary-indexes.md](../proposals/accepted/global-secondary-indexes.md)
 
 ## Summary

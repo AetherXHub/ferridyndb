@@ -299,9 +299,10 @@ fn print_index_list(indexes: &[IndexInfo]) {
         println!("No indexes.");
     } else {
         for idx in indexes {
+            let schema = idx.partition_schema.as_deref().unwrap_or("(global)");
             println!(
                 "  {} \u{2014} schema: {}, key: {} ({})",
-                idx.name, idx.partition_schema, idx.index_key_name, idx.index_key_type
+                idx.name, schema, idx.index_key_name, idx.index_key_type
             );
         }
         println!("({} index(es))", indexes.len());
@@ -311,7 +312,8 @@ fn print_index_list(indexes: &[IndexInfo]) {
 /// Print details of a single secondary index.
 fn print_index_detail(index: &IndexInfo) {
     println!("Index: {}", index.name);
-    println!("  Partition schema: {}", index.partition_schema);
+    let schema = index.partition_schema.as_deref().unwrap_or("(global)");
+    println!("  Partition schema: {}", schema);
     println!(
         "  Index key:        {} ({})",
         index.index_key_name, index.index_key_type

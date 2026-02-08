@@ -134,7 +134,8 @@ pub enum Request {
     CreateIndex {
         table: String,
         name: String,
-        partition_schema: String,
+        #[serde(default)]
+        partition_schema: Option<String>,
         index_key: KeyDef,
     },
     DropIndex {
@@ -233,7 +234,8 @@ pub struct PartitionSchemaWire {
 #[derive(Debug, Serialize)]
 pub struct IndexDefWire {
     pub name: String,
-    pub partition_schema: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_schema: Option<String>,
     pub index_key: KeyDefWire,
 }
 

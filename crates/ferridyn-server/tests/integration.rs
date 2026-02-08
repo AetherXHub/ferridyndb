@@ -698,7 +698,7 @@ async fn test_index_crud() {
 
     // Create index.
     client
-        .create_index("data", "email-idx", "CONTACT", "email", "String")
+        .create_index("data", "email-idx", Some("CONTACT"), "email", "String")
         .await
         .unwrap();
 
@@ -706,14 +706,14 @@ async fn test_index_crud() {
     let indexes = client.list_indexes("data").await.unwrap();
     assert_eq!(indexes.len(), 1);
     assert_eq!(indexes[0].name, "email-idx");
-    assert_eq!(indexes[0].partition_schema, "CONTACT");
+    assert_eq!(indexes[0].partition_schema, Some("CONTACT".to_string()));
     assert_eq!(indexes[0].index_key_name, "email");
     assert_eq!(indexes[0].index_key_type, "String");
 
     // Describe index.
     let index = client.describe_index("data", "email-idx").await.unwrap();
     assert_eq!(index.name, "email-idx");
-    assert_eq!(index.partition_schema, "CONTACT");
+    assert_eq!(index.partition_schema, Some("CONTACT".to_string()));
 
     // Drop index.
     client.drop_index("data", "email-idx").await.unwrap();
@@ -760,7 +760,7 @@ async fn test_query_index() {
         .unwrap();
 
     client
-        .create_index("data", "email-idx", "CONTACT", "email", "String")
+        .create_index("data", "email-idx", Some("CONTACT"), "email", "String")
         .await
         .unwrap();
 
@@ -885,7 +885,7 @@ async fn test_query_index_with_limit() {
         .unwrap();
 
     client
-        .create_index("data", "status-idx", "ITEM", "status", "String")
+        .create_index("data", "status-idx", Some("ITEM"), "status", "String")
         .await
         .unwrap();
 
@@ -1224,7 +1224,7 @@ async fn test_index_pagination_over_wire() {
         .unwrap();
 
     client
-        .create_index("data", "status-idx", "ITEM", "status", "String")
+        .create_index("data", "status-idx", Some("ITEM"), "status", "String")
         .await
         .unwrap();
 

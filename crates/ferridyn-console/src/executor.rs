@@ -395,7 +395,7 @@ fn exec_create_index(
     rt.block_on(client.create_index(
         table,
         name,
-        schema_prefix,
+        Some(schema_prefix),
         key_attr,
         key_type_to_str(key_type),
     ))?;
