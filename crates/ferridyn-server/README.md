@@ -10,6 +10,7 @@ JSON-over-newlines on Unix domain socket. Each request is one JSON line, each re
 
 ```jsonl
 {"op":"get_item","table":"users","partition_key":"alice"}
+{"op":"get_item","table":"users","partition_key":"alice","projection":["name","email"]}
 {"op":"get_item_versioned","table":"users","partition_key":"alice"}
 {"op":"put_item","table":"users","item":{"user_id":"alice","name":"Alice"}}
 {"op":"put_item","table":"users","item":{"user_id":"alice","name":"Updated"},"expected_version":5}
@@ -18,12 +19,15 @@ JSON-over-newlines on Unix domain socket. Each request is one JSON line, each re
 {"op":"delete_item","table":"users","partition_key":"alice","return_values":"ALL_OLD"}
 {"op":"update_item","table":"users","partition_key":"alice","updates":[{"action":"set","path":"name","value":"New"}],"return_values":"ALL_NEW"}
 {"op":"query","table":"users","partition_key":"alice","limit":20}
+{"op":"query","table":"users","partition_key":"alice","limit":20,"projection":["name","age"]}
 {"op":"query","table":"users","partition_key":"alice","filter":{"Gt":[{"Attr":"age"},{"Literal":25}]}}
 {"op":"scan","table":"users","limit":100}
+{"op":"scan","table":"users","limit":100,"projection":["name","status"]}
 {"op":"scan","table":"users","limit":100,"filter":{"And":[{"Eq":[{"Attr":"status"},{"Literal":"active"}]},{"Gt":[{"Attr":"age"},{"Literal":18}]}]}}
 {"op":"create_table","table":"users","partition_key":{"name":"user_id","type":"String"}}
 {"op":"list_tables"}
 {"op":"batch_get_item","table":"users","keys":[{"partition_key":"alice"},{"partition_key":"bob"}]}
+{"op":"batch_get_item","table":"users","keys":[{"partition_key":"alice"},{"partition_key":"bob"}],"projection":["name"]}
 {"op":"list_partition_keys","table":"users","limit":20}
 {"op":"list_sort_key_prefixes","table":"users","partition_key":"alice","limit":20}
 ```
@@ -50,12 +54,18 @@ let mut client = FerridynClient::connect("/tmp/ferridyn.sock").await?;
 
 // CRUD operations
 client.put_item("users", json!({"user_id": "alice", "name": "Alice"})).await?;
-let item = client.get_item("users", json!("alice"), None).await?;
+let item = client.get_item("users", json!("alice"), None, None).await?;
 client.delete_item("users", json!("alice"), None).await?;
+
+// Projection — return only selected attributes (key attrs always included)
+let proj = vec!["name".to_string(), "email".to_string()];
+let item = client.get_item("users", json!("alice"), None, Some(&proj)).await?;
 
 // Batch get (single snapshot, positional results, None for missing)
 let keys = vec![(json!("alice"), None), (json!("bob"), None)];
-let results = client.batch_get_item("users", &keys).await?;
+let results = client.batch_get_item("users", &keys, None).await?;
+// With projection
+let results = client.batch_get_item("users", &keys, Some(&proj)).await?;
 
 // ReturnValues — get old/new document atomically
 let old = client.put_item_returning_old("users", json!({"user_id": "alice", "name": "Updated"})).await?;
@@ -100,6 +110,7 @@ ferridyn-server [--db PATH] [--socket PATH]
 - **Graceful shutdown**: SIGINT/SIGTERM handling with socket cleanup
 - **Stale socket cleanup**: Automatically removes socket file from crashed servers
 - **Version tracking**: Optimistic locking with version numbers for conditional updates
+- **Projection expressions**: Return only selected attributes from read operations (get, query, scan, batch_get, query_index)
 
 ## Concurrency Model
 
