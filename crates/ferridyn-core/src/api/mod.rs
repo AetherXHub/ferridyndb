@@ -12,7 +12,7 @@ pub mod update;
 
 pub use batch::{BatchOp, SyncMode, WriteBatch};
 pub use builders::{
-    CreateIndexBuilder, DeleteItemBuilder, GetItemBuilder, IndexQueryBuilder,
+    BatchGetItemBuilder, CreateIndexBuilder, DeleteItemBuilder, GetItemBuilder, IndexQueryBuilder,
     PartitionSchemaBuilder, PutItemBuilder, QueryBuilder, ScanBuilder, TableBuilder,
     UpdateItemBuilder,
 };

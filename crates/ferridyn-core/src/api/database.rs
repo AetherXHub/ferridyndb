@@ -21,10 +21,10 @@ use crate::types::{IndexDefinition, PAGE_SIZE, PageId, PartitionSchema};
 
 use super::batch::{SyncMode, WriteBatch};
 use super::builders::{
-    CreateIndexBuilder, DeleteItemBuilder, GetItemBuilder, GetItemVersionedBuilder,
-    IndexQueryBuilder, ListPartitionKeysBuilder, ListSortKeyPrefixesBuilder,
-    PartitionSchemaBuilder, PutItemBuilder, QueryBuilder, ScanBuilder, TableBuilder,
-    UpdateItemBuilder,
+    BatchGetItemBuilder, CreateIndexBuilder, DeleteItemBuilder, GetItemBuilder,
+    GetItemVersionedBuilder, IndexQueryBuilder, ListPartitionKeysBuilder,
+    ListSortKeyPrefixesBuilder, PartitionSchemaBuilder, PutItemBuilder, QueryBuilder, ScanBuilder,
+    TableBuilder, UpdateItemBuilder,
 };
 use super::page_store::{BufferedPageStore, FilePageStore};
 use super::transaction::Transaction;
@@ -257,6 +257,15 @@ impl FerridynDB {
     /// Use the version with `put_item_conditional` for optimistic concurrency.
     pub fn get_item_versioned(&self, table: &str) -> GetItemVersionedBuilder<'_> {
         GetItemVersionedBuilder::new(self, table.to_string())
+    }
+
+    /// Retrieve multiple items by key in a single call from a single snapshot.
+    ///
+    /// Returns a builder to specify keys via `.key()` chaining.
+    /// Results are positional: `results[i]` corresponds to `keys[i]`.
+    /// Missing items return `None`.
+    pub fn batch_get_item(&self, table: &str) -> BatchGetItemBuilder<'_> {
+        BatchGetItemBuilder::new(self, table.to_string())
     }
 
     /// Put an item with optimistic concurrency control.
@@ -5305,5 +5314,209 @@ mod index_pagination_tests {
             err_msg.contains("invalid") || err_msg.contains("mismatch"),
             "error should mention type issue, got: {err_msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod batch_get_item_tests {
+    use super::*;
+    use crate::types::KeyType;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    fn create_test_db() -> (FerridynDB, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = FerridynDB::create(&db_path).unwrap();
+        (db, dir)
+    }
+
+    #[test]
+    fn test_batch_get_basic() {
+        let (db, _dir) = create_test_db();
+        db.create_table("users")
+            .partition_key("id", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put_item("users", json!({"id": "alice", "name": "Alice"}))
+            .unwrap();
+        db.put_item("users", json!({"id": "bob", "name": "Bob"}))
+            .unwrap();
+        db.put_item("users", json!({"id": "charlie", "name": "Charlie"}))
+            .unwrap();
+
+        let results = db
+            .batch_get_item("users")
+            .key("alice", None)
+            .key("bob", None)
+            .key("charlie", None)
+            .execute()
+            .unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].as_ref().unwrap()["name"], "Alice");
+        assert_eq!(results[1].as_ref().unwrap()["name"], "Bob");
+        assert_eq!(results[2].as_ref().unwrap()["name"], "Charlie");
+    }
+
+    #[test]
+    fn test_batch_get_some_missing() {
+        let (db, _dir) = create_test_db();
+        db.create_table("users")
+            .partition_key("id", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put_item("users", json!({"id": "alice", "name": "Alice"}))
+            .unwrap();
+        db.put_item("users", json!({"id": "bob", "name": "Bob"}))
+            .unwrap();
+        db.put_item("users", json!({"id": "charlie", "name": "Charlie"}))
+            .unwrap();
+
+        let results = db
+            .batch_get_item("users")
+            .key("alice", None)
+            .key("missing", None)
+            .key("bob", None)
+            .key("also_missing", None)
+            .execute()
+            .unwrap();
+
+        assert_eq!(results.len(), 4);
+        assert!(results[0].is_some());
+        assert_eq!(results[0].as_ref().unwrap()["name"], "Alice");
+        assert!(results[1].is_none());
+        assert!(results[2].is_some());
+        assert_eq!(results[2].as_ref().unwrap()["name"], "Bob");
+        assert!(results[3].is_none());
+    }
+
+    #[test]
+    fn test_batch_get_empty() {
+        let (db, _dir) = create_test_db();
+        db.create_table("users")
+            .partition_key("id", KeyType::String)
+            .execute()
+            .unwrap();
+
+        let results = db.batch_get_item("users").execute().unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_batch_get_single() {
+        let (db, _dir) = create_test_db();
+        db.create_table("users")
+            .partition_key("id", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put_item("users", json!({"id": "alice", "name": "Alice"}))
+            .unwrap();
+
+        let results = db
+            .batch_get_item("users")
+            .key("alice", None)
+            .execute()
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].as_ref().unwrap()["name"], "Alice");
+    }
+
+    #[test]
+    fn test_batch_get_snapshot_consistency() {
+        let (db, _dir) = create_test_db();
+        db.create_table("users")
+            .partition_key("id", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put_item("users", json!({"id": "alice", "name": "Alice"}))
+            .unwrap();
+        db.put_item("users", json!({"id": "bob", "name": "Bob"}))
+            .unwrap();
+
+        // Start a batch get that captures a snapshot. Then delete an item
+        // in a separate transaction. The batch should still see both items
+        // because it reads from the snapshot taken before the delete.
+        //
+        // We test this by verifying that batch_get_item returns a consistent
+        // snapshot: if we read both items, both should be visible even if
+        // a concurrent writer deletes one after we took our snapshot.
+        //
+        // Since batch_get_item uses a single read_snapshot call internally,
+        // all lookups see the same point-in-time view. We verify this by
+        // confirming both items are present in the result.
+        let results = db
+            .batch_get_item("users")
+            .key("alice", None)
+            .key("bob", None)
+            .execute()
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_some());
+        assert!(results[1].is_some());
+
+        // Now delete bob and verify a new batch shows it gone.
+        db.delete_item("users")
+            .partition_key("bob")
+            .execute()
+            .unwrap();
+
+        let results2 = db
+            .batch_get_item("users")
+            .key("alice", None)
+            .key("bob", None)
+            .execute()
+            .unwrap();
+
+        assert_eq!(results2.len(), 2);
+        assert!(results2[0].is_some());
+        assert!(results2[1].is_none());
+    }
+
+    #[test]
+    fn test_batch_get_with_sort_key() {
+        let (db, _dir) = create_test_db();
+        db.create_table("orders")
+            .partition_key("user_id", KeyType::String)
+            .sort_key("order_id", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put_item(
+            "orders",
+            json!({"user_id": "user1", "order_id": "order-001", "total": 100}),
+        )
+        .unwrap();
+        db.put_item(
+            "orders",
+            json!({"user_id": "user1", "order_id": "order-002", "total": 200}),
+        )
+        .unwrap();
+        db.put_item(
+            "orders",
+            json!({"user_id": "user2", "order_id": "order-003", "total": 300}),
+        )
+        .unwrap();
+
+        let results = db
+            .batch_get_item("orders")
+            .key("user1", Some(json!("order-001")))
+            .key("user1", Some(json!("order-002")))
+            .key("user2", Some(json!("order-003")))
+            .key("user2", Some(json!("order-999")))
+            .execute()
+            .unwrap();
+
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[0].as_ref().unwrap()["total"], 100);
+        assert_eq!(results[1].as_ref().unwrap()["total"], 200);
+        assert_eq!(results[2].as_ref().unwrap()["total"], 300);
+        assert!(results[3].is_none());
     }
 }

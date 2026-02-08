@@ -254,6 +254,94 @@ impl<'a> GetItemVersionedBuilder<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// BatchGetItemBuilder
+// ---------------------------------------------------------------------------
+
+/// Builder for retrieving multiple items by key in a single call.
+///
+/// All items are read from a single MVCC snapshot, providing a consistent
+/// point-in-time view. Results are positional: `results[i]` corresponds to
+/// `keys[i]`. Missing items return `None`.
+pub struct BatchGetItemBuilder<'a> {
+    db: &'a FerridynDB,
+    table: String,
+    keys: Vec<(Value, Option<Value>)>,
+}
+
+impl<'a> BatchGetItemBuilder<'a> {
+    pub(crate) fn new(db: &'a FerridynDB, table: String) -> Self {
+        Self {
+            db,
+            table,
+            keys: Vec::new(),
+        }
+    }
+
+    /// Add a key to retrieve. `partition_key` is the partition key value,
+    /// `sort_key` is the optional sort key value (for composite key tables).
+    pub fn key(mut self, partition_key: impl Into<Value>, sort_key: Option<Value>) -> Self {
+        self.keys.push((partition_key.into(), sort_key));
+        self
+    }
+
+    /// Execute the batch get operation.
+    pub fn execute(self) -> Result<Vec<Option<Value>>, Error> {
+        if self.keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        self.db.read_snapshot(|store, catalog_root, snapshot_txn| {
+            let entry = self.db.cached_get_table(store, catalog_root, &self.table)?;
+            let schema = &entry.schema;
+
+            let mut results = Vec::with_capacity(self.keys.len());
+
+            for (pk_val, sk_val) in &self.keys {
+                let pk = key_utils::json_to_key_value(
+                    pk_val,
+                    schema.partition_key.key_type,
+                    &schema.partition_key.name,
+                )?;
+                key_utils::validate_partition_key_size(&pk)?;
+
+                let sk = match (&schema.sort_key, sk_val) {
+                    (Some(sk_def), Some(sk_v)) => {
+                        let sk = key_utils::json_to_key_value(sk_v, sk_def.key_type, &sk_def.name)?;
+                        key_utils::validate_sort_key_size(&sk)?;
+                        Some(sk)
+                    }
+                    (Some(_), None) => None,
+                    (None, Some(_)) => return Err(QueryError::SortKeyNotSupported.into()),
+                    (None, None) => None,
+                };
+
+                let composite_key = composite::encode_composite(&pk, sk.as_ref())?;
+                let data =
+                    mvcc_ops::mvcc_get(store, entry.data_root_page, &composite_key, snapshot_txn)?;
+
+                match data {
+                    Some(bytes) => {
+                        let val: Value = rmp_serde::from_slice(&bytes).map_err(|e| {
+                            StorageError::CorruptedPage(format!(
+                                "failed to deserialize document: {e}"
+                            ))
+                        })?;
+                        if is_ttl_expired(&val, schema) {
+                            results.push(None);
+                        } else {
+                            results.push(Some(val));
+                        }
+                    }
+                    None => results.push(None),
+                }
+            }
+
+            Ok(results)
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DeleteItemBuilder
 // ---------------------------------------------------------------------------
 

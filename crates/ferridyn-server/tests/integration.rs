@@ -1265,3 +1265,85 @@ async fn test_index_pagination_over_wire() {
     all_pks.dedup();
     assert_eq!(all_pks.len(), 10);
 }
+
+#[tokio::test]
+async fn test_batch_get_over_wire() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    // Create table.
+    client
+        .create_table(
+            "users",
+            KeyDef {
+                name: "id".to_string(),
+                key_type: "String".to_string(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Insert 3 items.
+    client
+        .put_item("users", json!({"id": "alice", "name": "Alice"}))
+        .await
+        .unwrap();
+    client
+        .put_item("users", json!({"id": "bob", "name": "Bob"}))
+        .await
+        .unwrap();
+    client
+        .put_item("users", json!({"id": "charlie", "name": "Charlie"}))
+        .await
+        .unwrap();
+
+    // Batch get 4 keys (1 missing).
+    let keys = vec![
+        (json!("alice"), None),
+        (json!("bob"), None),
+        (json!("missing"), None),
+        (json!("charlie"), None),
+    ];
+    let results = client.batch_get_item("users", &keys).await.unwrap();
+
+    assert_eq!(results.len(), 4);
+    assert_eq!(results[0].as_ref().unwrap()["name"], "Alice");
+    assert_eq!(results[1].as_ref().unwrap()["name"], "Bob");
+    assert!(results[2].is_none());
+    assert_eq!(results[3].as_ref().unwrap()["name"], "Charlie");
+}
+
+#[tokio::test]
+async fn test_batch_get_exceeds_limit() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    // Create table.
+    client
+        .create_table(
+            "users",
+            KeyDef {
+                name: "id".to_string(),
+                key_type: "String".to_string(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Build 1001 keys (exceeds 1000 limit).
+    let keys: Vec<(serde_json::Value, Option<serde_json::Value>)> = (0..1001)
+        .map(|i| (json!(format!("key-{i}")), None))
+        .collect();
+
+    let result = client.batch_get_item("users", &keys).await;
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("BatchSizeLimitExceeded"),
+        "expected BatchSizeLimitExceeded error, got: {err}"
+    );
+}

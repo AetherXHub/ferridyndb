@@ -583,6 +583,36 @@ impl FerridynClient {
         index_from_response(&resp)
     }
 
+    /// Retrieve multiple items by key in a single call.
+    ///
+    /// Results are positional: `results[i]` corresponds to `keys[i]`.
+    /// Missing items return `None`.
+    pub async fn batch_get_item(
+        &mut self,
+        table: &str,
+        keys: &[(Value, Option<Value>)],
+    ) -> Result<Vec<Option<Value>>> {
+        let keys_json: Vec<Value> = keys
+            .iter()
+            .map(|(pk, sk)| {
+                let mut obj = serde_json::json!({"partition_key": pk});
+                if let Some(sk) = sk {
+                    obj.as_object_mut()
+                        .unwrap()
+                        .insert("sort_key".to_string(), sk.clone());
+                }
+                obj
+            })
+            .collect();
+        let req = serde_json::json!({
+            "op": "batch_get_item",
+            "table": table,
+            "keys": keys_json,
+        });
+        let resp = self.send_request(&req).await?;
+        batch_items_from_response(&resp)
+    }
+
     /// Query a secondary index.
     #[allow(clippy::too_many_arguments)]
     pub async fn query_index(
@@ -708,6 +738,20 @@ fn items_from_response(resp: &Value) -> Result<QueryResult> {
         items,
         last_evaluated_key,
     })
+}
+
+fn batch_items_from_response(resp: &Value) -> Result<Vec<Option<Value>>> {
+    check_error(resp)?;
+    let items = resp
+        .get("items")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            ClientError::Protocol("missing 'items' array in batch_get_item response".to_string())
+        })?;
+    Ok(items
+        .iter()
+        .map(|v| if v.is_null() { None } else { Some(v.clone()) })
+        .collect())
 }
 
 fn keys_from_response(resp: &Value) -> Result<Vec<Value>> {

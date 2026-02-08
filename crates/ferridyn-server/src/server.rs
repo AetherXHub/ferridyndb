@@ -15,8 +15,8 @@ use ferridyn_core::error::{Error as DynError, SchemaError, TxnError};
 use ferridyn_core::types::{AttrType, IndexDefinition, KeyType, PartitionSchema, TableSchema};
 
 use crate::protocol::{
-    AttributeDefWire, IndexDefWire, KeyDef, KeyDefWire, PartitionSchemaWire, Request, Response,
-    SortKeyCondition, TableSchemaWire, UpdateActionWire,
+    AttributeDefWire, BatchGetItemKey, IndexDefWire, KeyDef, KeyDefWire, PartitionSchemaWire,
+    Request, Response, SortKeyCondition, TableSchemaWire, UpdateActionWire,
 };
 
 /// A FerridynDB server listening on a Unix socket.
@@ -248,6 +248,8 @@ fn dispatch(db: &FerridynDB, req: Request) -> Response {
             filter,
             exclusive_start_key,
         ),
+
+        Request::BatchGetItem { table, keys } => handle_batch_get_item(db, &table, keys),
     }
 }
 
@@ -687,6 +689,27 @@ fn handle_query_index(
     }
     match builder.execute() {
         Ok(result) => Response::ok_items(result.items, result.last_evaluated_key),
+        Err(e) => dyn_error_to_response(e),
+    }
+}
+
+fn handle_batch_get_item(db: &FerridynDB, table: &str, keys: Vec<BatchGetItemKey>) -> Response {
+    const MAX_BATCH_SIZE: usize = 1000;
+    if keys.len() > MAX_BATCH_SIZE {
+        return Response::error(
+            "BatchSizeLimitExceeded",
+            format!(
+                "batch size {} exceeds limit of {MAX_BATCH_SIZE}",
+                keys.len()
+            ),
+        );
+    }
+    let mut builder = db.batch_get_item(table);
+    for k in keys {
+        builder = builder.key(k.partition_key, k.sort_key);
+    }
+    match builder.execute() {
+        Ok(items) => Response::ok_batch_items(items),
         Err(e) => dyn_error_to_response(e),
     }
 }

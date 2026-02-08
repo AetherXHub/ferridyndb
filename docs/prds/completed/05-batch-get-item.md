@@ -1,7 +1,7 @@
 # PRD: BatchGetItem
 
 **Priority:** 5
-**Status:** Approved
+**Status:** Complete
 **Proposal:** [docs/proposals/accepted/batch-get-item.md](../proposals/accepted/batch-get-item.md)
 
 ## Summary

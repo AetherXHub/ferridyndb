@@ -149,6 +149,11 @@ pub enum Request {
         #[serde(default)]
         exclusive_start_key: Option<Value>,
     },
+    // -- Batch operations --
+    BatchGetItem {
+        table: String,
+        keys: Vec<BatchGetItemKey>,
+    },
 }
 
 /// Sort key condition for query requests.
@@ -170,6 +175,14 @@ pub struct KeyDef {
     pub name: String,
     #[serde(rename = "type")]
     pub key_type: String,
+}
+
+/// Key for a batch get item request.
+#[derive(Debug, Deserialize)]
+pub struct BatchGetItemKey {
+    pub partition_key: Value,
+    #[serde(default)]
+    pub sort_key: Option<Value>,
 }
 
 /// Update action in wire format.
@@ -268,6 +281,10 @@ pub enum OkResponse {
     IndexDetail {
         ok: bool,
         index: IndexDefWire,
+    },
+    BatchItems {
+        ok: bool,
+        items: Vec<Option<Value>>,
     },
 }
 
@@ -370,5 +387,9 @@ impl Response {
 
     pub fn ok_index(index: IndexDefWire) -> Self {
         Response::Ok(OkResponse::IndexDetail { ok: true, index })
+    }
+
+    pub fn ok_batch_items(items: Vec<Option<Value>>) -> Self {
+        Response::Ok(OkResponse::BatchItems { ok: true, items })
     }
 }
