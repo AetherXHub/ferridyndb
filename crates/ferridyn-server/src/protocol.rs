@@ -15,6 +15,8 @@ pub enum Request {
         partition_key: Value,
         #[serde(default)]
         sort_key: Option<Value>,
+        #[serde(default)]
+        projection: Option<Vec<String>>,
     },
     GetItemVersioned {
         table: String,
@@ -66,6 +68,8 @@ pub enum Request {
         exclusive_start_key: Option<Value>,
         #[serde(default)]
         filter: Option<FilterExpr>,
+        #[serde(default)]
+        projection: Option<Vec<String>>,
     },
     Scan {
         table: String,
@@ -75,6 +79,8 @@ pub enum Request {
         exclusive_start_key: Option<Value>,
         #[serde(default)]
         filter: Option<FilterExpr>,
+        #[serde(default)]
+        projection: Option<Vec<String>>,
     },
     CreateTable {
         table: String,
@@ -154,11 +160,15 @@ pub enum Request {
         filter: Option<FilterExpr>,
         #[serde(default)]
         exclusive_start_key: Option<Value>,
+        #[serde(default)]
+        projection: Option<Vec<String>>,
     },
     // -- Batch operations --
     BatchGetItem {
         table: String,
         keys: Vec<BatchGetItemKey>,
+        #[serde(default)]
+        projection: Option<Vec<String>>,
     },
 }
 

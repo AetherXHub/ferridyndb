@@ -5736,3 +5736,312 @@ mod return_values_tests {
         assert!(result.is_ok());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Projection expression tests (PRD-07)
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+    use crate::types::{AttrType, KeyType};
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    fn create_test_db() -> (FerridynDB, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = FerridynDB::create(&db_path).unwrap();
+        (db, dir)
+    }
+
+    #[test]
+    fn test_projection_get_item() {
+        let (db, _dir) = create_test_db();
+        db.create_table("users")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put(
+            "users",
+            json!({"pk": "alice", "name": "Alice", "age": 30, "email": "a@b.com"}),
+        )
+        .execute()
+        .unwrap();
+
+        let item = db
+            .get_item("users")
+            .partition_key("alice")
+            .projection(&["name", "age"])
+            .execute()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(item["pk"], "alice"); // key always included
+        assert_eq!(item["name"], "Alice");
+        assert_eq!(item["age"], 30);
+        assert!(item.get("email").is_none()); // not projected
+    }
+
+    #[test]
+    fn test_projection_top_level() {
+        let (db, _dir) = create_test_db();
+        db.create_table("users")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put(
+            "users",
+            json!({"pk": "a", "name": "Alice", "age": 30, "email": "a@b.com",
+                    "phone": "555-1234", "city": "NYC", "state": "NY",
+                    "zip": "10001", "country": "US", "active": true}),
+        )
+        .execute()
+        .unwrap();
+
+        let item = db
+            .get_item("users")
+            .partition_key("a")
+            .projection(&["name", "age"])
+            .execute()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(item["pk"], "a");
+        assert_eq!(item["name"], "Alice");
+        assert_eq!(item["age"], 30);
+        // All other attributes should be absent.
+        assert!(item.get("email").is_none());
+        assert!(item.get("phone").is_none());
+        assert!(item.get("city").is_none());
+    }
+
+    #[test]
+    fn test_projection_nested() {
+        let (db, _dir) = create_test_db();
+        db.create_table("users")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put(
+            "users",
+            json!({"pk": "a", "address": {"city": "NYC", "zip": "10001", "state": "NY"},
+                    "name": "Alice"}),
+        )
+        .execute()
+        .unwrap();
+
+        let item = db
+            .get_item("users")
+            .partition_key("a")
+            .projection(&["address.city"])
+            .execute()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(item["pk"], "a");
+        assert_eq!(item["address"]["city"], "NYC");
+        assert!(item["address"].get("zip").is_none());
+        assert!(item.get("name").is_none());
+    }
+
+    #[test]
+    fn test_projection_keys_always_included() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .sort_key("sk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put(
+            "data",
+            json!({"pk": "a", "sk": "b", "name": "Alice", "age": 30}),
+        )
+        .execute()
+        .unwrap();
+
+        let item = db
+            .get_item("data")
+            .partition_key("a")
+            .sort_key("b")
+            .projection(&["name"])
+            .execute()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(item["pk"], "a");
+        assert_eq!(item["sk"], "b"); // sort key always included
+        assert_eq!(item["name"], "Alice");
+        assert!(item.get("age").is_none());
+    }
+
+    #[test]
+    fn test_projection_missing_attr() {
+        let (db, _dir) = create_test_db();
+        db.create_table("users")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put("users", json!({"pk": "a", "name": "Alice"}))
+            .execute()
+            .unwrap();
+
+        let item = db
+            .get_item("users")
+            .partition_key("a")
+            .projection(&["nonexistent"])
+            .execute()
+            .unwrap()
+            .unwrap();
+
+        // Only pk should be present, nonexistent attr silently omitted.
+        assert_eq!(item["pk"], "a");
+        assert!(item.get("name").is_none());
+        assert!(item.get("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_projection_empty() {
+        let (db, _dir) = create_test_db();
+        db.create_table("users")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put("users", json!({"pk": "a", "name": "Alice", "age": 30}))
+            .execute()
+            .unwrap();
+
+        // Empty projection returns full document.
+        let item = db
+            .get_item("users")
+            .partition_key("a")
+            .projection(&[])
+            .execute()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(item["pk"], "a");
+        assert_eq!(item["name"], "Alice");
+        assert_eq!(item["age"], 30);
+    }
+
+    #[test]
+    fn test_projection_query() {
+        let (db, _dir) = create_test_db();
+        db.create_table("events")
+            .partition_key("pk", KeyType::String)
+            .sort_key("sk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        for i in 0..5 {
+            db.put(
+                "events",
+                json!({"pk": "user1", "sk": format!("ev#{i}"),
+                        "type": "click", "data": {"x": i, "y": i * 2}}),
+            )
+            .execute()
+            .unwrap();
+        }
+
+        let result = db
+            .query("events")
+            .partition_key("user1")
+            .projection(&["type"])
+            .execute()
+            .unwrap();
+
+        assert_eq!(result.items.len(), 5);
+        for item in &result.items {
+            assert!(item.get("pk").is_some()); // key included
+            assert!(item.get("sk").is_some()); // sort key included
+            assert_eq!(item["type"], "click");
+            assert!(item.get("data").is_none()); // not projected
+        }
+    }
+
+    #[test]
+    fn test_projection_scan() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        for i in 0..3 {
+            db.put(
+                "items",
+                json!({"pk": format!("item{i}"), "name": format!("Item {i}"),
+                        "price": i * 10, "category": "A"}),
+            )
+            .execute()
+            .unwrap();
+        }
+
+        let result = db.scan("items").projection(&["name"]).execute().unwrap();
+
+        assert_eq!(result.items.len(), 3);
+        for item in &result.items {
+            assert!(item.get("pk").is_some());
+            assert!(item.get("name").is_some());
+            assert!(item.get("price").is_none());
+            assert!(item.get("category").is_none());
+        }
+    }
+
+    #[test]
+    fn test_projection_index_query() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_partition_schema("data")
+            .prefix("CONTACT")
+            .attribute("email", AttrType::String, true)
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("email-idx")
+            .partition_schema("CONTACT")
+            .index_key("email", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put(
+            "data",
+            json!({"pk": "CONTACT#1", "email": "alice@test.com", "name": "Alice", "age": 30}),
+        )
+        .execute()
+        .unwrap();
+
+        db.put(
+            "data",
+            json!({"pk": "CONTACT#2", "email": "alice@test.com", "name": "Alice2", "age": 25}),
+        )
+        .execute()
+        .unwrap();
+
+        let result = db
+            .query_index("data", "email-idx")
+            .key_value("alice@test.com")
+            .projection(&["name"])
+            .execute()
+            .unwrap();
+
+        assert_eq!(result.items.len(), 2);
+        for item in &result.items {
+            assert!(item.get("pk").is_some());
+            assert!(item.get("name").is_some());
+            assert!(item.get("age").is_none()); // not projected
+            assert!(item.get("email").is_none()); // not projected (not a key attr)
+        }
+    }
+}

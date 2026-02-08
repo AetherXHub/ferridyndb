@@ -60,7 +60,7 @@ async fn test_create_table_and_crud() {
 
     // Get item.
     let item = client
-        .get_item("users", json!("alice"), None)
+        .get_item("users", json!("alice"), None, None)
         .await
         .unwrap();
     assert!(item.is_some());
@@ -69,7 +69,10 @@ async fn test_create_table_and_crud() {
     assert_eq!(item["age"], 30);
 
     // Get nonexistent item.
-    let missing = client.get_item("users", json!("bob"), None).await.unwrap();
+    let missing = client
+        .get_item("users", json!("bob"), None, None)
+        .await
+        .unwrap();
     assert!(missing.is_none());
 
     // Delete item.
@@ -78,7 +81,7 @@ async fn test_create_table_and_crud() {
         .await
         .unwrap();
     let deleted = client
-        .get_item("users", json!("alice"), None)
+        .get_item("users", json!("alice"), None, None)
         .await
         .unwrap();
     assert!(deleted.is_none());
@@ -138,7 +141,7 @@ async fn test_versioned_get_and_conditional_put() {
 
     // Verify the value is v2, not v3.
     let item = client
-        .get_item("items", json!("key1"), None)
+        .get_item("items", json!("key1"), None, None)
         .await
         .unwrap()
         .unwrap();
@@ -206,7 +209,7 @@ async fn test_concurrent_version_conflict() {
 
     // Verify A's write won.
     let item = client_a
-        .get_item("items", json!("shared"), None)
+        .get_item("items", json!("shared"), None, None)
         .await
         .unwrap()
         .unwrap();
@@ -246,25 +249,37 @@ async fn test_query_and_scan() {
 
     // Query all for user1.
     let result = client
-        .query("events", json!("user1"), None, None, None, None, None)
+        .query("events", json!("user1"), None, None, None, None, None, None)
         .await
         .unwrap();
     assert_eq!(result.items.len(), 10);
 
     // Query with limit.
     let result = client
-        .query("events", json!("user1"), None, Some(3), None, None, None)
+        .query(
+            "events",
+            json!("user1"),
+            None,
+            Some(3),
+            None,
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(result.items.len(), 3);
     assert!(result.last_evaluated_key.is_some());
 
     // Scan all.
-    let result = client.scan("events", None, None, None).await.unwrap();
+    let result = client.scan("events", None, None, None, None).await.unwrap();
     assert_eq!(result.items.len(), 10);
 
     // Scan with limit.
-    let result = client.scan("events", Some(5), None, None).await.unwrap();
+    let result = client
+        .scan("events", Some(5), None, None, None)
+        .await
+        .unwrap();
     assert_eq!(result.items.len(), 5);
 }
 
@@ -366,7 +381,9 @@ async fn test_error_table_not_found() {
     let (_dir, sock) = start_test_server().await;
     let mut client = FerridynClient::connect(&sock).await.unwrap();
 
-    let result = client.get_item("nonexistent", json!("key"), None).await;
+    let result = client
+        .get_item("nonexistent", json!("key"), None, None)
+        .await;
     assert!(result.is_err());
 }
 
@@ -454,7 +471,7 @@ async fn test_update_item_server_round_trip() {
 
     // Verify the update.
     let item = client
-        .get_item("users", json!("alice"), None)
+        .get_item("users", json!("alice"), None, None)
         .await
         .unwrap()
         .unwrap();
@@ -497,7 +514,7 @@ async fn test_update_item_upsert_via_server() {
         .unwrap();
 
     let item = client
-        .get_item("users", json!("bob"), None)
+        .get_item("users", json!("bob"), None, None)
         .await
         .unwrap()
         .unwrap();
@@ -555,7 +572,7 @@ async fn test_update_item_add_and_delete_via_server() {
         .unwrap();
 
     let item = client
-        .get_item("counters", json!("item1"), None)
+        .get_item("counters", json!("item1"), None, None)
         .await
         .unwrap()
         .unwrap();
@@ -780,6 +797,7 @@ async fn test_query_index() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -791,6 +809,7 @@ async fn test_query_index() {
             "data",
             "email-idx",
             json!("bob@example.com"),
+            None,
             None,
             None,
             None,
@@ -807,6 +826,7 @@ async fn test_query_index() {
             "data",
             "email-idx",
             json!("nobody@example.com"),
+            None,
             None,
             None,
             None,
@@ -889,6 +909,7 @@ async fn test_query_index_with_limit() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -938,7 +959,16 @@ async fn test_query_with_filter_over_wire() {
     // Query with filter: only active items.
     let filter = FilterExpr::eq(FilterExpr::attr("status"), FilterExpr::literal("active"));
     let result = client
-        .query("items", json!("org1"), None, None, None, None, Some(filter))
+        .query(
+            "items",
+            json!("org1"),
+            None,
+            None,
+            None,
+            None,
+            Some(filter),
+            None,
+        )
         .await
         .unwrap();
 
@@ -958,6 +988,7 @@ async fn test_query_with_filter_over_wire() {
             None,
             None,
             Some(filter),
+            None,
         )
         .await
         .unwrap();
@@ -1002,7 +1033,10 @@ async fn test_scan_with_filter_over_wire() {
 
     // Scan with filter: priority > 3.
     let filter = FilterExpr::gt(FilterExpr::attr("priority"), FilterExpr::literal(3));
-    let result = client.scan("docs", None, None, Some(filter)).await.unwrap();
+    let result = client
+        .scan("docs", None, None, Some(filter), None)
+        .await
+        .unwrap();
 
     // priority 4 and 5.
     assert_eq!(result.items.len(), 2);
@@ -1044,7 +1078,7 @@ async fn test_server_put_with_condition() {
         .unwrap();
 
     let item = client
-        .get_item("items", json!("a"), None)
+        .get_item("items", json!("a"), None, None)
         .await
         .unwrap()
         .unwrap();
@@ -1062,7 +1096,7 @@ async fn test_server_put_with_condition() {
 
     // Original value should remain.
     let item = client
-        .get_item("items", json!("a"), None)
+        .get_item("items", json!("a"), None, None)
         .await
         .unwrap()
         .unwrap();
@@ -1106,7 +1140,10 @@ async fn test_server_delete_with_condition() {
         .await
         .unwrap();
 
-    let item = client.get_item("items", json!("a"), None).await.unwrap();
+    let item = client
+        .get_item("items", json!("a"), None, None)
+        .await
+        .unwrap();
     assert!(item.is_none());
 }
 
@@ -1216,6 +1253,7 @@ async fn test_index_pagination_over_wire() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1232,6 +1270,7 @@ async fn test_index_pagination_over_wire() {
             None,
             None,
             page1.last_evaluated_key,
+            None,
         )
         .await
         .unwrap();
@@ -1248,6 +1287,7 @@ async fn test_index_pagination_over_wire() {
             None,
             None,
             page2.last_evaluated_key,
+            None,
         )
         .await
         .unwrap();
@@ -1306,7 +1346,7 @@ async fn test_batch_get_over_wire() {
         (json!("missing"), None),
         (json!("charlie"), None),
     ];
-    let results = client.batch_get_item("users", &keys).await.unwrap();
+    let results = client.batch_get_item("users", &keys, None).await.unwrap();
 
     assert_eq!(results.len(), 4);
     assert_eq!(results[0].as_ref().unwrap()["name"], "Alice");
@@ -1339,7 +1379,7 @@ async fn test_batch_get_exceeds_limit() {
         .map(|i| (json!(format!("key-{i}")), None))
         .collect();
 
-    let result = client.batch_get_item("users", &keys).await;
+    let result = client.batch_get_item("users", &keys, None).await;
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
@@ -1429,7 +1469,7 @@ async fn test_server_delete_return_old() {
 
     // Verify deleted.
     let item = client
-        .get_item("users", json!("alice"), None)
+        .get_item("users", json!("alice"), None, None)
         .await
         .unwrap();
     assert!(item.is_none());
@@ -1503,4 +1543,114 @@ async fn test_server_update_return_new() {
     assert!(old.is_some());
     let old = old.unwrap();
     assert_eq!(old["name"], "Alice2"); // was Alice2 before this update
+}
+
+#[tokio::test]
+async fn test_projection_over_wire() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    // Create table with pk + sk.
+    client
+        .create_table(
+            "users",
+            KeyDef {
+                name: "pk".to_string(),
+                key_type: "String".to_string(),
+            },
+            Some(KeyDef {
+                name: "sk".to_string(),
+                key_type: "String".to_string(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Put multi-attribute documents.
+    for i in 0..3 {
+        client
+            .put_item(
+                "users",
+                json!({
+                    "pk": "org1",
+                    "sk": format!("user#{i}"),
+                    "name": format!("User {i}"),
+                    "age": 20 + i,
+                    "email": format!("user{i}@test.com"),
+                    "address": {"city": "NYC", "zip": "10001"}
+                }),
+            )
+            .await
+            .unwrap();
+    }
+
+    let proj = vec!["name".to_string(), "address.city".to_string()];
+
+    // get_item with projection.
+    let item = client
+        .get_item("users", json!("org1"), Some(json!("user#0")), Some(&proj))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(item["pk"], "org1");
+    assert_eq!(item["sk"], "user#0");
+    assert_eq!(item["name"], "User 0");
+    assert_eq!(item["address"]["city"], "NYC");
+    assert!(item.get("age").is_none());
+    assert!(item.get("email").is_none());
+    assert!(item["address"].get("zip").is_none());
+
+    // query with projection.
+    let result = client
+        .query(
+            "users",
+            json!("org1"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&proj),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.items.len(), 3);
+    for item in &result.items {
+        assert!(item.get("pk").is_some());
+        assert!(item.get("sk").is_some());
+        assert!(item.get("name").is_some());
+        assert!(item.get("age").is_none());
+        assert!(item.get("email").is_none());
+    }
+
+    // scan with projection.
+    let name_only = vec!["name".to_string()];
+    let result = client
+        .scan("users", None, None, None, Some(&name_only))
+        .await
+        .unwrap();
+    assert_eq!(result.items.len(), 3);
+    for item in &result.items {
+        assert!(item.get("pk").is_some());
+        assert!(item.get("sk").is_some());
+        assert!(item.get("name").is_some());
+        assert!(item.get("age").is_none());
+    }
+
+    // batch_get_item with projection.
+    let keys = vec![
+        (json!("org1"), Some(json!("user#0"))),
+        (json!("org1"), Some(json!("user#2"))),
+    ];
+    let results = client
+        .batch_get_item("users", &keys, Some(&name_only))
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2);
+    for item in results.iter().flatten() {
+        assert!(item.get("pk").is_some());
+        assert!(item.get("name").is_some());
+        assert!(item.get("age").is_none());
+    }
 }

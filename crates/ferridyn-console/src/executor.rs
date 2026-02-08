@@ -231,7 +231,7 @@ fn exec_get(
     pk: Value,
     sk: Option<Value>,
 ) -> Result<CommandResult, ClientError> {
-    let item = rt.block_on(client.get_item(table, pk, sk))?;
+    let item = rt.block_on(client.get_item(table, pk, sk, None))?;
     Ok(CommandResult::Item(item))
 }
 
@@ -294,7 +294,7 @@ fn exec_query(
 ) -> Result<CommandResult, ClientError> {
     let cond = sort_condition.map(sort_clause_to_condition);
     let fwd = if desc { Some(false) } else { None };
-    let result = rt.block_on(client.query(table, pk, cond, limit, fwd, None, None))?;
+    let result = rt.block_on(client.query(table, pk, cond, limit, fwd, None, None, None))?;
     Ok(CommandResult::QueryResult(result))
 }
 
@@ -304,7 +304,7 @@ fn exec_scan(
     table: &str,
     limit: Option<usize>,
 ) -> Result<CommandResult, ClientError> {
-    let result = rt.block_on(client.scan(table, limit, None, None))?;
+    let result = rt.block_on(client.scan(table, limit, None, None, None))?;
     Ok(CommandResult::QueryResult(result))
 }
 
@@ -443,7 +443,7 @@ fn exec_query_index(
     desc: bool,
 ) -> Result<CommandResult, ClientError> {
     let fwd = if desc { Some(false) } else { None };
-    let result =
-        rt.block_on(client.query_index(table, index_name, key_value, limit, fwd, None, None))?;
+    let result = rt
+        .block_on(client.query_index(table, index_name, key_value, limit, fwd, None, None, None))?;
     Ok(CommandResult::QueryResult(result))
 }

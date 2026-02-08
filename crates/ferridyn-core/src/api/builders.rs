@@ -15,6 +15,7 @@ use crate::types::{
 use super::database::FerridynDB;
 use super::filter::FilterExpr;
 use super::key_utils;
+use super::projection;
 use super::query::{QueryResult, SortCondition, compute_scan_bounds};
 use super::update::UpdateAction;
 
@@ -103,6 +104,7 @@ pub struct GetItemBuilder<'a> {
     table: String,
     partition_key: Option<Value>,
     sort_key: Option<Value>,
+    projection: Vec<String>,
 }
 
 impl<'a> GetItemBuilder<'a> {
@@ -112,6 +114,7 @@ impl<'a> GetItemBuilder<'a> {
             table,
             partition_key: None,
             sort_key: None,
+            projection: Vec::new(),
         }
     }
 
@@ -124,6 +127,13 @@ impl<'a> GetItemBuilder<'a> {
     /// Set the sort key value (for tables with a sort key).
     pub fn sort_key(mut self, value: impl Into<Value>) -> Self {
         self.sort_key = Some(value.into());
+        self
+    }
+
+    /// Set attribute paths to project. Only these attributes (plus key
+    /// attributes) will be returned. An empty list returns the full document.
+    pub fn projection(mut self, paths: &[&str]) -> Self {
+        self.projection = paths.iter().map(|s| s.to_string()).collect();
         self
     }
 
@@ -164,8 +174,15 @@ impl<'a> GetItemBuilder<'a> {
                     })?;
                     if is_ttl_expired(&val, schema) {
                         Ok(None)
-                    } else {
+                    } else if self.projection.is_empty() {
                         Ok(Some(val))
+                    } else {
+                        let key_attrs = collect_key_attrs(schema);
+                        Ok(Some(projection::apply_projection(
+                            &val,
+                            &self.projection,
+                            &key_attrs,
+                        )))
                     }
                 }
                 None => Ok(None),
@@ -276,6 +293,7 @@ pub struct BatchGetItemBuilder<'a> {
     db: &'a FerridynDB,
     table: String,
     keys: Vec<(Value, Option<Value>)>,
+    projection: Vec<String>,
 }
 
 impl<'a> BatchGetItemBuilder<'a> {
@@ -284,6 +302,7 @@ impl<'a> BatchGetItemBuilder<'a> {
             db,
             table,
             keys: Vec::new(),
+            projection: Vec::new(),
         }
     }
 
@@ -291,6 +310,13 @@ impl<'a> BatchGetItemBuilder<'a> {
     /// `sort_key` is the optional sort key value (for composite key tables).
     pub fn key(mut self, partition_key: impl Into<Value>, sort_key: Option<Value>) -> Self {
         self.keys.push((partition_key.into(), sort_key));
+        self
+    }
+
+    /// Set attribute paths to project. Only these attributes (plus key
+    /// attributes) will be returned. An empty list returns the full document.
+    pub fn projection(mut self, paths: &[&str]) -> Self {
+        self.projection = paths.iter().map(|s| s.to_string()).collect();
         self
     }
 
@@ -303,6 +329,7 @@ impl<'a> BatchGetItemBuilder<'a> {
         self.db.read_snapshot(|store, catalog_root, snapshot_txn| {
             let entry = self.db.cached_get_table(store, catalog_root, &self.table)?;
             let schema = &entry.schema;
+            let key_attrs = collect_key_attrs(schema);
 
             let mut results = Vec::with_capacity(self.keys.len());
 
@@ -338,8 +365,14 @@ impl<'a> BatchGetItemBuilder<'a> {
                         })?;
                         if is_ttl_expired(&val, schema) {
                             results.push(None);
-                        } else {
+                        } else if self.projection.is_empty() {
                             results.push(Some(val));
+                        } else {
+                            results.push(Some(projection::apply_projection(
+                                &val,
+                                &self.projection,
+                                &key_attrs,
+                            )));
                         }
                     }
                     None => results.push(None),
@@ -718,6 +751,7 @@ pub struct QueryBuilder<'a> {
     scan_forward: bool,
     exclusive_start_key: Option<Value>,
     filter: Option<FilterExpr>,
+    projection: Vec<String>,
 }
 
 impl<'a> QueryBuilder<'a> {
@@ -731,6 +765,7 @@ impl<'a> QueryBuilder<'a> {
             scan_forward: true,
             exclusive_start_key: None,
             filter: None,
+            projection: Vec::new(),
         }
     }
 
@@ -741,6 +776,13 @@ impl<'a> QueryBuilder<'a> {
 
     pub fn filter(mut self, expr: FilterExpr) -> Self {
         self.filter = Some(expr);
+        self
+    }
+
+    /// Set attribute paths to project. Only these attributes (plus key
+    /// attributes) will be returned. An empty list returns the full document.
+    pub fn projection(mut self, paths: &[&str]) -> Self {
+        self.projection = paths.iter().map(|s| s.to_string()).collect();
         self
     }
 
@@ -801,6 +843,7 @@ impl<'a> QueryBuilder<'a> {
         self.db.read_snapshot(|store, catalog_root, snapshot_txn| {
             let entry = self.db.cached_get_table(store, catalog_root, &self.table)?;
             let schema = &entry.schema;
+            let key_attrs = collect_key_attrs(schema);
 
             let pk = key_utils::json_to_key_value(
                 &pk_val,
@@ -882,7 +925,15 @@ impl<'a> QueryBuilder<'a> {
                 };
 
                 if passes {
-                    result_items.push(val.clone());
+                    if self.projection.is_empty() {
+                        result_items.push(val.clone());
+                    } else {
+                        result_items.push(projection::apply_projection(
+                            val,
+                            &self.projection,
+                            &key_attrs,
+                        ));
+                    }
                 }
             }
 
@@ -916,6 +967,7 @@ pub struct ScanBuilder<'a> {
     limit: Option<usize>,
     exclusive_start_key: Option<Value>,
     filter: Option<FilterExpr>,
+    projection: Vec<String>,
 }
 
 impl<'a> ScanBuilder<'a> {
@@ -926,6 +978,7 @@ impl<'a> ScanBuilder<'a> {
             limit: None,
             exclusive_start_key: None,
             filter: None,
+            projection: Vec::new(),
         }
     }
 
@@ -944,11 +997,19 @@ impl<'a> ScanBuilder<'a> {
         self
     }
 
+    /// Set attribute paths to project. Only these attributes (plus key
+    /// attributes) will be returned. An empty list returns the full document.
+    pub fn projection(mut self, paths: &[&str]) -> Self {
+        self.projection = paths.iter().map(|s| s.to_string()).collect();
+        self
+    }
+
     /// Execute the scan.
     pub fn execute(self) -> Result<QueryResult, Error> {
         self.db.read_snapshot(|store, catalog_root, snapshot_txn| {
             let entry = self.db.cached_get_table(store, catalog_root, &self.table)?;
             let schema = &entry.schema;
+            let key_attrs = collect_key_attrs(schema);
 
             // Full range scan with MVCC filtering.
             let raw_results =
@@ -998,7 +1059,15 @@ impl<'a> ScanBuilder<'a> {
                 };
 
                 if passes {
-                    result_items.push(val.clone());
+                    if self.projection.is_empty() {
+                        result_items.push(val.clone());
+                    } else {
+                        result_items.push(projection::apply_projection(
+                            val,
+                            &self.projection,
+                            &key_attrs,
+                        ));
+                    }
                 }
             }
 
@@ -1217,6 +1286,7 @@ pub struct IndexQueryBuilder<'a> {
     scan_forward: bool,
     filter: Option<FilterExpr>,
     exclusive_start_key: Option<Value>,
+    projection: Vec<String>,
 }
 
 impl<'a> IndexQueryBuilder<'a> {
@@ -1230,6 +1300,7 @@ impl<'a> IndexQueryBuilder<'a> {
             scan_forward: true,
             filter: None,
             exclusive_start_key: None,
+            projection: Vec::new(),
         }
     }
 
@@ -1263,6 +1334,13 @@ impl<'a> IndexQueryBuilder<'a> {
         self
     }
 
+    /// Set attribute paths to project. Only these attributes (plus key
+    /// attributes) will be returned. An empty list returns the full document.
+    pub fn projection(mut self, paths: &[&str]) -> Self {
+        self.projection = paths.iter().map(|s| s.to_string()).collect();
+        self
+    }
+
     /// Execute the index query.
     pub fn execute(self) -> Result<QueryResult, Error> {
         let search_value = self.key_value.ok_or(QueryError::IndexKeyRequired)?;
@@ -1270,6 +1348,7 @@ impl<'a> IndexQueryBuilder<'a> {
         self.db.read_snapshot(|store, catalog_root, snapshot_txn| {
             let entry = self.db.cached_get_table(store, catalog_root, &self.table)?;
             let schema = &entry.schema;
+            let key_attrs = collect_key_attrs(schema);
 
             // Find the index definition.
             let index = entry
@@ -1377,7 +1456,15 @@ impl<'a> IndexQueryBuilder<'a> {
                 };
 
                 if passes {
-                    result_items.push(val.clone());
+                    if self.projection.is_empty() {
+                        result_items.push(val.clone());
+                    } else {
+                        result_items.push(projection::apply_projection(
+                            val,
+                            &self.projection,
+                            &key_attrs,
+                        ));
+                    }
                 }
             }
 
@@ -1757,4 +1844,13 @@ fn is_ttl_expired(doc: &Value, schema: &TableSchema) -> bool {
         .unwrap_or_default()
         .as_secs_f64();
     epoch_secs <= now
+}
+
+/// Collect key attribute names from a table schema for projection.
+fn collect_key_attrs(schema: &TableSchema) -> Vec<&str> {
+    let mut attrs = vec![schema.partition_key.name.as_str()];
+    if let Some(ref sk) = schema.sort_key {
+        attrs.push(sk.name.as_str());
+    }
+    attrs
 }

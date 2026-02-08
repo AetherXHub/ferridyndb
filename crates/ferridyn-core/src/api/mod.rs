@@ -6,6 +6,7 @@ pub mod database;
 pub mod filter;
 pub mod key_utils;
 pub mod page_store;
+pub mod projection;
 pub mod query;
 pub mod transaction;
 pub mod update;

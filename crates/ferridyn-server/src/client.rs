@@ -109,13 +109,19 @@ impl FerridynClient {
         table: &str,
         partition_key: Value,
         sort_key: Option<Value>,
+        projection: Option<&[String]>,
     ) -> Result<Option<Value>> {
-        let req = serde_json::json!({
+        let mut req = serde_json::json!({
             "op": "get_item",
             "table": table,
             "partition_key": partition_key,
             "sort_key": sort_key,
         });
+        if let Some(paths) = projection {
+            req.as_object_mut()
+                .unwrap()
+                .insert("projection".to_string(), serde_json::json!(paths));
+        }
         let resp = self.send_request(&req).await?;
         match item_from_response(&resp)? {
             Some(item) => Ok(Some(item)),
@@ -378,6 +384,7 @@ impl FerridynClient {
         scan_forward: Option<bool>,
         exclusive_start_key: Option<Value>,
         filter: Option<FilterExpr>,
+        projection: Option<&[String]>,
     ) -> Result<QueryResult> {
         let mut req = serde_json::json!({
             "op": "query",
@@ -403,6 +410,9 @@ impl FerridynClient {
         if let Some(f) = filter {
             obj.insert("filter".to_string(), serde_json::to_value(f).unwrap());
         }
+        if let Some(paths) = projection {
+            obj.insert("projection".to_string(), serde_json::json!(paths));
+        }
 
         let resp = self.send_request(&req).await?;
         items_from_response(&resp)
@@ -415,6 +425,7 @@ impl FerridynClient {
         limit: Option<usize>,
         exclusive_start_key: Option<Value>,
         filter: Option<FilterExpr>,
+        projection: Option<&[String]>,
     ) -> Result<QueryResult> {
         let mut req = serde_json::json!({
             "op": "scan",
@@ -429,6 +440,9 @@ impl FerridynClient {
         }
         if let Some(f) = filter {
             obj.insert("filter".to_string(), serde_json::to_value(f).unwrap());
+        }
+        if let Some(paths) = projection {
+            obj.insert("projection".to_string(), serde_json::json!(paths));
         }
 
         let resp = self.send_request(&req).await?;
@@ -667,6 +681,7 @@ impl FerridynClient {
         &mut self,
         table: &str,
         keys: &[(Value, Option<Value>)],
+        projection: Option<&[String]>,
     ) -> Result<Vec<Option<Value>>> {
         let keys_json: Vec<Value> = keys
             .iter()
@@ -680,11 +695,16 @@ impl FerridynClient {
                 obj
             })
             .collect();
-        let req = serde_json::json!({
+        let mut req = serde_json::json!({
             "op": "batch_get_item",
             "table": table,
             "keys": keys_json,
         });
+        if let Some(paths) = projection {
+            req.as_object_mut()
+                .unwrap()
+                .insert("projection".to_string(), serde_json::json!(paths));
+        }
         let resp = self.send_request(&req).await?;
         batch_items_from_response(&resp)
     }
@@ -700,6 +720,7 @@ impl FerridynClient {
         scan_forward: Option<bool>,
         filter: Option<FilterExpr>,
         exclusive_start_key: Option<Value>,
+        projection: Option<&[String]>,
     ) -> Result<QueryResult> {
         let mut req = serde_json::json!({
             "op": "query_index",
@@ -719,6 +740,9 @@ impl FerridynClient {
         }
         if let Some(esk) = exclusive_start_key {
             obj.insert("exclusive_start_key".to_string(), esk);
+        }
+        if let Some(paths) = projection {
+            obj.insert("projection".to_string(), serde_json::json!(paths));
         }
         let resp = self.send_request(&req).await?;
         items_from_response(&resp)

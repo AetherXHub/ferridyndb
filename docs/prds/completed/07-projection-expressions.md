@@ -1,7 +1,7 @@
 # PRD: Projection Expressions
 
 **Priority:** 7
-**Status:** Approved
+**Status:** Complete
 **Proposal:** [docs/proposals/accepted/projection-expressions.md](../proposals/accepted/projection-expressions.md)
 
 ## Summary

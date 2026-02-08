@@ -124,7 +124,8 @@ fn dispatch(db: &FerridynDB, req: Request) -> Response {
             table,
             partition_key,
             sort_key,
-        } => handle_get_item(db, &table, partition_key, sort_key),
+            projection,
+        } => handle_get_item(db, &table, partition_key, sort_key, projection),
 
         Request::GetItemVersioned {
             table,
@@ -180,6 +181,7 @@ fn dispatch(db: &FerridynDB, req: Request) -> Response {
             scan_forward,
             exclusive_start_key,
             filter,
+            projection,
         } => handle_query(
             db,
             &table,
@@ -189,6 +191,7 @@ fn dispatch(db: &FerridynDB, req: Request) -> Response {
             scan_forward,
             exclusive_start_key,
             filter,
+            projection,
         ),
 
         Request::Scan {
@@ -196,7 +199,8 @@ fn dispatch(db: &FerridynDB, req: Request) -> Response {
             limit,
             exclusive_start_key,
             filter,
-        } => handle_scan(db, &table, limit, exclusive_start_key, filter),
+            projection,
+        } => handle_scan(db, &table, limit, exclusive_start_key, filter, projection),
 
         Request::CreateTable {
             table,
@@ -256,6 +260,7 @@ fn dispatch(db: &FerridynDB, req: Request) -> Response {
             scan_forward,
             filter,
             exclusive_start_key,
+            projection,
         } => handle_query_index(
             db,
             &table,
@@ -265,9 +270,14 @@ fn dispatch(db: &FerridynDB, req: Request) -> Response {
             scan_forward,
             filter,
             exclusive_start_key,
+            projection,
         ),
 
-        Request::BatchGetItem { table, keys } => handle_batch_get_item(db, &table, keys),
+        Request::BatchGetItem {
+            table,
+            keys,
+            projection,
+        } => handle_batch_get_item(db, &table, keys, projection),
     }
 }
 
@@ -280,10 +290,15 @@ fn handle_get_item(
     table: &str,
     partition_key: serde_json::Value,
     sort_key: Option<serde_json::Value>,
+    projection: Option<Vec<String>>,
 ) -> Response {
     let mut builder = db.get_item(table).partition_key(partition_key);
     if let Some(sk) = sort_key {
         builder = builder.sort_key(sk);
+    }
+    if let Some(ref paths) = projection {
+        let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+        builder = builder.projection(&refs);
     }
     match builder.execute() {
         Ok(item) => Response::ok_item(item),
@@ -489,6 +504,7 @@ fn handle_query(
     scan_forward: Option<bool>,
     exclusive_start_key: Option<serde_json::Value>,
     filter: Option<FilterExpr>,
+    projection: Option<Vec<String>>,
 ) -> Response {
     let mut builder = db.query(table).partition_key(partition_key);
 
@@ -516,6 +532,10 @@ fn handle_query(
     if let Some(f) = filter {
         builder = builder.filter(f);
     }
+    if let Some(ref paths) = projection {
+        let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+        builder = builder.projection(&refs);
+    }
 
     match builder.execute() {
         Ok(result) => Response::ok_items(result.items, result.last_evaluated_key),
@@ -529,6 +549,7 @@ fn handle_scan(
     limit: Option<usize>,
     exclusive_start_key: Option<serde_json::Value>,
     filter: Option<FilterExpr>,
+    projection: Option<Vec<String>>,
 ) -> Response {
     let mut builder = db.scan(table);
     if let Some(n) = limit {
@@ -539,6 +560,10 @@ fn handle_scan(
     }
     if let Some(f) = filter {
         builder = builder.filter(f);
+    }
+    if let Some(ref paths) = projection {
+        let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+        builder = builder.projection(&refs);
     }
     match builder.execute() {
         Ok(result) => Response::ok_items(result.items, result.last_evaluated_key),
@@ -755,6 +780,7 @@ fn handle_query_index(
     scan_forward: Option<bool>,
     filter: Option<FilterExpr>,
     exclusive_start_key: Option<serde_json::Value>,
+    projection: Option<Vec<String>>,
 ) -> Response {
     let mut builder = db.query_index(table, index_name).key_value(key_value);
     if let Some(n) = limit {
@@ -769,13 +795,22 @@ fn handle_query_index(
     if let Some(esk) = exclusive_start_key {
         builder = builder.exclusive_start_key(esk);
     }
+    if let Some(ref paths) = projection {
+        let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+        builder = builder.projection(&refs);
+    }
     match builder.execute() {
         Ok(result) => Response::ok_items(result.items, result.last_evaluated_key),
         Err(e) => dyn_error_to_response(e),
     }
 }
 
-fn handle_batch_get_item(db: &FerridynDB, table: &str, keys: Vec<BatchGetItemKey>) -> Response {
+fn handle_batch_get_item(
+    db: &FerridynDB,
+    table: &str,
+    keys: Vec<BatchGetItemKey>,
+    projection: Option<Vec<String>>,
+) -> Response {
     const MAX_BATCH_SIZE: usize = 1000;
     if keys.len() > MAX_BATCH_SIZE {
         return Response::error(
@@ -789,6 +824,10 @@ fn handle_batch_get_item(db: &FerridynDB, table: &str, keys: Vec<BatchGetItemKey
     let mut builder = db.batch_get_item(table);
     for k in keys {
         builder = builder.key(k.partition_key, k.sort_key);
+    }
+    if let Some(ref paths) = projection {
+        let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+        builder = builder.projection(&refs);
     }
     match builder.execute() {
         Ok(items) => Response::ok_batch_items(items),
