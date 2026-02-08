@@ -4,8 +4,8 @@ use crate::encoding::KeyValue;
 use crate::encoding::string;
 use crate::error::{EncodingError, Error, SchemaError};
 use crate::types::{
-    IndexDefinition, KeyDefinition, KeyType, MAX_DOCUMENT_SIZE, MAX_PARTITION_KEY_SIZE,
-    MAX_SORT_KEY_SIZE, TableSchema,
+    IndexDefinition, IndexProjection, KeyDefinition, KeyType, MAX_DOCUMENT_SIZE,
+    MAX_PARTITION_KEY_SIZE, MAX_SORT_KEY_SIZE, TableSchema,
 };
 
 /// Convert a [`serde_json::Value`] to a [`KeyValue`], given the expected [`KeyType`].
@@ -233,6 +233,69 @@ pub fn build_index_key(
     Ok(Some(index_key))
 }
 
+/// Build the value bytes to store in a secondary index entry.
+///
+/// The value depends on the index's [`IndexProjection`]:
+/// - `KeysOnly` → empty `Vec<u8>` (current/legacy behavior)
+/// - `Include(attrs)` → MessagePack map with table keys, index keys, and listed attributes
+/// - `All` → full document serialized as MessagePack
+pub fn build_index_value(
+    projection: &IndexProjection,
+    doc: &Value,
+    table_schema: &TableSchema,
+    index: &IndexDefinition,
+) -> Result<Vec<u8>, Error> {
+    match projection {
+        IndexProjection::KeysOnly => Ok(Vec::new()),
+        IndexProjection::All => {
+            let bytes = rmp_serde::to_vec(doc).map_err(|e| {
+                crate::error::StorageError::CorruptedPage(format!(
+                    "MessagePack serialization error: {e}"
+                ))
+            })?;
+            Ok(bytes)
+        }
+        IndexProjection::Include(attrs) => {
+            let mut projected = serde_json::Map::new();
+
+            // Always include table partition key.
+            if let Some(v) = doc.get(&table_schema.partition_key.name) {
+                projected.insert(table_schema.partition_key.name.clone(), v.clone());
+            }
+            // Always include table sort key (if any).
+            if let Some(ref sk_def) = table_schema.sort_key
+                && let Some(v) = doc.get(&sk_def.name)
+            {
+                projected.insert(sk_def.name.clone(), v.clone());
+            }
+            // Always include index key attribute.
+            if let Some(v) = doc.get(&index.index_key.name) {
+                projected.insert(index.index_key.name.clone(), v.clone());
+            }
+            // Always include index sort key attribute (if any).
+            if let Some(ref isk_def) = index.index_sort_key
+                && let Some(v) = doc.get(&isk_def.name)
+            {
+                projected.insert(isk_def.name.clone(), v.clone());
+            }
+            // Include the user-specified attributes.
+            for attr_name in attrs {
+                if let Some(v) = doc.get(attr_name) {
+                    projected.insert(attr_name.clone(), v.clone());
+                }
+            }
+
+            let val = Value::Object(projected);
+            let bytes = rmp_serde::to_vec(&val).map_err(|e| {
+                crate::error::StorageError::CorruptedPage(format!(
+                    "MessagePack serialization error: {e}"
+                ))
+            })?;
+            Ok(bytes)
+        }
+    }
+}
+
 /// Decode the primary composite key bytes from an index entry's B+Tree key.
 ///
 /// The index key is:
@@ -422,6 +485,8 @@ mod tests {
                 key_type: KeyType::String,
             },
             index_sort_key: None,
+            projection: crate::types::IndexProjection::KeysOnly,
+            is_local: false,
             root_page: 0,
         };
         let doc = json!({
@@ -466,6 +531,8 @@ mod tests {
                 key_type: KeyType::String,
             },
             index_sort_key: None,
+            projection: crate::types::IndexProjection::KeysOnly,
+            is_local: false,
             root_page: 0,
         };
         let doc = json!({"pk": "CONTACT#alice", "name": "Alice"});
@@ -493,6 +560,8 @@ mod tests {
                 key_type: KeyType::String,
             },
             index_sort_key: None,
+            projection: crate::types::IndexProjection::KeysOnly,
+            is_local: false,
             root_page: 0,
         };
         // email is a number, but index expects String
@@ -521,6 +590,8 @@ mod tests {
                 key_type: KeyType::String,
             },
             index_sort_key: None,
+            projection: crate::types::IndexProjection::KeysOnly,
+            is_local: false,
             root_page: 0,
         };
         let doc = json!({"pk": "CONTACT#alice", "email": "alice@example.com"});

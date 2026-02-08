@@ -702,8 +702,11 @@ async fn test_index_crud() {
             "data",
             "email-idx",
             Some("CONTACT"),
-            "email",
-            "String",
+            Some("email"),
+            Some("String"),
+            None,
+            None,
+            None,
             None,
             None,
         )
@@ -772,8 +775,11 @@ async fn test_query_index() {
             "data",
             "email-idx",
             Some("CONTACT"),
-            "email",
-            "String",
+            Some("email"),
+            Some("String"),
+            None,
+            None,
+            None,
             None,
             None,
         )
@@ -908,8 +914,11 @@ async fn test_query_index_with_limit() {
             "data",
             "status-idx",
             Some("ITEM"),
-            "status",
-            "String",
+            Some("status"),
+            Some("String"),
+            None,
+            None,
+            None,
             None,
             None,
         )
@@ -1256,8 +1265,11 @@ async fn test_index_pagination_over_wire() {
             "data",
             "status-idx",
             Some("ITEM"),
-            "status",
-            "String",
+            Some("status"),
+            Some("String"),
+            None,
+            None,
+            None,
             None,
             None,
         )
@@ -1718,10 +1730,13 @@ async fn test_composite_index_over_wire() {
             "data",
             "cat-price-idx",
             None,
-            "category",
-            "String",
+            Some("category"),
+            Some("String"),
             Some("price"),
             Some("Number"),
+            None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1781,4 +1796,318 @@ async fn test_composite_index_over_wire() {
         .await
         .unwrap();
     assert_eq!(result.items.len(), 3);
+}
+
+#[tokio::test]
+async fn test_local_index_over_wire() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    // Create table with sort key (required for LSI).
+    client
+        .create_table(
+            "orders",
+            KeyDef {
+                name: "customer".to_string(),
+                key_type: "String".to_string(),
+            },
+            Some(KeyDef {
+                name: "order_id".to_string(),
+                key_type: "String".to_string(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Create a local secondary index (no index_key needed — auto-inferred).
+    client
+        .create_index(
+            "orders",
+            "ts-idx",
+            None,
+            None,
+            None,
+            Some("timestamp"),
+            Some("Number"),
+            None,
+            None,
+            Some(true),
+        )
+        .await
+        .unwrap();
+
+    // Verify the index is created and marked as local.
+    let idx = client.describe_index("orders", "ts-idx").await.unwrap();
+    assert_eq!(idx.name, "ts-idx");
+    assert!(idx.is_local);
+    assert_eq!(idx.index_key_name, "customer");
+    assert_eq!(idx.index_sort_key_name, Some("timestamp".to_string()));
+
+    // Insert orders for two customers.
+    client
+        .put_item(
+            "orders",
+            json!({"customer": "alice", "order_id": "o1", "timestamp": 100.0, "total": 50.0}),
+        )
+        .await
+        .unwrap();
+    client
+        .put_item(
+            "orders",
+            json!({"customer": "alice", "order_id": "o2", "timestamp": 200.0, "total": 75.0}),
+        )
+        .await
+        .unwrap();
+    client
+        .put_item(
+            "orders",
+            json!({"customer": "bob", "order_id": "o3", "timestamp": 50.0, "total": 100.0}),
+        )
+        .await
+        .unwrap();
+
+    // Query LSI with table pk value.
+    let result = client
+        .query_index(
+            "orders",
+            "ts-idx",
+            json!("alice"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.items.len(), 2);
+    assert_eq!(result.items[0]["timestamp"], 100.0);
+    assert_eq!(result.items[1]["timestamp"], 200.0);
+
+    // Query with sort key condition.
+    let result = client
+        .query_index(
+            "orders",
+            "ts-idx",
+            json!("alice"),
+            Some(SortKeyCondition::Gt {
+                value: json!(150.0),
+            }),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.items.len(), 1);
+    assert_eq!(result.items[0]["timestamp"], 200.0);
+
+    // Bob's orders.
+    let result = client
+        .query_index(
+            "orders",
+            "ts-idx",
+            json!("bob"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.items.len(), 1);
+    assert_eq!(result.items[0]["total"], 100.0);
+}
+
+// ---------------------------------------------------------------------------
+// Change stream tests (PRD-10 Phase 4)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_stream_records_over_wire() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    // Create table.
+    client
+        .create_table(
+            "items",
+            KeyDef {
+                name: "id".to_string(),
+                key_type: "String".to_string(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Enable stream.
+    client
+        .enable_stream("items", "KEYS_ONLY")
+        .await
+        .unwrap();
+
+    // Write some items.
+    client
+        .put_item("items", json!({"id": "a", "val": 1}))
+        .await
+        .unwrap();
+    client
+        .put_item("items", json!({"id": "b", "val": 2}))
+        .await
+        .unwrap();
+
+    // Update item a.
+    client
+        .update_item(
+            "items",
+            json!("a"),
+            None,
+            &[UpdateActionInput {
+                action: "set".to_string(),
+                path: "val".to_string(),
+                value: Some(json!(10)),
+            }],
+        )
+        .await
+        .unwrap();
+
+    // Delete item b.
+    client.delete_item("items", json!("b"), None).await.unwrap();
+
+    // Get all stream records.
+    let records = client
+        .get_stream_records("items", None, None)
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 4);
+    assert_eq!(records[0].event_type, "INSERT");
+    assert_eq!(records[1].event_type, "INSERT");
+    assert_eq!(records[2].event_type, "MODIFY");
+    assert_eq!(records[3].event_type, "REMOVE");
+
+    // Pagination: after_sequence.
+    let first_seq = records[0].sequence_number;
+    let after = client
+        .get_stream_records("items", Some(first_seq), None)
+        .await
+        .unwrap();
+    assert_eq!(after.len(), 3); // skipped the first record
+
+    // Pagination: limit.
+    let limited = client
+        .get_stream_records("items", None, Some(2))
+        .await
+        .unwrap();
+    assert_eq!(limited.len(), 2);
+}
+
+#[tokio::test]
+async fn test_stream_info_over_wire() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    // Create table.
+    client
+        .create_table(
+            "items",
+            KeyDef {
+                name: "id".to_string(),
+                key_type: "String".to_string(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Enable stream.
+    client
+        .enable_stream("items", "NEW_AND_OLD_IMAGES")
+        .await
+        .unwrap();
+
+    // Check stream info on empty stream.
+    let info = client.get_stream_info("items").await.unwrap();
+    assert!(info.enabled);
+    assert_eq!(info.view_type, "NEW_AND_OLD_IMAGES");
+    assert_eq!(info.record_count, 0);
+    assert!(info.oldest_sequence.is_none());
+    assert!(info.latest_sequence.is_none());
+
+    // Write items.
+    client
+        .put_item("items", json!({"id": "x", "val": 1}))
+        .await
+        .unwrap();
+    client
+        .put_item("items", json!({"id": "y", "val": 2}))
+        .await
+        .unwrap();
+
+    // Check stream info after writes.
+    let info = client.get_stream_info("items").await.unwrap();
+    assert_eq!(info.record_count, 2);
+    assert!(info.oldest_sequence.is_some());
+    assert!(info.latest_sequence.is_some());
+    assert!(info.latest_sequence.unwrap() >= info.oldest_sequence.unwrap());
+
+    // Disable stream.
+    client.disable_stream("items").await.unwrap();
+
+    // Records should still be readable.
+    let records = client
+        .get_stream_records("items", None, None)
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 2);
+
+    // Info should show disabled.
+    let info = client.get_stream_info("items").await.unwrap();
+    assert!(!info.enabled);
+
+    // Enable stream with a different error (already has stream config).
+    // Re-enable should work.
+    client
+        .enable_stream("items", "KEYS_ONLY")
+        .await
+        .unwrap();
+    let info = client.get_stream_info("items").await.unwrap();
+    assert!(info.enabled);
+    assert_eq!(info.view_type, "KEYS_ONLY");
+}
+
+#[tokio::test]
+async fn test_stream_not_enabled_error() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    // Create table without stream.
+    client
+        .create_table(
+            "items",
+            KeyDef {
+                name: "id".to_string(),
+                key_type: "String".to_string(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Trying to get stream records should fail.
+    let result = client.get_stream_records("items", None, None).await;
+    assert!(result.is_err());
+
+    // Trying to get stream info should fail.
+    let result = client.get_stream_info("items").await;
+    assert!(result.is_err());
 }

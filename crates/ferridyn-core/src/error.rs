@@ -129,6 +129,12 @@ pub enum SchemaError {
 
     #[error("type mismatch for update action on '{attribute}': {message}")]
     UpdateTypeMismatch { attribute: String, message: String },
+
+    #[error("stream already enabled on table: {0}")]
+    StreamAlreadyEnabled(String),
+
+    #[error("stream not enabled on table: {0}")]
+    StreamNotEnabled(String),
 }
 
 #[derive(Debug, Error)]

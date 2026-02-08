@@ -8,7 +8,7 @@ A local, embedded, DynamoDB-style document database written in Rust with single-
 - **Single-file storage** — Copy-on-write pages with atomic double-buffered header commits (no WAL)
 - **MVCC snapshot isolation** — Single writer, unlimited concurrent readers with version chains
 - **B+Tree indexing** — Efficient range scans with slotted pages and overflow support
-- **Partition schemas & secondary indexes** — Declare entity types with prefix-based schemas, create scoped or global secondary indexes with composite keys (partition + sort) and automatic backfill, and query by indexed attribute values with sort key range conditions
+- **Partition schemas & secondary indexes** — Declare entity types with prefix-based schemas, create scoped or global secondary indexes (GSI) with composite keys (partition + sort), local secondary indexes (LSI) with alternate sort keys, index projections (KeysOnly, Include, All), and automatic backfill, and query by indexed attribute values with sort key range conditions
 - **Byte-ordered key encoding** — Enables fast `memcmp`-based comparisons for partition and sort keys
 - **TTL support** — Optional time-to-live attributes with automatic expiry filtering
 - **Condition expressions** — Predicates on write operations (`put`, `delete`, `update`) that evaluate against the existing item before proceeding, enabling prevent-overwrite and business rule enforcement
@@ -193,6 +193,63 @@ let result = db.query_index("data", "status-price-idx")
     .execute()
     .unwrap();
 assert_eq!(result.items.len(), 1); // Only price=50 in range
+
+// Index projections — store attributes in the index to avoid primary table fetches
+use ferridyn_core::types::IndexProjection;
+
+db.create_index("data")
+    .name("status-name-proj-idx")
+    .index_key("status", KeyType::String)
+    .projection_type(IndexProjection::Include(vec!["name".to_string()]))
+    .execute()
+    .unwrap();
+
+// Covered query — reads directly from the index, no primary table fetch
+let result = db.query_index("data", "status-name-proj-idx")
+    .key_value("active")
+    .projection(&["name"])
+    .execute()
+    .unwrap();
+
+// ALL projection stores the full document in the index
+db.create_index("data")
+    .name("status-all-idx")
+    .index_key("status", KeyType::String)
+    .projection_type(IndexProjection::All)
+    .execute()
+    .unwrap();
+
+// Local secondary index — same partition key, alternate sort key
+let db2 = FerridynDB::create("orders.db").unwrap();
+db2.create_table("orders")
+    .partition_key("customer", KeyType::String)
+    .sort_key("order_id", KeyType::String)
+    .execute()
+    .unwrap();
+
+// LSI auto-infers index_key from the table's partition key
+db2.create_index("orders")
+    .name("ts-idx")
+    .local()
+    .index_sort_key("timestamp", KeyType::Number)
+    .execute()
+    .unwrap();
+
+db2.put_item("orders", json!({
+    "customer": "alice", "order_id": "o1", "timestamp": 100.0
+})).unwrap();
+db2.put_item("orders", json!({
+    "customer": "alice", "order_id": "o2", "timestamp": 200.0
+})).unwrap();
+
+// Query with table pk value — returns alice's orders sorted by timestamp
+let result = db2.query_index("orders", "ts-idx")
+    .key_value("alice")
+    .sort_key_gt(json!(150.0))
+    .execute()
+    .unwrap();
+assert_eq!(result.items.len(), 1);
+assert_eq!(result.items[0]["timestamp"], 200.0);
 ```
 
 ### Build and Test
@@ -201,7 +258,7 @@ assert_eq!(result.items.len(), 1); // Only price=50 in range
 # Compile all crates
 cargo build
 
-# Run all tests (668 tests across workspace)
+# Run all tests (691 tests across workspace)
 cargo test
 
 # Run tests for a specific crate
@@ -416,7 +473,7 @@ FerridynDB follows the LMDB concurrency model: one writer at a time (via file lo
 
 ### Partition Schemas & Secondary Indexes
 
-Secondary indexes can be **scoped** (limited to a partition schema prefix) or **global** (spanning all items in the table). Scoped indexes are tied to partition schemas — prefix-based entity type declarations that define expected attributes. Global indexes match any item that has the indexed attribute, regardless of partition key prefix. Both types are backed by plain B+Tree lookups with lazy GC for orphaned entries. Dropping an index reclaims all of its B+Tree pages.
+Secondary indexes can be **scoped** (limited to a partition schema prefix) or **global** (spanning all items in the table). Scoped indexes are tied to partition schemas — prefix-based entity type declarations that define expected attributes. Global indexes match any item that has the indexed attribute, regardless of partition key prefix. **Local secondary indexes** (LSI) share the table's partition key but use an alternate sort key, enabling queries like "find all items in partition X, sorted by timestamp". All index types support composite keys, range queries, projections (KeysOnly, Include, All), and are backed by plain B+Tree lookups with lazy GC for orphaned entries. Dropping an index reclaims all of its B+Tree pages.
 
 ### No B+Tree Rebalancing (v1)
 

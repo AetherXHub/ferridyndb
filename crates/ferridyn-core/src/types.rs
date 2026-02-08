@@ -119,6 +119,25 @@ pub struct PartitionSchema {
     pub validate: bool,
 }
 
+/// Controls what attributes are stored in secondary index entry values.
+///
+/// DynamoDB-style index projections allow queries to return results directly
+/// from the index without fetching the full document from the primary table.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub enum IndexProjection {
+    /// Store nothing in the index value (empty bytes). Every index query must
+    /// fetch the full document from the primary table. This is the default and
+    /// matches the behavior of indexes created before projections were added.
+    #[default]
+    KeysOnly,
+    /// Store table keys + index keys + the listed attributes as MessagePack in
+    /// the index value. Covered queries skip the primary table fetch.
+    Include(Vec<String>),
+    /// Store the entire document as MessagePack in the index value. Always
+    /// covered — no primary table fetch needed.
+    All,
+}
+
 /// A secondary index definition, optionally scoped to a partition schema.
 ///
 /// Each index maintains a separate B+Tree keyed by
@@ -143,6 +162,13 @@ pub struct IndexDefinition {
     /// Optional index sort key for composite index keys.
     #[serde(default)]
     pub index_sort_key: Option<KeyDefinition>,
+    /// What attributes to store in the index entry value.
+    #[serde(default)]
+    pub projection: IndexProjection,
+    /// When true, this is a local secondary index — the index_key matches
+    /// the table's partition key, and index_sort_key is the alternate sort key.
+    #[serde(default)]
+    pub is_local: bool,
     /// B+Tree root page for this index.
     pub root_page: PageId,
 }

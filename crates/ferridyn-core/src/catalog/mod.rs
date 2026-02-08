@@ -18,4 +18,10 @@ pub struct CatalogEntry {
     /// Secondary index definitions scoped to partition schemas.
     #[serde(default)]
     pub indexes: Vec<IndexDefinition>,
+    /// Change stream configuration (None = stream never enabled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_config: Option<crate::stream::StreamConfig>,
+    /// Root page of the stream B+Tree (None = no stream data).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_root_page: Option<PageId>,
 }

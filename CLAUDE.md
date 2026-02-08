@@ -15,7 +15,7 @@ DynamoDB's API is simple and effective for key-value and document workloads, but
 This is a Cargo workspace. Build/test from the repository root:
 
 - `cargo build` — compile all crates
-- `cargo test` — run all tests across the workspace (683 tests)
+- `cargo test` — run all tests across the workspace (723 tests)
 - `cargo test -p ferridyn-core` — test only the core crate
 - `cargo test -p ferridyn-core <test_name>` — run a single test by name
 - `cargo clippy --workspace -- -D warnings` — lint all crates (zero warnings required)
@@ -86,6 +86,7 @@ PRDs live in `docs/prds/` and track feature implementation across phases.
 - **Single writer, unlimited readers** — LMDB concurrency model
 - **Slotted pages** — Slot array grows forward, cell data grows backward
 - **Partition schemas & scoped secondary indexes** — Prefix-based entity type metadata with attribute definitions, scoped secondary indexes backed by plain B+Tree lookups with lazy GC
+- **Global and local secondary indexes** — GSI indexes alternate attributes across the table; LSI shares the table's partition key with an alternate sort key. Both support composite keys, range queries, and projections (KeysOnly, Include, All)
 - **No B+Tree rebalancing in v1** — Mark-as-dead delete, reclaim fully empty pages
 
 ## Dependencies

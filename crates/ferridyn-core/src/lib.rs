@@ -44,4 +44,5 @@ pub mod encoding;
 pub mod error;
 pub mod mvcc;
 pub mod storage;
+pub mod stream;
 pub mod types;

@@ -136,9 +136,16 @@ pub enum Request {
         name: String,
         #[serde(default)]
         partition_schema: Option<String>,
-        index_key: KeyDef,
+        #[serde(default)]
+        index_key: Option<KeyDef>,
         #[serde(default)]
         index_sort_key: Option<KeyDef>,
+        #[serde(default)]
+        projection_type: Option<String>,
+        #[serde(default)]
+        projection_attributes: Option<Vec<String>>,
+        #[serde(default)]
+        is_local: Option<bool>,
     },
     DropIndex {
         table: String,
@@ -174,6 +181,27 @@ pub enum Request {
         keys: Vec<BatchGetItemKey>,
         #[serde(default)]
         projection: Option<Vec<String>>,
+    },
+    // -- Stream operations --
+    EnableStream {
+        table: String,
+        view_type: String,
+    },
+    DisableStream {
+        table: String,
+    },
+    GetStreamRecords {
+        table: String,
+        #[serde(default)]
+        after_sequence: Option<u64>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    GetStreamInfo {
+        table: String,
+    },
+    PruneStream {
+        table: String,
     },
 }
 
@@ -234,6 +262,32 @@ pub struct PartitionSchemaWire {
     pub validate: bool,
 }
 
+/// Stream record in wire format.
+#[derive(Debug, Serialize)]
+pub struct StreamRecordWire {
+    pub sequence_number: u64,
+    pub sub_sequence: u32,
+    pub event_type: String,
+    pub keys: Value,
+    pub timestamp: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_image: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_image: Option<Value>,
+}
+
+/// Stream info in wire format.
+#[derive(Debug, Serialize)]
+pub struct StreamInfoWire {
+    pub enabled: bool,
+    pub view_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_sequence: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_sequence: Option<u64>,
+    pub record_count: usize,
+}
+
 /// Index definition in wire format.
 #[derive(Debug, Serialize)]
 pub struct IndexDefWire {
@@ -243,6 +297,11 @@ pub struct IndexDefWire {
     pub index_key: KeyDefWire,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index_sort_key: Option<KeyDefWire>,
+    pub projection_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_attributes: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_local: bool,
 }
 
 /// A response sent back to the client.
@@ -309,6 +368,14 @@ pub enum OkResponse {
     BatchItems {
         ok: bool,
         items: Vec<Option<Value>>,
+    },
+    StreamRecords {
+        ok: bool,
+        records: Vec<StreamRecordWire>,
+    },
+    StreamInfoResult {
+        ok: bool,
+        stream_info: StreamInfoWire,
     },
 }
 
@@ -415,5 +482,16 @@ impl Response {
 
     pub fn ok_batch_items(items: Vec<Option<Value>>) -> Self {
         Response::Ok(OkResponse::BatchItems { ok: true, items })
+    }
+
+    pub fn ok_stream_records(records: Vec<StreamRecordWire>) -> Self {
+        Response::Ok(OkResponse::StreamRecords { ok: true, records })
+    }
+
+    pub fn ok_stream_info(stream_info: StreamInfoWire) -> Self {
+        Response::Ok(OkResponse::StreamInfoResult {
+            ok: true,
+            stream_info,
+        })
     }
 }

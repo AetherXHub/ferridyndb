@@ -16,7 +16,8 @@ use ferridyn_core::types::{AttrType, IndexDefinition, KeyType, PartitionSchema, 
 
 use crate::protocol::{
     AttributeDefWire, BatchGetItemKey, IndexDefWire, KeyDef, KeyDefWire, PartitionSchemaWire,
-    Request, Response, SortKeyCondition, TableSchemaWire, UpdateActionWire,
+    Request, Response, SortKeyCondition, StreamInfoWire, StreamRecordWire, TableSchemaWire,
+    UpdateActionWire,
 };
 
 /// A FerridynDB server listening on a Unix socket.
@@ -245,6 +246,9 @@ fn dispatch(db: &FerridynDB, req: Request) -> Response {
             partition_schema,
             index_key,
             index_sort_key,
+            projection_type,
+            projection_attributes,
+            is_local,
         } => handle_create_index(
             db,
             &table,
@@ -252,6 +256,9 @@ fn dispatch(db: &FerridynDB, req: Request) -> Response {
             partition_schema.as_deref(),
             index_key,
             index_sort_key,
+            projection_type.as_deref(),
+            projection_attributes,
+            is_local.unwrap_or(false),
         ),
 
         Request::DropIndex { table, name } => handle_drop_index(db, &table, &name),
@@ -288,6 +295,22 @@ fn dispatch(db: &FerridynDB, req: Request) -> Response {
             keys,
             projection,
         } => handle_batch_get_item(db, &table, keys, projection),
+
+        Request::EnableStream { table, view_type } => {
+            handle_enable_stream(db, &table, &view_type)
+        }
+
+        Request::DisableStream { table } => handle_disable_stream(db, &table),
+
+        Request::GetStreamRecords {
+            table,
+            after_sequence,
+            limit,
+        } => handle_get_stream_records(db, &table, after_sequence, limit),
+
+        Request::GetStreamInfo { table } => handle_get_stream_info(db, &table),
+
+        Request::PruneStream { table } => handle_prune_stream(db, &table),
     }
 }
 
@@ -731,27 +754,39 @@ fn handle_describe_schema(db: &FerridynDB, table: &str, prefix: &str) -> Respons
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_create_index(
     db: &FerridynDB,
     table: &str,
     name: &str,
     partition_schema: Option<&str>,
-    index_key: KeyDef,
+    index_key: Option<KeyDef>,
     index_sort_key: Option<KeyDef>,
+    projection_type: Option<&str>,
+    projection_attributes: Option<Vec<String>>,
+    is_local: bool,
 ) -> Response {
-    let key_type = match parse_key_type(&index_key.key_type) {
-        Some(t) => t,
-        None => {
-            return Response::error(
-                "InvalidKeyType",
-                format!("unknown key type: {}", index_key.key_type),
-            );
-        }
-    };
-    let mut builder = db
-        .create_index(table)
-        .name(name)
-        .index_key(&index_key.name, key_type);
+    let mut builder = db.create_index(table).name(name);
+    if is_local {
+        builder = builder.local();
+    } else {
+        let ik = match index_key {
+            Some(k) => k,
+            None => {
+                return Response::error("InvalidRequest", "index_key is required for GSI");
+            }
+        };
+        let key_type = match parse_key_type(&ik.key_type) {
+            Some(t) => t,
+            None => {
+                return Response::error(
+                    "InvalidKeyType",
+                    format!("unknown key type: {}", ik.key_type),
+                );
+            }
+        };
+        builder = builder.index_key(&ik.name, key_type);
+    }
     if let Some(ps) = partition_schema {
         builder = builder.partition_schema(ps);
     }
@@ -767,6 +802,21 @@ fn handle_create_index(
         };
         builder = builder.index_sort_key(&sk.name, sk_type);
     }
+    // Parse index projection type.
+    let projection = match projection_type {
+        Some("ALL") => ferridyn_core::types::IndexProjection::All,
+        Some("INCLUDE") => ferridyn_core::types::IndexProjection::Include(
+            projection_attributes.unwrap_or_default(),
+        ),
+        Some("KEYS_ONLY") | None => ferridyn_core::types::IndexProjection::KeysOnly,
+        Some(other) => {
+            return Response::error(
+                "InvalidProjectionType",
+                format!("unknown projection type: {other}. Expected KEYS_ONLY, INCLUDE, or ALL"),
+            );
+        }
+    };
+    builder = builder.projection_type(projection);
     match builder.execute() {
         Ok(()) => Response::ok_empty(),
         Err(e) => dyn_error_to_response(e),
@@ -873,9 +923,121 @@ fn handle_batch_get_item(
     }
 }
 
+fn handle_enable_stream(db: &FerridynDB, table: &str, view_type: &str) -> Response {
+    let vt = match parse_stream_view_type(view_type) {
+        Some(vt) => vt,
+        None => {
+            return Response::error(
+                "InvalidStreamViewType",
+                format!("unknown view type: {view_type}. Expected KEYS_ONLY, NEW_IMAGE, OLD_IMAGE, or NEW_AND_OLD_IMAGES"),
+            );
+        }
+    };
+    match db.enable_stream(table, vt) {
+        Ok(()) => Response::ok_empty(),
+        Err(e) => dyn_error_to_response(e),
+    }
+}
+
+fn handle_disable_stream(db: &FerridynDB, table: &str) -> Response {
+    match db.disable_stream(table) {
+        Ok(()) => Response::ok_empty(),
+        Err(e) => dyn_error_to_response(e),
+    }
+}
+
+fn handle_get_stream_records(
+    db: &FerridynDB,
+    table: &str,
+    after_sequence: Option<u64>,
+    limit: Option<usize>,
+) -> Response {
+    let mut builder = db.get_stream_records(table);
+    if let Some(seq) = after_sequence {
+        builder = builder.after_sequence(seq);
+    }
+    if let Some(n) = limit {
+        builder = builder.limit(n);
+    }
+    match builder.execute() {
+        Ok(records) => {
+            let wire_records: Vec<StreamRecordWire> =
+                records.iter().map(stream_record_to_wire).collect();
+            Response::ok_stream_records(wire_records)
+        }
+        Err(e) => dyn_error_to_response(e),
+    }
+}
+
+fn handle_get_stream_info(db: &FerridynDB, table: &str) -> Response {
+    match db.get_stream_info(table) {
+        Ok(info) => Response::ok_stream_info(stream_info_to_wire(&info)),
+        Err(e) => dyn_error_to_response(e),
+    }
+}
+
+fn handle_prune_stream(db: &FerridynDB, table: &str) -> Response {
+    match db.prune_stream(table) {
+        Ok(_pruned) => Response::ok_empty(),
+        Err(e) => dyn_error_to_response(e),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn parse_stream_view_type(s: &str) -> Option<ferridyn_core::stream::StreamViewType> {
+    use ferridyn_core::stream::StreamViewType;
+    match s.to_uppercase().as_str() {
+        "KEYS_ONLY" | "KEYSONLY" => Some(StreamViewType::KeysOnly),
+        "NEW_IMAGE" | "NEWIMAGE" => Some(StreamViewType::NewImage),
+        "OLD_IMAGE" | "OLDIMAGE" => Some(StreamViewType::OldImage),
+        "NEW_AND_OLD_IMAGES" | "NEWANDOLDIMAGES" => Some(StreamViewType::NewAndOldImages),
+        _ => None,
+    }
+}
+
+fn stream_view_type_str(vt: ferridyn_core::stream::StreamViewType) -> &'static str {
+    use ferridyn_core::stream::StreamViewType;
+    match vt {
+        StreamViewType::KeysOnly => "KEYS_ONLY",
+        StreamViewType::NewImage => "NEW_IMAGE",
+        StreamViewType::OldImage => "OLD_IMAGE",
+        StreamViewType::NewAndOldImages => "NEW_AND_OLD_IMAGES",
+    }
+}
+
+fn event_type_str(et: ferridyn_core::stream::EventType) -> &'static str {
+    use ferridyn_core::stream::EventType;
+    match et {
+        EventType::Insert => "INSERT",
+        EventType::Modify => "MODIFY",
+        EventType::Remove => "REMOVE",
+    }
+}
+
+fn stream_record_to_wire(record: &ferridyn_core::stream::StreamRecord) -> StreamRecordWire {
+    StreamRecordWire {
+        sequence_number: record.sequence_number,
+        sub_sequence: record.sub_sequence,
+        event_type: event_type_str(record.event_type).to_string(),
+        keys: record.keys.clone(),
+        timestamp: record.timestamp,
+        new_image: record.new_image.clone(),
+        old_image: record.old_image.clone(),
+    }
+}
+
+fn stream_info_to_wire(info: &ferridyn_core::stream::StreamInfo) -> StreamInfoWire {
+    StreamInfoWire {
+        enabled: info.enabled,
+        view_type: stream_view_type_str(info.view_type).to_string(),
+        oldest_sequence: info.oldest_sequence,
+        latest_sequence: info.latest_sequence,
+        record_count: info.record_count,
+    }
+}
 
 fn parse_key_type(s: &str) -> Option<KeyType> {
     match s.to_lowercase().as_str() {
@@ -929,6 +1091,13 @@ fn partition_schema_to_wire(schema: &PartitionSchema) -> PartitionSchemaWire {
 }
 
 fn index_to_wire(index: &IndexDefinition) -> IndexDefWire {
+    let (proj_type, proj_attrs) = match &index.projection {
+        ferridyn_core::types::IndexProjection::KeysOnly => ("KEYS_ONLY".to_string(), None),
+        ferridyn_core::types::IndexProjection::Include(attrs) => {
+            ("INCLUDE".to_string(), Some(attrs.clone()))
+        }
+        ferridyn_core::types::IndexProjection::All => ("ALL".to_string(), None),
+    };
     IndexDefWire {
         name: index.name.clone(),
         partition_schema: index.partition_schema.clone(),
@@ -940,6 +1109,9 @@ fn index_to_wire(index: &IndexDefinition) -> IndexDefWire {
             name: sk.name.clone(),
             key_type: key_type_str(sk.key_type).to_string(),
         }),
+        projection_type: proj_type,
+        projection_attributes: proj_attrs,
+        is_local: index.is_local,
     }
 }
 

@@ -1,7 +1,7 @@
 # PRD: Change Streams (Change Data Capture)
 
 **Priority:** 10
-**Status:** Approved
+**Status:** Complete
 **Proposal:** [docs/proposals/accepted/change-streams.md](../proposals/accepted/change-streams.md)
 
 ## Summary

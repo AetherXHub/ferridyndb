@@ -113,12 +113,88 @@ fn maintain_indexes(
         if let Some(new) = new_doc
             && let Some(new_key) = key_utils::build_index_key(index, new, &entry.schema)?
         {
-            current_root = crate::btree::ops::insert(store, current_root, &new_key, &[])?;
+            let value_bytes =
+                key_utils::build_index_value(&index.projection, new, &entry.schema, index)?;
+            current_root = crate::btree::ops::insert(store, current_root, &new_key, &value_bytes)?;
         }
 
         updated.indexes[idx_pos].root_page = current_root;
     }
 
+    Ok(updated)
+}
+
+/// Maintain the change stream after a primary write.
+///
+/// Appends a `StreamRecord` to the table's stream B+Tree if the table has
+/// an enabled stream. Returns the updated `CatalogEntry` with the new
+/// `stream_root_page`.
+#[allow(clippy::too_many_arguments)]
+fn maintain_stream(
+    store: &mut impl crate::btree::PageStore,
+    entry: &catalog::CatalogEntry,
+    schema: &crate::types::TableSchema,
+    pk: &crate::encoding::KeyValue,
+    sk: Option<&crate::encoding::KeyValue>,
+    old_doc: Option<&Value>,
+    new_doc: Option<&Value>,
+    txn_id: TxnId,
+    sub_sequence: u32,
+    view_type_override: Option<crate::stream::StreamViewType>,
+) -> Result<catalog::CatalogEntry, Error> {
+    let config = match &entry.stream_config {
+        Some(c) if c.enabled => c,
+        _ => return Ok(entry.clone()),
+    };
+
+    let stream_root = match entry.stream_root_page {
+        Some(root) => root,
+        None => return Ok(entry.clone()),
+    };
+
+    // Determine event type.
+    let event_type = match (old_doc, new_doc) {
+        (None, Some(_)) => crate::stream::EventType::Insert,
+        (Some(_), Some(_)) => crate::stream::EventType::Modify,
+        (Some(_), None) => crate::stream::EventType::Remove,
+        (None, None) => return Ok(entry.clone()),
+    };
+
+    // Build keys JSON object.
+    let mut keys_map = serde_json::Map::new();
+    keys_map.insert(
+        schema.partition_key.name.clone(),
+        key_utils::key_value_to_json(pk),
+    );
+    if let (Some(sk_def), Some(sk_val)) = (&schema.sort_key, sk) {
+        keys_map.insert(sk_def.name.clone(), key_utils::key_value_to_json(sk_val));
+    }
+
+    // Determine images based on view type.
+    let vt = view_type_override.unwrap_or(config.view_type);
+    let (new_image, old_image) = match vt {
+        crate::stream::StreamViewType::KeysOnly => (None, None),
+        crate::stream::StreamViewType::NewImage => (new_doc.cloned(), None),
+        crate::stream::StreamViewType::OldImage => (None, old_doc.cloned()),
+        crate::stream::StreamViewType::NewAndOldImages => {
+            (new_doc.cloned(), old_doc.cloned())
+        }
+    };
+
+    let record = crate::stream::StreamRecord {
+        sequence_number: txn_id,
+        sub_sequence,
+        event_type,
+        keys: Value::Object(keys_map),
+        timestamp: crate::stream::ops::now_epoch_secs(),
+        new_image,
+        old_image,
+    };
+
+    let new_stream_root = crate::stream::ops::append_stream_record(store, stream_root, &record)?;
+
+    let mut updated = entry.clone();
+    updated.stream_root_page = Some(new_stream_root);
     Ok(updated)
 }
 
@@ -133,6 +209,8 @@ pub struct Transaction {
     pub(crate) txn_id: TxnId,
     /// Keys deleted during this transaction (for incremental GC).
     pub(crate) tombstones: Vec<TombstoneEntry>,
+    /// Sub-sequence counter for stream records within this transaction.
+    pub(crate) stream_sub_seq: u32,
 }
 
 /// Evaluate a condition expression against an existing document.
@@ -152,6 +230,13 @@ fn evaluate_condition(condition: &FilterExpr, existing_doc: Option<&Value>) -> R
 }
 
 impl Transaction {
+    /// Get the next stream sub-sequence number and increment the counter.
+    fn next_stream_sub_seq(&mut self) -> u32 {
+        let seq = self.stream_sub_seq;
+        self.stream_sub_seq += 1;
+        seq
+    }
+
     /// Internal put_item implementation that optionally returns the old document.
     fn put_item_inner(
         &mut self,
@@ -193,23 +278,24 @@ impl Transaction {
         // 5. Encode composite key.
         let composite_key = composite::encode_composite(&pk, sk.as_ref())?;
 
-        // 5a. Read old document for condition evaluation, index maintenance, or return.
-        let old_doc: Option<Value> = if condition.is_some() || !entry.indexes.is_empty() || need_old
-        {
-            mvcc_ops::mvcc_get(
-                &self.store,
-                entry.data_root_page,
-                &composite_key,
-                self.txn_id,
-            )?
-            .map(|bytes| rmp_serde::from_slice(&bytes))
-            .transpose()
-            .map_err(|e| {
-                StorageError::CorruptedPage(format!("failed to deserialize document: {e}"))
-            })?
-        } else {
-            None
-        };
+        // 5a. Read old document for condition evaluation, index maintenance, stream, or return.
+        let stream_enabled = entry.stream_config.as_ref().is_some_and(|c| c.enabled);
+        let old_doc: Option<Value> =
+            if condition.is_some() || !entry.indexes.is_empty() || need_old || stream_enabled {
+                mvcc_ops::mvcc_get(
+                    &self.store,
+                    entry.data_root_page,
+                    &composite_key,
+                    self.txn_id,
+                )?
+                .map(|bytes| rmp_serde::from_slice(&bytes))
+                .transpose()
+                .map_err(|e| {
+                    StorageError::CorruptedPage(format!("failed to deserialize document: {e}"))
+                })?
+            } else {
+                None
+            };
 
         // 5b. Evaluate condition expression against existing document.
         if let Some(cond) = condition {
@@ -236,8 +322,26 @@ impl Transaction {
             Some(&document),
         )?;
 
+        // 7a. Maintain stream.
+        let sub_seq = self.next_stream_sub_seq();
+        updated = maintain_stream(
+            &mut self.store,
+            &updated,
+            schema,
+            &pk,
+            sk.as_ref(),
+            old_doc.as_ref(),
+            Some(&document),
+            self.txn_id,
+            sub_seq,
+            None,
+        )?;
+
         // 8. Write catalog if anything changed.
-        if updated.data_root_page != entry.data_root_page || updated.indexes != entry.indexes {
+        if updated.data_root_page != entry.data_root_page
+            || updated.indexes != entry.indexes
+            || updated.stream_root_page != entry.stream_root_page
+        {
             self.update_catalog_entry(table, &updated)?;
         }
 
@@ -481,23 +585,24 @@ impl Transaction {
 
         let composite_key = composite::encode_composite(&pk, sk.as_ref())?;
 
-        // Read document before delete for condition evaluation, index maintenance, or return.
-        let old_doc: Option<Value> = if condition.is_some() || !entry.indexes.is_empty() || need_old
-        {
-            mvcc_ops::mvcc_get(
-                &self.store,
-                entry.data_root_page,
-                &composite_key,
-                self.txn_id,
-            )?
-            .map(|bytes| rmp_serde::from_slice(&bytes))
-            .transpose()
-            .map_err(|e| {
-                StorageError::CorruptedPage(format!("failed to deserialize document: {e}"))
-            })?
-        } else {
-            None
-        };
+        // Read document before delete for condition evaluation, index maintenance, stream, or return.
+        let stream_enabled = entry.stream_config.as_ref().is_some_and(|c| c.enabled);
+        let old_doc: Option<Value> =
+            if condition.is_some() || !entry.indexes.is_empty() || need_old || stream_enabled {
+                mvcc_ops::mvcc_get(
+                    &self.store,
+                    entry.data_root_page,
+                    &composite_key,
+                    self.txn_id,
+                )?
+                .map(|bytes| rmp_serde::from_slice(&bytes))
+                .transpose()
+                .map_err(|e| {
+                    StorageError::CorruptedPage(format!("failed to deserialize document: {e}"))
+                })?
+            } else {
+                None
+            };
 
         // Evaluate condition expression against existing document.
         if let Some(cond) = condition {
@@ -527,7 +632,25 @@ impl Transaction {
             None, // delete: no new document
         )?;
 
-        if updated.data_root_page != entry.data_root_page || updated.indexes != entry.indexes {
+        // Maintain stream.
+        let sub_seq = self.next_stream_sub_seq();
+        updated = maintain_stream(
+            &mut self.store,
+            &updated,
+            schema,
+            &pk,
+            sk.as_ref(),
+            old_doc.as_ref(),
+            None,
+            self.txn_id,
+            sub_seq,
+            None,
+        )?;
+
+        if updated.data_root_page != entry.data_root_page
+            || updated.indexes != entry.indexes
+            || updated.stream_root_page != entry.stream_root_page
+        {
             self.update_catalog_entry(table, &updated)?;
         }
 
@@ -666,8 +789,26 @@ impl Transaction {
             Some(&document),
         )?;
 
+        // 10a. Maintain stream.
+        let sub_seq = self.next_stream_sub_seq();
+        updated = maintain_stream(
+            &mut self.store,
+            &updated,
+            schema,
+            &pk,
+            sk.as_ref(),
+            old_doc.as_ref(),
+            Some(&document),
+            self.txn_id,
+            sub_seq,
+            None,
+        )?;
+
         // 11. Write catalog if anything changed.
-        if updated.data_root_page != entry.data_root_page || updated.indexes != entry.indexes {
+        if updated.data_root_page != entry.data_root_page
+            || updated.indexes != entry.indexes
+            || updated.stream_root_page != entry.stream_root_page
+        {
             self.update_catalog_entry(table, &updated)?;
         }
 
@@ -1029,6 +1170,8 @@ mod tests {
                 key_type: KeyType::String,
             },
             None,
+            crate::types::IndexProjection::KeysOnly,
+            false,
             1,
         )
         .unwrap();
@@ -1069,6 +1212,8 @@ mod tests {
                 key_type: KeyType::String,
             },
             None,
+            crate::types::IndexProjection::KeysOnly,
+            false,
             1,
         )
         .unwrap();
@@ -1112,6 +1257,8 @@ mod tests {
                 key_type: KeyType::String,
             },
             None,
+            crate::types::IndexProjection::KeysOnly,
+            false,
             1,
         )
         .unwrap();
@@ -1172,6 +1319,8 @@ mod tests {
                 key_type: KeyType::String,
             },
             None,
+            crate::types::IndexProjection::KeysOnly,
+            false,
             1,
         )
         .unwrap();
@@ -1212,6 +1361,8 @@ mod tests {
                 key_type: KeyType::String,
             },
             None,
+            crate::types::IndexProjection::KeysOnly,
+            false,
             1,
         )
         .unwrap();

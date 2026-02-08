@@ -68,6 +68,9 @@ pub struct IndexInfo {
     pub index_key_type: String,
     pub index_sort_key_name: Option<String>,
     pub index_sort_key_type: Option<String>,
+    pub projection_type: String,
+    pub projection_attributes: Option<Vec<String>>,
+    pub is_local: bool,
 }
 
 /// Input for creating a partition schema attribute.
@@ -84,6 +87,28 @@ pub struct UpdateActionInput {
     pub action: String,
     pub path: String,
     pub value: Option<Value>,
+}
+
+/// Stream record returned from server.
+#[derive(Debug, Clone)]
+pub struct StreamRecordInfo {
+    pub sequence_number: u64,
+    pub sub_sequence: u32,
+    pub event_type: String,
+    pub keys: Value,
+    pub timestamp: f64,
+    pub new_image: Option<Value>,
+    pub old_image: Option<Value>,
+}
+
+/// Stream info returned from server.
+#[derive(Debug, Clone)]
+pub struct StreamInfo {
+    pub enabled: bool,
+    pub view_type: String,
+    pub oldest_sequence: Option<u64>,
+    pub latest_sequence: Option<u64>,
+    pub record_count: usize,
 }
 
 /// Client for a FerridynDB server.
@@ -627,20 +652,25 @@ impl FerridynClient {
         table: &str,
         name: &str,
         partition_schema: Option<&str>,
-        index_key_name: &str,
-        index_key_type: &str,
+        index_key_name: Option<&str>,
+        index_key_type: Option<&str>,
         index_sort_key_name: Option<&str>,
         index_sort_key_type: Option<&str>,
+        projection_type: Option<&str>,
+        projection_attributes: Option<&[String]>,
+        is_local: Option<bool>,
     ) -> Result<()> {
         let mut req = serde_json::json!({
             "op": "create_index",
             "table": table,
             "name": name,
-            "index_key": {
-                "name": index_key_name,
-                "type": index_key_type,
-            },
         });
+        if let (Some(ik_name), Some(ik_type)) = (index_key_name, index_key_type) {
+            req["index_key"] = serde_json::json!({
+                "name": ik_name,
+                "type": ik_type,
+            });
+        }
         if let Some(ps) = partition_schema {
             req["partition_schema"] = serde_json::Value::String(ps.to_string());
         }
@@ -649,6 +679,15 @@ impl FerridynClient {
                 "name": sk_name,
                 "type": sk_type,
             });
+        }
+        if let Some(pt) = projection_type {
+            req["projection_type"] = serde_json::Value::String(pt.to_string());
+        }
+        if let Some(pa) = projection_attributes {
+            req["projection_attributes"] = serde_json::json!(pa);
+        }
+        if let Some(true) = is_local {
+            req["is_local"] = serde_json::json!(true);
         }
         let resp = self.send_request(&req).await?;
         check_ok(&resp)
@@ -766,6 +805,71 @@ impl FerridynClient {
         }
         let resp = self.send_request(&req).await?;
         items_from_response(&resp)
+    }
+
+    // -- Stream operations --
+
+    /// Enable a change stream on a table.
+    pub async fn enable_stream(&mut self, table: &str, view_type: &str) -> Result<()> {
+        let req = serde_json::json!({
+            "op": "enable_stream",
+            "table": table,
+            "view_type": view_type,
+        });
+        let resp = self.send_request(&req).await?;
+        check_ok(&resp)
+    }
+
+    /// Disable a change stream on a table.
+    pub async fn disable_stream(&mut self, table: &str) -> Result<()> {
+        let req = serde_json::json!({
+            "op": "disable_stream",
+            "table": table,
+        });
+        let resp = self.send_request(&req).await?;
+        check_ok(&resp)
+    }
+
+    /// Get stream records from a table.
+    pub async fn get_stream_records(
+        &mut self,
+        table: &str,
+        after_sequence: Option<u64>,
+        limit: Option<usize>,
+    ) -> Result<Vec<StreamRecordInfo>> {
+        let mut req = serde_json::json!({
+            "op": "get_stream_records",
+            "table": table,
+        });
+        let obj = req.as_object_mut().unwrap();
+        if let Some(seq) = after_sequence {
+            obj.insert("after_sequence".to_string(), serde_json::json!(seq));
+        }
+        if let Some(n) = limit {
+            obj.insert("limit".to_string(), serde_json::json!(n));
+        }
+        let resp = self.send_request(&req).await?;
+        stream_records_from_response(&resp)
+    }
+
+    /// Get stream info for a table.
+    pub async fn get_stream_info(&mut self, table: &str) -> Result<StreamInfo> {
+        let req = serde_json::json!({
+            "op": "get_stream_info",
+            "table": table,
+        });
+        let resp = self.send_request(&req).await?;
+        stream_info_from_response(&resp)
+    }
+
+    /// Prune old stream records based on retention settings.
+    pub async fn prune_stream(&mut self, table: &str) -> Result<()> {
+        let req = serde_json::json!({
+            "op": "prune_stream",
+            "table": table,
+        });
+        let resp = self.send_request(&req).await?;
+        check_ok(&resp)
     }
 
     // -----------------------------------------------------------------------
@@ -1066,5 +1170,79 @@ fn parse_index_info(v: &Value) -> IndexInfo {
             .and_then(|v| v.get("type"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
+        projection_type: v
+            .get("projection_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("KEYS_ONLY")
+            .to_string(),
+        projection_attributes: v
+            .get("projection_attributes")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            }),
+        is_local: v.get("is_local").and_then(|v| v.as_bool()).unwrap_or(false),
+    }
+}
+
+fn stream_records_from_response(resp: &Value) -> Result<Vec<StreamRecordInfo>> {
+    check_error(resp)?;
+    let records = resp
+        .get("records")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().map(parse_stream_record).collect())
+        .unwrap_or_default();
+    Ok(records)
+}
+
+fn stream_info_from_response(resp: &Value) -> Result<StreamInfo> {
+    check_error(resp)?;
+    let info = resp
+        .get("stream_info")
+        .ok_or_else(|| ClientError::Protocol("missing 'stream_info' in response".to_string()))?;
+    Ok(StreamInfo {
+        enabled: info.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false),
+        view_type: info
+            .get("view_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        oldest_sequence: info.get("oldest_sequence").and_then(|v| v.as_u64()),
+        latest_sequence: info.get("latest_sequence").and_then(|v| v.as_u64()),
+        record_count: info
+            .get("record_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize,
+    })
+}
+
+fn parse_stream_record(v: &Value) -> StreamRecordInfo {
+    StreamRecordInfo {
+        sequence_number: v
+            .get("sequence_number")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        sub_sequence: v
+            .get("sub_sequence")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32,
+        event_type: v
+            .get("event_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        keys: v.get("keys").cloned().unwrap_or(Value::Null),
+        timestamp: v
+            .get("timestamp")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0),
+        new_image: v
+            .get("new_image")
+            .and_then(|v| if v.is_null() { None } else { Some(v.clone()) }),
+        old_image: v
+            .get("old_image")
+            .and_then(|v| if v.is_null() { None } else { Some(v.clone()) }),
     }
 }

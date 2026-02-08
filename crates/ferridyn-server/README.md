@@ -31,6 +31,9 @@ JSON-over-newlines on Unix domain socket. Each request is one JSON line, each re
 {"op":"create_index","table":"data","name":"email-idx","partition_schema":"CONTACT","index_key":{"name":"email","type":"String"}}
 {"op":"create_index","table":"data","name":"status-idx","index_key":{"name":"status","type":"String"}}
 {"op":"create_index","table":"data","name":"age-status-idx","index_key":{"name":"status","type":"String"},"index_sort_key":{"name":"age","type":"Number"}}
+{"op":"create_index","table":"data","name":"email-proj-idx","partition_schema":"CONTACT","index_key":{"name":"email","type":"String"},"projection_type":"INCLUDE","projection_attributes":["name","phone"]}
+{"op":"create_index","table":"data","name":"status-all-idx","index_key":{"name":"status","type":"String"},"projection_type":"ALL"}
+{"op":"create_index","table":"orders","name":"ts-idx","index_sort_key":{"name":"timestamp","type":"Number"},"is_local":true}
 {"op":"query_index","table":"data","index_name":"status-idx","key_value":"active"}
 {"op":"query_index","table":"data","index_name":"age-status-idx","key_value":"active","sort_key_condition":{"Between":[25,50]}}
 {"op":"query_index","table":"data","index_name":"email-idx","key_value":"alice@example.com","projection":["name"]}
@@ -118,7 +121,7 @@ ferridyn-server [--db PATH] [--socket PATH]
 - **Stale socket cleanup**: Automatically removes socket file from crashed servers
 - **Version tracking**: Optimistic locking with version numbers for conditional updates
 - **Projection expressions**: Return only selected attributes from read operations (get, query, scan, batch_get, query_index)
-- **Secondary indexes**: Scoped (partition schema prefix) and global (table-wide) secondary indexes with composite keys (partition + sort), automatic backfill, sort key range conditions, and page reclamation on drop
+- **Secondary indexes**: Scoped (partition schema prefix), global (table-wide), and local (same partition key, alternate sort key) secondary indexes with composite keys (partition + sort), index projections (KEYS_ONLY, INCLUDE, ALL), automatic backfill, sort key range conditions, and page reclamation on drop
 
 ## Concurrency Model
 

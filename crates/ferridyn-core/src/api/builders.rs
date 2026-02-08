@@ -9,7 +9,8 @@ use crate::encoding::composite;
 use crate::error::{Error, QueryError, SchemaError, StorageError};
 use crate::mvcc::ops as mvcc_ops;
 use crate::types::{
-    AttrType, AttributeDef, KeyDefinition, KeyType, ReturnValues, TableSchema, VersionedItem,
+    AttrType, AttributeDef, IndexProjection, KeyDefinition, KeyType, ReturnValues, TableSchema,
+    VersionedItem,
 };
 
 use super::database::FerridynDB;
@@ -37,6 +38,7 @@ pub struct TableBuilder<'a> {
     partition_key: Option<(String, KeyType)>,
     sort_key: Option<(String, KeyType)>,
     ttl_attribute: Option<String>,
+    stream_view_type: Option<crate::stream::StreamViewType>,
 }
 
 impl<'a> TableBuilder<'a> {
@@ -47,6 +49,7 @@ impl<'a> TableBuilder<'a> {
             partition_key: None,
             sort_key: None,
             ttl_attribute: None,
+            stream_view_type: None,
         }
     }
 
@@ -69,10 +72,17 @@ impl<'a> TableBuilder<'a> {
         self
     }
 
+    /// Enable a change stream on the table with the given view type.
+    pub fn stream(mut self, view_type: crate::stream::StreamViewType) -> Self {
+        self.stream_view_type = Some(view_type);
+        self
+    }
+
     /// Execute the table creation.
     pub fn execute(self) -> Result<(), Error> {
         let (pk_name, pk_type) = self.partition_key.ok_or(QueryError::PartitionKeyRequired)?;
 
+        let table_name = self.name.clone();
         let schema = TableSchema {
             name: self.name,
             partition_key: KeyDefinition {
@@ -85,10 +95,21 @@ impl<'a> TableBuilder<'a> {
             ttl_attribute: self.ttl_attribute,
         };
 
+        let stream_view_type = self.stream_view_type;
         self.db.transact(move |txn| {
             let (new_root, _entry) =
                 catalog::ops::create_table(&mut txn.store, txn.catalog_root, schema)?;
             txn.catalog_root = new_root;
+
+            if let Some(view_type) = stream_view_type {
+                txn.catalog_root = catalog::ops::enable_stream(
+                    &mut txn.store,
+                    txn.catalog_root,
+                    &table_name,
+                    view_type,
+                )?;
+            }
+
             Ok(())
         })
     }
@@ -1436,10 +1457,21 @@ impl<'a> IndexQueryBuilder<'a> {
                 end_key.as_deref(),
             )?;
 
+            // Determine if the index projection covers this query, allowing
+            // us to skip the primary table fetch and read directly from the
+            // index entry value.
+            let use_projection = index_covers_query(
+                &index.projection,
+                &self.projection,
+                &self.filter,
+                &key_attrs,
+                index,
+            );
+
             // Collect results by looking up each primary document via MVCC.
             // Track index key bytes alongside documents for cursor building.
             let mut items: Vec<(Vec<u8>, Value)> = Vec::new();
-            for (index_key, _empty_val) in &index_entries {
+            for (index_key, index_value) in &index_entries {
                 // Skip items based on exclusive_start_key (direction-aware).
                 // Forward: skip items already seen (key <= cursor).
                 // Reverse: skip items already seen (key >= cursor).
@@ -1451,6 +1483,20 @@ impl<'a> IndexQueryBuilder<'a> {
                     } else if *index_key >= *sk {
                         continue;
                     }
+                }
+
+                // Try to serve from the index projection value directly.
+                if use_projection && !index_value.is_empty() {
+                    let val: Value = rmp_serde::from_slice(index_value).map_err(|e| {
+                        StorageError::CorruptedPage(format!(
+                            "failed to deserialize index projection value: {e}"
+                        ))
+                    })?;
+                    if is_ttl_expired(&val, &entry.schema) {
+                        continue;
+                    }
+                    items.push((index_key.clone(), val));
+                    continue;
                 }
 
                 // Decode the primary composite key bytes from the index entry.
@@ -1640,6 +1686,8 @@ pub struct CreateIndexBuilder<'a> {
     partition_schema: Option<String>,
     index_key: Option<(String, KeyType)>,
     index_sort_key: Option<(String, KeyType)>,
+    projection: IndexProjection,
+    is_local: bool,
 }
 
 impl<'a> CreateIndexBuilder<'a> {
@@ -1651,6 +1699,8 @@ impl<'a> CreateIndexBuilder<'a> {
             partition_schema: None,
             index_key: None,
             index_sort_key: None,
+            projection: IndexProjection::KeysOnly,
+            is_local: false,
         }
     }
 
@@ -1678,22 +1728,63 @@ impl<'a> CreateIndexBuilder<'a> {
         self
     }
 
+    /// Set the index projection type. Controls what attributes are stored in
+    /// the index entry value. Defaults to `KeysOnly` (empty value, always
+    /// fetch from primary table).
+    pub fn projection_type(mut self, p: IndexProjection) -> Self {
+        self.projection = p;
+        self
+    }
+
+    /// Mark this as a local secondary index. The index partition key is
+    /// automatically set to the table's partition key. Only `.index_sort_key()`
+    /// is required — it becomes the alternate sort key for the LSI.
+    pub fn local(mut self) -> Self {
+        self.is_local = true;
+        self
+    }
+
     /// Execute the index creation (with synchronous backfill).
     pub fn execute(self) -> Result<(), Error> {
         let name = self.name.ok_or(QueryError::InvalidCondition(
             "index name required".to_string(),
         ))?;
         let partition_schema = self.partition_schema;
-        let (attr_name, key_type) = self.index_key.ok_or(QueryError::IndexKeyRequired)?;
+        let is_local = self.is_local;
 
-        let key_def = KeyDefinition {
-            name: attr_name,
-            key_type,
+        let (key_def, sort_key_def) = if is_local {
+            // LSI: auto-infer index_key from the table's partition key.
+            let table_schema = self.db.describe_table(&self.table)?;
+            if table_schema.sort_key.is_none() {
+                return Err(QueryError::InvalidCondition(
+                    "local secondary index requires a table with a sort key".to_string(),
+                )
+                .into());
+            }
+            let (sk_name, sk_type) = self.index_sort_key.ok_or(QueryError::InvalidCondition(
+                "local secondary index requires index_sort_key".to_string(),
+            ))?;
+            (
+                table_schema.partition_key,
+                Some(KeyDefinition {
+                    name: sk_name,
+                    key_type: sk_type,
+                }),
+            )
+        } else {
+            let (attr_name, key_type) = self.index_key.ok_or(QueryError::IndexKeyRequired)?;
+            let key_def = KeyDefinition {
+                name: attr_name,
+                key_type,
+            };
+            let sort_key_def = self
+                .index_sort_key
+                .map(|(name, key_type)| KeyDefinition { name, key_type });
+            (key_def, sort_key_def)
         };
-        let sort_key_def = self
-            .index_sort_key
-            .map(|(name, key_type)| KeyDefinition { name, key_type });
+
         let table = self.table;
+        let projection = self.projection;
 
         self.db.transact(move |txn| {
             let new_root = catalog::ops::create_index(
@@ -1704,6 +1795,8 @@ impl<'a> CreateIndexBuilder<'a> {
                 partition_schema,
                 key_def,
                 sort_key_def,
+                projection,
+                is_local,
                 txn.txn_id,
             )?;
             txn.catalog_root = new_root;
@@ -1715,6 +1808,66 @@ impl<'a> CreateIndexBuilder<'a> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+use crate::types::IndexDefinition;
+
+/// Determine whether the index projection covers the query, allowing the
+/// query to skip the primary table fetch and read directly from the index
+/// entry value.
+///
+/// Returns `true` when:
+/// - `All` projection — always covered (full document in index value).
+/// - `Include(stored)` — covered only when: (1) no filter expression, AND
+///   (2) query projection is non-empty, AND (3) every requested attribute is
+///   either a key attribute or in the stored set.
+/// - `KeysOnly` — never covered.
+fn index_covers_query(
+    index_projection: &IndexProjection,
+    query_projection: &[String],
+    filter: &Option<FilterExpr>,
+    key_attrs: &[&str],
+    index: &IndexDefinition,
+) -> bool {
+    match index_projection {
+        IndexProjection::All => true,
+        IndexProjection::KeysOnly => false,
+        IndexProjection::Include(stored_attrs) => {
+            // A filter may reference attributes not stored in the projection,
+            // so fall back to the primary table when a filter is present.
+            if filter.is_some() {
+                return false;
+            }
+            // If the caller wants the full document (empty projection list),
+            // we cannot guarantee all attributes are stored.
+            if query_projection.is_empty() {
+                return false;
+            }
+            // Build the set of available attributes: key attrs + index key
+            // attrs + stored attrs.
+            let idx_key_name = &index.index_key.name;
+            let idx_sk_name = index.index_sort_key.as_ref().map(|k| k.name.as_str());
+
+            for attr in query_projection {
+                let attr_s = attr.as_str();
+                if key_attrs.contains(&attr_s) {
+                    continue;
+                }
+                if attr_s == idx_key_name {
+                    continue;
+                }
+                if idx_sk_name == Some(attr_s) {
+                    continue;
+                }
+                if stored_attrs.iter().any(|s| s == attr) {
+                    continue;
+                }
+                // Requested attribute is not available in the projection.
+                return false;
+            }
+            true
+        }
+    }
+}
 
 /// Encode the exclusive_start_key JSON object into composite key bytes.
 fn encode_exclusive_start_key(esk: &Value, schema: &TableSchema) -> Result<Vec<u8>, Error> {
@@ -1951,4 +2104,63 @@ fn collect_key_attrs(schema: &TableSchema) -> Vec<&str> {
         attrs.push(sk.name.as_str());
     }
     attrs
+}
+
+// ---------------------------------------------------------------------------
+// GetStreamRecordsBuilder
+// ---------------------------------------------------------------------------
+
+/// Builder for querying change stream records from a table.
+pub struct GetStreamRecordsBuilder<'a> {
+    db: &'a FerridynDB,
+    table: String,
+    after_sequence: Option<u64>,
+    limit: usize,
+}
+
+impl<'a> GetStreamRecordsBuilder<'a> {
+    pub(crate) fn new(db: &'a FerridynDB, table: String) -> Self {
+        Self {
+            db,
+            table,
+            after_sequence: None,
+            limit: 100,
+        }
+    }
+
+    /// Only return records with sequence_number > this value.
+    pub fn after_sequence(mut self, seq: u64) -> Self {
+        self.after_sequence = Some(seq);
+        self
+    }
+
+    /// Maximum number of records to return (default: 100).
+    pub fn limit(mut self, n: usize) -> Self {
+        self.limit = n;
+        self
+    }
+
+    /// Execute the stream query.
+    pub fn execute(self) -> Result<Vec<crate::stream::StreamRecord>, Error> {
+        self.db.read_snapshot(|store, catalog_root, _snapshot_txn| {
+            let entry = self.db.cached_get_table(store, catalog_root, &self.table)?;
+
+            let config = entry
+                .stream_config
+                .as_ref()
+                .ok_or_else(|| SchemaError::StreamNotEnabled(self.table.clone()))?;
+            let _ = config;
+
+            let stream_root = entry
+                .stream_root_page
+                .ok_or_else(|| SchemaError::StreamNotEnabled(self.table.clone()))?;
+
+            crate::stream::ops::get_stream_records(
+                store,
+                stream_root,
+                self.after_sequence,
+                self.limit,
+            )
+        })
+    }
 }

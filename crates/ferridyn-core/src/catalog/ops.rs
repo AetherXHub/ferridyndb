@@ -8,7 +8,9 @@ use crate::btree::PageStore;
 use crate::btree::ops;
 use crate::encoding::string::encode_string;
 use crate::error::{Error, SchemaError, StorageError};
-use crate::types::{IndexDefinition, KeyDefinition, PageId, PartitionSchema, TableSchema, TxnId};
+use crate::types::{
+    IndexDefinition, IndexProjection, KeyDefinition, PageId, PartitionSchema, TableSchema, TxnId,
+};
 
 use super::CatalogEntry;
 
@@ -40,6 +42,8 @@ pub fn create_table(
         data_root_page,
         partition_schemas: Vec::new(),
         indexes: Vec::new(),
+        stream_config: None,
+        stream_root_page: None,
     };
 
     let json_bytes = serde_json::to_vec(&entry).map_err(|e| {
@@ -207,6 +211,8 @@ pub fn create_index(
     partition_schema: Option<String>,
     index_key: KeyDefinition,
     index_sort_key: Option<KeyDefinition>,
+    projection: IndexProjection,
+    is_local: bool,
     txn_id: TxnId,
 ) -> Result<PageId, Error> {
     use crate::api::key_utils;
@@ -238,6 +244,8 @@ pub fn create_index(
         partition_schema: partition_schema.clone(),
         index_key,
         index_sort_key,
+        projection,
+        is_local,
         root_page: index_root,
     };
 
@@ -261,9 +269,15 @@ pub fn create_index(
             StorageError::CorruptedPage(format!("failed to deserialize document: {e}"))
         })?;
 
-        // Build the index key.
+        // Build the index key and value.
         if let Some(idx_key) = key_utils::build_index_key(&index_def, &doc, &entry.schema)? {
-            index_root = ops::insert(store, index_root, &idx_key, &[])?;
+            let idx_value = key_utils::build_index_value(
+                &index_def.projection,
+                &doc,
+                &entry.schema,
+                &index_def,
+            )?;
+            index_root = ops::insert(store, index_root, &idx_key, &idx_value)?;
         }
     }
 
@@ -306,6 +320,69 @@ pub fn drop_index(
     ops::free_tree(store, index_root)?;
 
     entry.indexes.remove(idx_pos);
+
+    let json_bytes = serde_json::to_vec(&entry).map_err(|e| {
+        StorageError::CorruptedPage(format!("failed to serialize catalog entry: {e}"))
+    })?;
+    let encoded_name = encode_string(table_name);
+    let new_catalog_root = ops::insert(store, catalog_root, &encoded_name, &json_bytes)?;
+
+    Ok(new_catalog_root)
+}
+
+/// Enable a change stream on a table.
+///
+/// Allocates a new empty B+Tree for the stream data and stores the
+/// configuration in the catalog entry. Returns the new catalog root.
+pub fn enable_stream(
+    store: &mut impl PageStore,
+    catalog_root: PageId,
+    table_name: &str,
+    view_type: crate::stream::StreamViewType,
+) -> Result<PageId, Error> {
+    let mut entry = get_table(store, catalog_root, table_name)?;
+
+    if entry.stream_config.as_ref().is_some_and(|c| c.enabled) {
+        return Err(SchemaError::StreamAlreadyEnabled(table_name.to_string()).into());
+    }
+
+    let stream_root = ops::create_tree(store)?;
+    entry.stream_config = Some(crate::stream::StreamConfig {
+        view_type,
+        enabled: true,
+        max_age_secs: None,
+        max_count: None,
+    });
+    entry.stream_root_page = Some(stream_root);
+
+    let json_bytes = serde_json::to_vec(&entry).map_err(|e| {
+        StorageError::CorruptedPage(format!("failed to serialize catalog entry: {e}"))
+    })?;
+    let encoded_name = encode_string(table_name);
+    let new_catalog_root = ops::insert(store, catalog_root, &encoded_name, &json_bytes)?;
+
+    Ok(new_catalog_root)
+}
+
+/// Disable a change stream on a table.
+///
+/// Sets `enabled = false` but preserves existing stream records for later
+/// querying or pruning.
+pub fn disable_stream(
+    store: &mut impl PageStore,
+    catalog_root: PageId,
+    table_name: &str,
+) -> Result<PageId, Error> {
+    let mut entry = get_table(store, catalog_root, table_name)?;
+
+    match entry.stream_config.as_mut() {
+        Some(config) if config.enabled => {
+            config.enabled = false;
+        }
+        _ => {
+            return Err(SchemaError::StreamNotEnabled(table_name.to_string()).into());
+        }
+    }
 
     let json_bytes = serde_json::to_vec(&entry).map_err(|e| {
         StorageError::CorruptedPage(format!("failed to serialize catalog entry: {e}"))
@@ -642,6 +719,8 @@ mod tests {
                 key_type: KeyType::String,
             },
             None,
+            IndexProjection::KeysOnly,
+            false,
             1,
         )
         .unwrap();
@@ -678,6 +757,8 @@ mod tests {
                 key_type: KeyType::String,
             },
             None,
+            IndexProjection::KeysOnly,
+            false,
             1,
         )
         .unwrap();
@@ -713,6 +794,8 @@ mod tests {
                 key_type: KeyType::String,
             },
             None,
+            IndexProjection::KeysOnly,
+            false,
             1,
         )
         .unwrap();
@@ -728,6 +811,8 @@ mod tests {
                 key_type: KeyType::String,
             },
             None,
+            IndexProjection::KeysOnly,
+            false,
             1,
         );
         assert!(result.is_err());
@@ -751,6 +836,8 @@ mod tests {
                 key_type: KeyType::String,
             },
             None,
+            IndexProjection::KeysOnly,
+            false,
             1,
         );
         assert!(result.is_err());
@@ -816,6 +903,8 @@ mod tests {
                 key_type: KeyType::String,
             },
             None,
+            IndexProjection::KeysOnly,
+            false,
             4,
         )
         .unwrap();
@@ -882,6 +971,8 @@ mod tests {
                 key_type: KeyType::String,
             },
             None,
+            IndexProjection::KeysOnly,
+            false,
             3,
         )
         .unwrap();
@@ -917,6 +1008,8 @@ mod tests {
                 key_type: KeyType::String,
             },
             None,
+            IndexProjection::KeysOnly,
+            false,
             1,
         )
         .unwrap();

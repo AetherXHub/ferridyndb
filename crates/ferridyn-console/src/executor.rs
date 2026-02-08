@@ -396,8 +396,11 @@ fn exec_create_index(
         table,
         name,
         Some(schema_prefix),
-        key_attr,
-        key_type_to_str(key_type),
+        Some(key_attr),
+        Some(key_type_to_str(key_type)),
+        None,
+        None,
+        None,
         None,
         None,
     ))?;

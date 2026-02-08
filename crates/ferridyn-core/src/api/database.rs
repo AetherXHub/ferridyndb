@@ -22,7 +22,7 @@ use crate::types::{IndexDefinition, PAGE_SIZE, PageId, PartitionSchema};
 use super::batch::{SyncMode, WriteBatch};
 use super::builders::{
     BatchGetItemBuilder, CreateIndexBuilder, DeleteItemBuilder, GetItemBuilder,
-    GetItemVersionedBuilder, IndexQueryBuilder, ListPartitionKeysBuilder,
+    GetItemVersionedBuilder, GetStreamRecordsBuilder, IndexQueryBuilder, ListPartitionKeysBuilder,
     ListSortKeyPrefixesBuilder, PartitionSchemaBuilder, PutItemBuilder, QueryBuilder, ScanBuilder,
     TableBuilder, UpdateItemBuilder,
 };
@@ -414,6 +414,97 @@ impl FerridynDB {
             .ok_or_else(|| SchemaError::IndexNotFound(index_name.to_string()).into())
     }
 
+    // -----------------------------------------------------------------------
+    // Stream management
+    // -----------------------------------------------------------------------
+
+    /// Enable a change stream on a table.
+    pub fn enable_stream(
+        &self,
+        table: &str,
+        view_type: crate::stream::StreamViewType,
+    ) -> Result<(), Error> {
+        let table = table.to_string();
+        self.transact(move |txn| {
+            txn.catalog_root = catalog::ops::enable_stream(
+                &mut txn.store,
+                txn.catalog_root,
+                &table,
+                view_type,
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Disable a change stream on a table (preserves existing records).
+    pub fn disable_stream(&self, table: &str) -> Result<(), Error> {
+        let table = table.to_string();
+        self.transact(move |txn| {
+            txn.catalog_root =
+                catalog::ops::disable_stream(&mut txn.store, txn.catalog_root, &table)?;
+            Ok(())
+        })
+    }
+
+    /// Query change stream records from a table.
+    pub fn get_stream_records(&self, table: &str) -> GetStreamRecordsBuilder<'_> {
+        GetStreamRecordsBuilder::new(self, table.to_string())
+    }
+
+    /// Get summary information about a table's change stream.
+    pub fn get_stream_info(&self, table: &str) -> Result<crate::stream::StreamInfo, Error> {
+        self.read_snapshot(|store, catalog_root, _snapshot_txn| {
+            let entry = self.cached_get_table(store, catalog_root, table)?;
+            let config = entry
+                .stream_config
+                .as_ref()
+                .ok_or_else(|| SchemaError::StreamNotEnabled(table.to_string()))?;
+            let stream_root = entry
+                .stream_root_page
+                .ok_or_else(|| SchemaError::StreamNotEnabled(table.to_string()))?;
+            crate::stream::ops::get_stream_info(store, stream_root, config)
+        })
+    }
+
+    /// Prune old stream records based on retention settings.
+    pub fn prune_stream(&self, table: &str) -> Result<usize, Error> {
+        let table = table.to_string();
+        self.transact(move |txn| {
+            let entry = catalog::ops::get_table(&txn.store, txn.catalog_root, &table)?;
+            let config = entry
+                .stream_config
+                .as_ref()
+                .ok_or_else(|| SchemaError::StreamNotEnabled(table.clone()))?;
+            let stream_root = entry
+                .stream_root_page
+                .ok_or_else(|| SchemaError::StreamNotEnabled(table.clone()))?;
+
+            let (new_root, pruned) = crate::stream::ops::prune_stream(
+                &mut txn.store,
+                stream_root,
+                config.max_age_secs,
+                config.max_count,
+            )?;
+
+            if new_root != stream_root {
+                let mut updated = entry.clone();
+                updated.stream_root_page = Some(new_root);
+                let json_bytes = serde_json::to_vec(&updated).map_err(|e| {
+                    StorageError::CorruptedPage(format!("failed to serialize catalog entry: {e}"))
+                })?;
+                let encoded_name = crate::encoding::string::encode_string(&table);
+                txn.catalog_root = crate::btree::ops::insert(
+                    &mut txn.store,
+                    txn.catalog_root,
+                    &encoded_name,
+                    &json_bytes,
+                )?;
+            }
+
+            Ok(pruned)
+        })
+    }
+
     /// Create a new write batch for batching multiple operations.
     ///
     /// All queued operations are committed in a single transaction
@@ -544,6 +635,7 @@ impl FerridynDB {
             catalog_root,
             txn_id: new_txn_id,
             tombstones: Vec::new(),
+            stream_sub_seq: 0,
         };
 
         let result = f(&mut txn);
@@ -590,6 +682,7 @@ impl FerridynDB {
             catalog_root,
             txn_id,
             tombstones,
+            stream_sub_seq: _,
         } = txn;
 
         // Record COW-replaced original pages in the pending free list so they
@@ -7166,5 +7259,1280 @@ mod global_index_tests {
             .execute()
             .unwrap();
         assert_eq!(result.items.len(), 1); // only 20.0
+    }
+
+    #[test]
+    fn test_index_projection_keys_only() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_partition_schema("data")
+            .prefix("CONTACT")
+            .description("People")
+            .execute()
+            .unwrap();
+
+        // Create index without projection_type (defaults to KeysOnly).
+        db.create_index("data")
+            .name("email-idx")
+            .partition_schema("CONTACT")
+            .index_key("email", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put_item(
+            "data",
+            json!({"pk": "CONTACT#1", "email": "alice@ex.com", "name": "Alice", "age": 30}),
+        )
+        .unwrap();
+
+        let result = db
+            .query_index("data", "email-idx")
+            .key_value("alice@ex.com")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["pk"], "CONTACT#1");
+        assert_eq!(result.items[0]["email"], "alice@ex.com");
+        assert_eq!(result.items[0]["name"], "Alice");
+        assert_eq!(result.items[0]["age"], 30);
+    }
+
+    #[test]
+    fn test_index_projection_include() {
+        use crate::types::IndexProjection;
+
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_partition_schema("data")
+            .prefix("CONTACT")
+            .description("People")
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("email-idx")
+            .partition_schema("CONTACT")
+            .index_key("email", KeyType::String)
+            .projection_type(IndexProjection::Include(vec![
+                "email".to_string(),
+                "name".to_string(),
+            ]))
+            .execute()
+            .unwrap();
+
+        db.put_item(
+            "data",
+            json!({"pk": "CONTACT#1", "email": "alice@ex.com", "name": "Alice", "age": 30}),
+        )
+        .unwrap();
+
+        // Query with projection of included attrs (covered query).
+        let result = db
+            .query_index("data", "email-idx")
+            .key_value("alice@ex.com")
+            .projection(&["email", "name"])
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["email"], "alice@ex.com");
+        assert_eq!(result.items[0]["name"], "Alice");
+        assert_eq!(result.items[0].get("age"), None);
+
+        // Query with projection including uncovered attr (falls back to primary).
+        let result = db
+            .query_index("data", "email-idx")
+            .key_value("alice@ex.com")
+            .projection(&["email", "name", "age"])
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["email"], "alice@ex.com");
+        assert_eq!(result.items[0]["name"], "Alice");
+        assert_eq!(result.items[0]["age"], 30);
+    }
+
+    #[test]
+    fn test_index_projection_all() {
+        use crate::types::IndexProjection;
+
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_partition_schema("data")
+            .prefix("CONTACT")
+            .description("People")
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("email-idx")
+            .partition_schema("CONTACT")
+            .index_key("email", KeyType::String)
+            .projection_type(IndexProjection::All)
+            .execute()
+            .unwrap();
+
+        db.put_item(
+            "data",
+            json!({"pk": "CONTACT#1", "email": "alice@ex.com", "name": "Alice", "age": 30, "city": "NYC"}),
+        )
+        .unwrap();
+
+        let result = db
+            .query_index("data", "email-idx")
+            .key_value("alice@ex.com")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["pk"], "CONTACT#1");
+        assert_eq!(result.items[0]["email"], "alice@ex.com");
+        assert_eq!(result.items[0]["name"], "Alice");
+        assert_eq!(result.items[0]["age"], 30);
+        assert_eq!(result.items[0]["city"], "NYC");
+    }
+
+    #[test]
+    fn test_index_projection_all_updates_on_any_change() {
+        use crate::types::IndexProjection;
+
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_partition_schema("data")
+            .prefix("CONTACT")
+            .description("People")
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("email-idx")
+            .partition_schema("CONTACT")
+            .index_key("email", KeyType::String)
+            .projection_type(IndexProjection::All)
+            .execute()
+            .unwrap();
+
+        db.put_item(
+            "data",
+            json!({"pk": "CONTACT#1", "email": "alice@ex.com", "name": "Alice", "age": 30}),
+        )
+        .unwrap();
+
+        // Update a non-indexed attribute.
+        db.update_item("data")
+            .partition_key("CONTACT#1")
+            .set("age", json!(31))
+            .execute()
+            .unwrap();
+
+        let result = db
+            .query_index("data", "email-idx")
+            .key_value("alice@ex.com")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["age"], 31);
+    }
+
+    #[test]
+    fn test_index_projection_include_backfill() {
+        use crate::types::IndexProjection;
+
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_partition_schema("data")
+            .prefix("CONTACT")
+            .description("People")
+            .execute()
+            .unwrap();
+
+        // Insert items BEFORE creating the index.
+        db.put_item(
+            "data",
+            json!({"pk": "CONTACT#1", "email": "alice@ex.com", "name": "Alice", "age": 30}),
+        )
+        .unwrap();
+        db.put_item(
+            "data",
+            json!({"pk": "CONTACT#2", "email": "bob@ex.com", "name": "Bob", "age": 25}),
+        )
+        .unwrap();
+
+        // Now create index with Include projection.
+        db.create_index("data")
+            .name("email-idx")
+            .partition_schema("CONTACT")
+            .index_key("email", KeyType::String)
+            .projection_type(IndexProjection::Include(vec![
+                "email".to_string(),
+                "name".to_string(),
+            ]))
+            .execute()
+            .unwrap();
+
+        let result = db
+            .query_index("data", "email-idx")
+            .key_value("alice@ex.com")
+            .projection(&["email", "name"])
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["email"], "alice@ex.com");
+        assert_eq!(result.items[0]["name"], "Alice");
+    }
+
+    #[test]
+    fn test_index_projection_with_filter_falls_back() {
+        use crate::api::filter::FilterExpr;
+        use crate::types::IndexProjection;
+
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_partition_schema("data")
+            .prefix("CONTACT")
+            .description("People")
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("email-idx")
+            .partition_schema("CONTACT")
+            .index_key("email", KeyType::String)
+            .projection_type(IndexProjection::Include(vec![
+                "email".to_string(),
+                "name".to_string(),
+            ]))
+            .execute()
+            .unwrap();
+
+        db.put_item(
+            "data",
+            json!({"pk": "CONTACT#1", "email": "alice@ex.com", "name": "Alice", "age": 30}),
+        )
+        .unwrap();
+        db.put_item(
+            "data",
+            json!({"pk": "CONTACT#2", "email": "bob@ex.com", "name": "Bob", "age": 25}),
+        )
+        .unwrap();
+
+        // Query with a filter expression — should still work (falls back to primary table fetch).
+        let result = db
+            .query_index("data", "email-idx")
+            .key_value("alice@ex.com")
+            .filter(FilterExpr::Eq(
+                Box::new(FilterExpr::Attr("name".to_string())),
+                Box::new(FilterExpr::Literal(json!("Alice"))),
+            ))
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["name"], "Alice");
+    }
+
+    #[test]
+    fn test_index_projection_include_with_composite_key() {
+        use crate::types::IndexProjection;
+
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .sort_key("sk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_partition_schema("data")
+            .prefix("CONTACT")
+            .description("People")
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("email-status-idx")
+            .partition_schema("CONTACT")
+            .index_key("email", KeyType::String)
+            .index_sort_key("status", KeyType::String)
+            .projection_type(IndexProjection::Include(vec![
+                "email".to_string(),
+                "status".to_string(),
+                "name".to_string(),
+            ]))
+            .execute()
+            .unwrap();
+
+        db.put_item(
+            "data",
+            json!({"pk": "CONTACT#1", "sk": "v1", "email": "alice@ex.com", "status": "active", "name": "Alice", "age": 30}),
+        )
+        .unwrap();
+
+        let result = db
+            .query_index("data", "email-status-idx")
+            .key_value("alice@ex.com")
+            .sort_key_eq(json!("active"))
+            .projection(&["email", "name"])
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["email"], "alice@ex.com");
+        assert_eq!(result.items[0]["name"], "Alice");
+    }
+
+    #[test]
+    fn test_index_projection_backward_compatible() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_partition_schema("data")
+            .prefix("CONTACT")
+            .description("People")
+            .execute()
+            .unwrap();
+
+        // Create index without projection_type (defaults to KeysOnly).
+        db.create_index("data")
+            .name("email-idx")
+            .partition_schema("CONTACT")
+            .index_key("email", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put_item(
+            "data",
+            json!({"pk": "CONTACT#1", "email": "alice@ex.com", "name": "Alice"}),
+        )
+        .unwrap();
+        db.put_item(
+            "data",
+            json!({"pk": "CONTACT#2", "email": "bob@ex.com", "name": "Bob"}),
+        )
+        .unwrap();
+
+        let result = db
+            .query_index("data", "email-idx")
+            .key_value("alice@ex.com")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["pk"], "CONTACT#1");
+        assert_eq!(result.items[0]["email"], "alice@ex.com");
+        assert_eq!(result.items[0]["name"], "Alice");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Local secondary index tests (PRD-09, Phase 4)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod local_index_tests {
+    use super::*;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    use crate::types::{IndexProjection, KeyType};
+
+    fn create_test_db() -> (FerridynDB, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = FerridynDB::create(&db_path).unwrap();
+        (db, dir)
+    }
+
+    #[test]
+    fn test_local_index_create() {
+        let (db, _dir) = create_test_db();
+        db.create_table("orders")
+            .partition_key("pk", KeyType::String)
+            .sort_key("sk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_index("orders")
+            .name("timestamp-idx")
+            .local()
+            .index_sort_key("timestamp", KeyType::Number)
+            .execute()
+            .unwrap();
+
+        let indexes = db.list_indexes("orders").unwrap();
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes[0].name, "timestamp-idx");
+        assert!(indexes[0].is_local);
+        // index_key should be auto-set to the table's partition key.
+        assert_eq!(indexes[0].index_key.name, "pk");
+        assert_eq!(indexes[0].index_key.key_type, KeyType::String);
+        assert!(indexes[0].index_sort_key.is_some());
+        let sk = indexes[0].index_sort_key.as_ref().unwrap();
+        assert_eq!(sk.name, "timestamp");
+        assert_eq!(sk.key_type, KeyType::Number);
+    }
+
+    #[test]
+    fn test_local_index_create_requires_table_sort_key() {
+        let (db, _dir) = create_test_db();
+        // Table without a sort key.
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        let result = db
+            .create_index("data")
+            .name("ts-idx")
+            .local()
+            .index_sort_key("timestamp", KeyType::Number)
+            .execute();
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("sort key"),
+            "expected sort key error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_local_index_create_requires_index_sort_key() {
+        let (db, _dir) = create_test_db();
+        db.create_table("orders")
+            .partition_key("pk", KeyType::String)
+            .sort_key("sk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        // .local() without .index_sort_key() should fail.
+        let result = db.create_index("orders").name("bad-idx").local().execute();
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("index_sort_key"),
+            "expected index_sort_key error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_local_index_query() {
+        let (db, _dir) = create_test_db();
+        db.create_table("orders")
+            .partition_key("customer", KeyType::String)
+            .sort_key("order_id", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_index("orders")
+            .name("ts-idx")
+            .local()
+            .index_sort_key("timestamp", KeyType::Number)
+            .execute()
+            .unwrap();
+
+        // Insert orders for two customers.
+        db.put_item(
+            "orders",
+            json!({"customer": "alice", "order_id": "o1", "timestamp": 100.0, "total": 50.0}),
+        )
+        .unwrap();
+        db.put_item(
+            "orders",
+            json!({"customer": "alice", "order_id": "o2", "timestamp": 200.0, "total": 75.0}),
+        )
+        .unwrap();
+        db.put_item(
+            "orders",
+            json!({"customer": "alice", "order_id": "o3", "timestamp": 50.0, "total": 25.0}),
+        )
+        .unwrap();
+        db.put_item(
+            "orders",
+            json!({"customer": "bob", "order_id": "o4", "timestamp": 150.0, "total": 100.0}),
+        )
+        .unwrap();
+
+        // Query LSI with table pk value — should return alice's 3 orders sorted by timestamp.
+        let result = db
+            .query_index("orders", "ts-idx")
+            .key_value("alice")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 3);
+        // Should be sorted by timestamp ascending: 50, 100, 200.
+        assert_eq!(result.items[0]["timestamp"], 50.0);
+        assert_eq!(result.items[1]["timestamp"], 100.0);
+        assert_eq!(result.items[2]["timestamp"], 200.0);
+
+        // Bob should have 1 order.
+        let result = db
+            .query_index("orders", "ts-idx")
+            .key_value("bob")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["timestamp"], 150.0);
+    }
+
+    #[test]
+    fn test_local_index_range_scan() {
+        let (db, _dir) = create_test_db();
+        db.create_table("orders")
+            .partition_key("customer", KeyType::String)
+            .sort_key("order_id", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_index("orders")
+            .name("ts-idx")
+            .local()
+            .index_sort_key("timestamp", KeyType::Number)
+            .execute()
+            .unwrap();
+
+        for i in 1..=5 {
+            db.put_item(
+                "orders",
+                json!({
+                    "customer": "alice",
+                    "order_id": format!("o{i}"),
+                    "timestamp": (i as f64) * 100.0,
+                }),
+            )
+            .unwrap();
+        }
+
+        // Eq condition.
+        let result = db
+            .query_index("orders", "ts-idx")
+            .key_value("alice")
+            .sort_key_eq(json!(300.0))
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["order_id"], "o3");
+
+        // Between condition.
+        let result = db
+            .query_index("orders", "ts-idx")
+            .key_value("alice")
+            .sort_key_between(json!(150.0), json!(350.0))
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 2);
+        assert_eq!(result.items[0]["timestamp"], 200.0);
+        assert_eq!(result.items[1]["timestamp"], 300.0);
+
+        // Gt condition.
+        let result = db
+            .query_index("orders", "ts-idx")
+            .key_value("alice")
+            .sort_key_gt(json!(300.0))
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 2);
+        assert_eq!(result.items[0]["timestamp"], 400.0);
+        assert_eq!(result.items[1]["timestamp"], 500.0);
+    }
+
+    #[test]
+    fn test_local_index_with_projection() {
+        let (db, _dir) = create_test_db();
+        db.create_table("orders")
+            .partition_key("customer", KeyType::String)
+            .sort_key("order_id", KeyType::String)
+            .execute()
+            .unwrap();
+
+        // LSI with Include projection.
+        db.create_index("orders")
+            .name("ts-include-idx")
+            .local()
+            .index_sort_key("timestamp", KeyType::Number)
+            .projection_type(IndexProjection::Include(vec!["total".to_string()]))
+            .execute()
+            .unwrap();
+
+        db.put_item(
+            "orders",
+            json!({"customer": "alice", "order_id": "o1", "timestamp": 100.0, "total": 50.0, "notes": "first"}),
+        )
+        .unwrap();
+
+        // Covered query (requesting only projected attrs).
+        let result = db
+            .query_index("orders", "ts-include-idx")
+            .key_value("alice")
+            .projection(&["total"])
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["total"], 50.0);
+
+        // LSI with All projection.
+        db.create_index("orders")
+            .name("ts-all-idx")
+            .local()
+            .index_sort_key("timestamp", KeyType::Number)
+            .projection_type(IndexProjection::All)
+            .execute()
+            .unwrap();
+
+        let result = db
+            .query_index("orders", "ts-all-idx")
+            .key_value("alice")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["notes"], "first");
+    }
+
+    #[test]
+    fn test_local_index_backfill() {
+        let (db, _dir) = create_test_db();
+        db.create_table("orders")
+            .partition_key("customer", KeyType::String)
+            .sort_key("order_id", KeyType::String)
+            .execute()
+            .unwrap();
+
+        // Insert items BEFORE creating the LSI.
+        db.put_item(
+            "orders",
+            json!({"customer": "alice", "order_id": "o1", "timestamp": 100.0}),
+        )
+        .unwrap();
+        db.put_item(
+            "orders",
+            json!({"customer": "alice", "order_id": "o2", "timestamp": 200.0}),
+        )
+        .unwrap();
+        db.put_item(
+            "orders",
+            json!({"customer": "bob", "order_id": "o3", "timestamp": 50.0}),
+        )
+        .unwrap();
+
+        // Create LSI after data exists — should backfill.
+        db.create_index("orders")
+            .name("ts-idx")
+            .local()
+            .index_sort_key("timestamp", KeyType::Number)
+            .execute()
+            .unwrap();
+
+        let result = db
+            .query_index("orders", "ts-idx")
+            .key_value("alice")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 2);
+        assert_eq!(result.items[0]["timestamp"], 100.0);
+        assert_eq!(result.items[1]["timestamp"], 200.0);
+
+        let result = db
+            .query_index("orders", "ts-idx")
+            .key_value("bob")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+    }
+
+    #[test]
+    fn test_local_index_update_maintains_index() {
+        let (db, _dir) = create_test_db();
+        db.create_table("orders")
+            .partition_key("customer", KeyType::String)
+            .sort_key("order_id", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_index("orders")
+            .name("ts-idx")
+            .local()
+            .index_sort_key("timestamp", KeyType::Number)
+            .execute()
+            .unwrap();
+
+        db.put_item(
+            "orders",
+            json!({"customer": "alice", "order_id": "o1", "timestamp": 100.0}),
+        )
+        .unwrap();
+        db.put_item(
+            "orders",
+            json!({"customer": "alice", "order_id": "o2", "timestamp": 200.0}),
+        )
+        .unwrap();
+
+        // Verify initial state.
+        let result = db
+            .query_index("orders", "ts-idx")
+            .key_value("alice")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 2);
+
+        // Update timestamp on o1.
+        db.update_item("orders")
+            .partition_key(json!("alice"))
+            .sort_key(json!("o1"))
+            .set("timestamp", json!(300.0))
+            .execute()
+            .unwrap();
+
+        // o1 should now appear after o2 (timestamp 300 > 200).
+        let result = db
+            .query_index("orders", "ts-idx")
+            .key_value("alice")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 2);
+        assert_eq!(result.items[0]["timestamp"], 200.0);
+        assert_eq!(result.items[1]["timestamp"], 300.0);
+
+        // Delete o2.
+        db.delete_item("orders")
+            .partition_key(json!("alice"))
+            .sort_key(json!("o2"))
+            .execute()
+            .unwrap();
+
+        let result = db
+            .query_index("orders", "ts-idx")
+            .key_value("alice")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["timestamp"], 300.0);
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    use crate::stream::{EventType, StreamViewType};
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    fn create_test_db() -> (FerridynDB, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = FerridynDB::create(&db_path).unwrap();
+        (db, dir)
+    }
+
+    #[test]
+    fn test_stream_insert_event() {
+        let (db, _dir) = create_test_db();
+        db.create_table("users")
+            .partition_key("pk", crate::types::KeyType::String)
+            .stream(StreamViewType::KeysOnly)
+            .execute()
+            .unwrap();
+
+        db.put_item("users", json!({"pk": "alice", "name": "Alice"}))
+            .unwrap();
+
+        let records = db.get_stream_records("users").execute().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].event_type, EventType::Insert);
+        assert_eq!(records[0].keys["pk"], "alice");
+        assert!(records[0].new_image.is_none());
+        assert!(records[0].old_image.is_none());
+    }
+
+    #[test]
+    fn test_stream_modify_event() {
+        let (db, _dir) = create_test_db();
+        db.create_table("users")
+            .partition_key("pk", crate::types::KeyType::String)
+            .stream(StreamViewType::KeysOnly)
+            .execute()
+            .unwrap();
+
+        db.put_item("users", json!({"pk": "alice", "name": "Alice"}))
+            .unwrap();
+        db.put_item("users", json!({"pk": "alice", "name": "Alice Updated"}))
+            .unwrap();
+
+        let records = db.get_stream_records("users").execute().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].event_type, EventType::Insert);
+        assert_eq!(records[1].event_type, EventType::Modify);
+    }
+
+    #[test]
+    fn test_stream_remove_event() {
+        let (db, _dir) = create_test_db();
+        db.create_table("users")
+            .partition_key("pk", crate::types::KeyType::String)
+            .stream(StreamViewType::KeysOnly)
+            .execute()
+            .unwrap();
+
+        db.put_item("users", json!({"pk": "alice", "name": "Alice"}))
+            .unwrap();
+        db.delete_item("users")
+            .partition_key("alice")
+            .execute()
+            .unwrap();
+
+        let records = db.get_stream_records("users").execute().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].event_type, EventType::Insert);
+        assert_eq!(records[1].event_type, EventType::Remove);
+    }
+
+    #[test]
+    fn test_stream_sequence_ordering() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", crate::types::KeyType::String)
+            .stream(StreamViewType::KeysOnly)
+            .execute()
+            .unwrap();
+
+        for i in 0..5 {
+            db.put_item("items", json!({"pk": format!("item{i}"), "val": i}))
+                .unwrap();
+        }
+
+        let records = db.get_stream_records("items").execute().unwrap();
+        assert_eq!(records.len(), 5);
+
+        // Verify ordering: each record has increasing sequence_number.
+        for i in 1..records.len() {
+            assert!(
+                records[i].sequence_number >= records[i - 1].sequence_number,
+                "records should be ordered by sequence_number"
+            );
+        }
+    }
+
+    #[test]
+    fn test_stream_keys_only_view() {
+        let (db, _dir) = create_test_db();
+        db.create_table("users")
+            .partition_key("pk", crate::types::KeyType::String)
+            .stream(StreamViewType::KeysOnly)
+            .execute()
+            .unwrap();
+
+        db.put_item("users", json!({"pk": "alice", "name": "Alice", "age": 30}))
+            .unwrap();
+
+        let records = db.get_stream_records("users").execute().unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].new_image.is_none());
+        assert!(records[0].old_image.is_none());
+        // Keys should be present.
+        assert_eq!(records[0].keys["pk"], "alice");
+    }
+
+    #[test]
+    fn test_stream_disabled_no_records() {
+        let (db, _dir) = create_test_db();
+        // Create table WITHOUT a stream.
+        db.create_table("users")
+            .partition_key("pk", crate::types::KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put_item("users", json!({"pk": "alice", "name": "Alice"}))
+            .unwrap();
+
+        // Stream not enabled — should error.
+        let result = db.get_stream_records("users").execute();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_stream_after_sequence_pagination() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", crate::types::KeyType::String)
+            .stream(StreamViewType::KeysOnly)
+            .execute()
+            .unwrap();
+
+        for i in 0..5 {
+            db.put_item("items", json!({"pk": format!("item{i}")}))
+                .unwrap();
+        }
+
+        let all_records = db.get_stream_records("items").execute().unwrap();
+        assert_eq!(all_records.len(), 5);
+
+        // Get records after the 3rd one.
+        let seq = all_records[2].sequence_number;
+        let later = db
+            .get_stream_records("items")
+            .after_sequence(seq)
+            .execute()
+            .unwrap();
+
+        // Should get records 4 and 5 (after seq 3).
+        assert_eq!(later.len(), 2);
+        assert!(later[0].sequence_number > seq);
+    }
+
+    #[test]
+    fn test_stream_info() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", crate::types::KeyType::String)
+            .stream(StreamViewType::KeysOnly)
+            .execute()
+            .unwrap();
+
+        // Empty stream info.
+        let info = db.get_stream_info("items").unwrap();
+        assert!(info.enabled);
+        assert_eq!(info.view_type, StreamViewType::KeysOnly);
+        assert_eq!(info.record_count, 0);
+        assert!(info.oldest_sequence.is_none());
+        assert!(info.latest_sequence.is_none());
+
+        db.put_item("items", json!({"pk": "a"})).unwrap();
+        db.put_item("items", json!({"pk": "b"})).unwrap();
+
+        let info = db.get_stream_info("items").unwrap();
+        assert_eq!(info.record_count, 2);
+        assert!(info.oldest_sequence.is_some());
+        assert!(info.latest_sequence.is_some());
+    }
+
+    #[test]
+    fn test_stream_update_event() {
+        let (db, _dir) = create_test_db();
+        db.create_table("users")
+            .partition_key("pk", crate::types::KeyType::String)
+            .stream(StreamViewType::KeysOnly)
+            .execute()
+            .unwrap();
+
+        db.put_item("users", json!({"pk": "alice", "name": "Alice"}))
+            .unwrap();
+        db.update_item("users")
+            .partition_key("alice")
+            .set("name", "Alice Updated")
+            .execute()
+            .unwrap();
+
+        let records = db.get_stream_records("users").execute().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].event_type, EventType::Insert);
+        assert_eq!(records[1].event_type, EventType::Modify);
+    }
+
+    #[test]
+    fn test_stream_with_sort_key() {
+        let (db, _dir) = create_test_db();
+        db.create_table("events")
+            .partition_key("pk", crate::types::KeyType::String)
+            .sort_key("sk", crate::types::KeyType::Number)
+            .stream(StreamViewType::KeysOnly)
+            .execute()
+            .unwrap();
+
+        db.put_item("events", json!({"pk": "user1", "sk": 100.0, "data": "evt1"}))
+            .unwrap();
+
+        let records = db.get_stream_records("events").execute().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].keys["pk"], "user1");
+        assert_eq!(records[0].keys["sk"], 100.0);
+    }
+
+    // Phase 2: Full Image Views
+
+    #[test]
+    fn test_stream_new_image() {
+        let (db, _dir) = create_test_db();
+        db.create_table("users")
+            .partition_key("pk", crate::types::KeyType::String)
+            .stream(StreamViewType::NewImage)
+            .execute()
+            .unwrap();
+
+        db.put_item("users", json!({"pk": "alice", "name": "Alice"}))
+            .unwrap();
+
+        let records = db.get_stream_records("users").execute().unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].new_image.is_some());
+        assert_eq!(records[0].new_image.as_ref().unwrap()["name"], "Alice");
+        assert!(records[0].old_image.is_none());
+    }
+
+    #[test]
+    fn test_stream_old_image() {
+        let (db, _dir) = create_test_db();
+        db.create_table("users")
+            .partition_key("pk", crate::types::KeyType::String)
+            .stream(StreamViewType::OldImage)
+            .execute()
+            .unwrap();
+
+        db.put_item("users", json!({"pk": "alice", "name": "Alice"}))
+            .unwrap();
+        db.put_item("users", json!({"pk": "alice", "name": "Alice Updated"}))
+            .unwrap();
+
+        let records = db.get_stream_records("users").execute().unwrap();
+        assert_eq!(records.len(), 2);
+        // Insert has no old image.
+        assert!(records[0].old_image.is_none());
+        // Modify has old image.
+        assert!(records[1].old_image.is_some());
+        assert_eq!(records[1].old_image.as_ref().unwrap()["name"], "Alice");
+        assert!(records[1].new_image.is_none());
+    }
+
+    #[test]
+    fn test_stream_new_and_old_images() {
+        let (db, _dir) = create_test_db();
+        db.create_table("users")
+            .partition_key("pk", crate::types::KeyType::String)
+            .stream(StreamViewType::NewAndOldImages)
+            .execute()
+            .unwrap();
+
+        db.put_item("users", json!({"pk": "alice", "name": "Alice"}))
+            .unwrap();
+        db.put_item("users", json!({"pk": "alice", "name": "Alice Updated"}))
+            .unwrap();
+
+        let records = db.get_stream_records("users").execute().unwrap();
+        assert_eq!(records.len(), 2);
+        // Insert: new image = document, old image = None.
+        assert!(records[0].new_image.is_some());
+        assert!(records[0].old_image.is_none());
+        // Modify: both images present.
+        assert!(records[1].new_image.is_some());
+        assert!(records[1].old_image.is_some());
+        assert_eq!(records[1].old_image.as_ref().unwrap()["name"], "Alice");
+        assert_eq!(
+            records[1].new_image.as_ref().unwrap()["name"],
+            "Alice Updated"
+        );
+    }
+
+    #[test]
+    fn test_stream_modify_images_correct() {
+        let (db, _dir) = create_test_db();
+        db.create_table("users")
+            .partition_key("pk", crate::types::KeyType::String)
+            .stream(StreamViewType::NewAndOldImages)
+            .execute()
+            .unwrap();
+
+        db.put_item("users", json!({"pk": "alice", "age": 30}))
+            .unwrap();
+        db.update_item("users")
+            .partition_key("alice")
+            .set("age", 31)
+            .execute()
+            .unwrap();
+
+        let records = db.get_stream_records("users").execute().unwrap();
+        assert_eq!(records.len(), 2);
+        // The update record should capture old_image with age=30 and new_image with age=31.
+        let update_record = &records[1];
+        assert_eq!(update_record.event_type, EventType::Modify);
+        assert_eq!(update_record.old_image.as_ref().unwrap()["age"], 30);
+        assert_eq!(update_record.new_image.as_ref().unwrap()["age"], 31);
+    }
+
+    // Phase 3: Retention and Pruning
+
+    #[test]
+    fn test_stream_retention_max_count() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", crate::types::KeyType::String)
+            .stream(StreamViewType::KeysOnly)
+            .execute()
+            .unwrap();
+
+        // Insert 10 items.
+        for i in 0..10 {
+            db.put_item("items", json!({"pk": format!("item{i}")}))
+                .unwrap();
+        }
+
+        // Manually set max_count to 5 via a transact to update stream config.
+        db.transact(|txn| {
+            let mut entry =
+                crate::catalog::ops::get_table(&txn.store, txn.catalog_root, "items")?;
+            if let Some(ref mut config) = entry.stream_config {
+                config.max_count = Some(5);
+            }
+            let json_bytes = serde_json::to_vec(&entry).map_err(|e| {
+                crate::error::StorageError::CorruptedPage(format!(
+                    "failed to serialize catalog entry: {e}"
+                ))
+            })?;
+            let encoded_name = crate::encoding::string::encode_string("items");
+            txn.catalog_root =
+                crate::btree::ops::insert(&mut txn.store, txn.catalog_root, &encoded_name, &json_bytes)?;
+            Ok(())
+        })
+        .unwrap();
+
+        let pruned = db.prune_stream("items").unwrap();
+        assert_eq!(pruned, 5);
+
+        let records = db.get_stream_records("items").execute().unwrap();
+        assert_eq!(records.len(), 5);
+    }
+
+    #[test]
+    fn test_stream_enable_on_existing_table() {
+        let (db, _dir) = create_test_db();
+        db.create_table("users")
+            .partition_key("pk", crate::types::KeyType::String)
+            .execute()
+            .unwrap();
+
+        // Put item before enabling stream.
+        db.put_item("users", json!({"pk": "alice"})).unwrap();
+
+        // Enable stream.
+        db.enable_stream("users", StreamViewType::KeysOnly)
+            .unwrap();
+
+        // No records from before enabling.
+        let records = db.get_stream_records("users").execute().unwrap();
+        assert_eq!(records.len(), 0);
+
+        // New writes produce records.
+        db.put_item("users", json!({"pk": "bob"})).unwrap();
+        let records = db.get_stream_records("users").execute().unwrap();
+        assert_eq!(records.len(), 1);
+    }
+
+    #[test]
+    fn test_stream_disable_preserves_records() {
+        let (db, _dir) = create_test_db();
+        db.create_table("users")
+            .partition_key("pk", crate::types::KeyType::String)
+            .stream(StreamViewType::KeysOnly)
+            .execute()
+            .unwrap();
+
+        db.put_item("users", json!({"pk": "alice"})).unwrap();
+
+        // Disable stream.
+        db.disable_stream("users").unwrap();
+
+        // Records are still readable.
+        let records = db.get_stream_records("users").execute().unwrap();
+        assert_eq!(records.len(), 1);
+
+        // New writes should NOT produce records.
+        db.put_item("users", json!({"pk": "bob"})).unwrap();
+        let records = db.get_stream_records("users").execute().unwrap();
+        assert_eq!(records.len(), 1); // Still just the original one.
+    }
+
+    // Phase 5: Transaction and Batch Integration
+
+    #[test]
+    fn test_stream_transaction_multiple_records() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", crate::types::KeyType::String)
+            .stream(StreamViewType::KeysOnly)
+            .execute()
+            .unwrap();
+
+        // Multiple writes in a single transaction.
+        db.transact(|txn| {
+            txn.put_item("items", json!({"pk": "a"}), None)?;
+            txn.put_item("items", json!({"pk": "b"}), None)?;
+            txn.put_item("items", json!({"pk": "c"}), None)?;
+            Ok(())
+        })
+        .unwrap();
+
+        let records = db.get_stream_records("items").execute().unwrap();
+        assert_eq!(records.len(), 3);
+
+        // All should share the same txn_id (sequence_number).
+        assert_eq!(records[0].sequence_number, records[1].sequence_number);
+        assert_eq!(records[1].sequence_number, records[2].sequence_number);
+
+        // Sub-sequences should be distinct.
+        assert_eq!(records[0].sub_sequence, 0);
+        assert_eq!(records[1].sub_sequence, 1);
+        assert_eq!(records[2].sub_sequence, 2);
+    }
+
+    #[test]
+    fn test_stream_batch_write_records() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", crate::types::KeyType::String)
+            .stream(StreamViewType::KeysOnly)
+            .execute()
+            .unwrap();
+
+        // Batch write.
+        let mut batch = db.write_batch();
+        batch.put_item("items", json!({"pk": "x"}));
+        batch.put_item("items", json!({"pk": "y"}));
+        batch.commit().unwrap();
+
+        let records = db.get_stream_records("items").execute().unwrap();
+        assert_eq!(records.len(), 2);
+
+        // Batch commits use a single transaction, so same sequence_number.
+        assert_eq!(records[0].sequence_number, records[1].sequence_number);
+        assert_ne!(records[0].sub_sequence, records[1].sub_sequence);
+    }
+
+    #[test]
+    fn test_stream_limit() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", crate::types::KeyType::String)
+            .stream(StreamViewType::KeysOnly)
+            .execute()
+            .unwrap();
+
+        for i in 0..10 {
+            db.put_item("items", json!({"pk": format!("item{i}")}))
+                .unwrap();
+        }
+
+        let records = db
+            .get_stream_records("items")
+            .limit(3)
+            .execute()
+            .unwrap();
+        assert_eq!(records.len(), 3);
     }
 }
