@@ -20,6 +20,7 @@ JSON-over-newlines on Unix domain socket. Each request is one JSON line, each re
 {"op":"scan","table":"users","limit":100,"filter":{"And":[{"Eq":[{"Attr":"status"},{"Literal":"active"}]},{"Gt":[{"Attr":"age"},{"Literal":18}]}]}}
 {"op":"create_table","table":"users","partition_key":{"name":"user_id","type":"String"}}
 {"op":"list_tables"}
+{"op":"batch_get_item","table":"users","keys":[{"partition_key":"alice"},{"partition_key":"bob"}]}
 {"op":"list_partition_keys","table":"users","limit":20}
 {"op":"list_sort_key_prefixes","table":"users","partition_key":"alice","limit":20}
 ```
@@ -30,6 +31,7 @@ JSON-over-newlines on Unix domain socket. Each request is one JSON line, each re
 {"ok":true,"item":{"user_id":"alice","name":"Alice"}}
 {"ok":true,"item":{"user_id":"alice","name":"Alice"},"version":5}
 {"ok":true,"items":[...]}
+{"ok":true,"items":[{"user_id":"alice","name":"Alice"},null]}
 {"ok":true}
 {"error":"VersionMismatch","message":"expected version 5, actual 8","expected":5,"actual":8}
 {"error":"TableNotFound","message":"table not found: nonexistent"}
@@ -47,6 +49,10 @@ let mut client = FerridynClient::connect("/tmp/ferridyn.sock").await?;
 client.put_item("users", json!({"user_id": "alice", "name": "Alice"})).await?;
 let item = client.get_item("users", json!("alice"), None).await?;
 client.delete_item("users", json!("alice"), None).await?;
+
+// Batch get (single snapshot, positional results, None for missing)
+let keys = vec![(json!("alice"), None), (json!("bob"), None)];
+let results = client.batch_get_item("users", &keys).await?;
 
 // Version conflict detection
 let v = client.get_item_versioned("users", json!("alice"), None).await?;
@@ -85,7 +91,7 @@ ferridyn-server [--db PATH] [--socket PATH]
 
 The server inherits FerridynDB's concurrency semantics:
 
-- **Read operations** (get, query, scan, list_*) execute concurrently via read lock
+- **Read operations** (get, batch_get, query, scan, list_*) execute concurrently via read lock
 - **Write operations** (put, delete, create_table) are serialized via write lock
 - **Version conflicts** are detected and reported as VersionMismatch errors
 - **Snapshot isolation** is maintained per-transaction
