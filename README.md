@@ -8,7 +8,7 @@ A local, embedded, DynamoDB-style document database written in Rust with single-
 - **Single-file storage** — Copy-on-write pages with atomic double-buffered header commits (no WAL)
 - **MVCC snapshot isolation** — Single writer, unlimited concurrent readers with version chains
 - **B+Tree indexing** — Efficient range scans with slotted pages and overflow support
-- **Partition schemas & secondary indexes** — Declare entity types with prefix-based schemas, create scoped secondary indexes with automatic backfill, and query by indexed attribute values
+- **Partition schemas & secondary indexes** — Declare entity types with prefix-based schemas, create scoped or global secondary indexes with automatic backfill, and query by indexed attribute values
 - **Byte-ordered key encoding** — Enables fast `memcmp`-based comparisons for partition and sort keys
 - **TTL support** — Optional time-to-live attributes with automatic expiry filtering
 - **Condition expressions** — Predicates on write operations (`put`, `delete`, `update`) that evaluate against the existing item before proceeding, enabling prevent-overwrite and business rule enforcement
@@ -152,6 +152,27 @@ let result = db.query_index("data", "email-idx")
     .unwrap();
 assert_eq!(result.items.len(), 1);
 assert_eq!(result.items[0]["name"], "Alice");
+
+// Global index — spans all items in the table regardless of pk prefix
+db.create_index("data")
+    .name("status-idx")
+    .index_key("status", KeyType::String)
+    .execute()
+    .unwrap();
+
+// Matches any item with a "status" attribute, across all entity types
+db.put_item("data", json!({
+    "pk": "CONTACT#alice", "status": "active", "name": "Alice"
+})).unwrap();
+db.put_item("data", json!({
+    "pk": "ORDER#001", "status": "active", "total": 42
+})).unwrap();
+
+let result = db.query_index("data", "status-idx")
+    .key_value("active")
+    .execute()
+    .unwrap();
+assert_eq!(result.items.len(), 2); // Both entity types returned
 ```
 
 ### Build and Test
@@ -160,7 +181,7 @@ assert_eq!(result.items[0]["name"], "Alice");
 # Compile all crates
 cargo build
 
-# Run all tests (642 tests across workspace)
+# Run all tests (668 tests across workspace)
 cargo test
 
 # Run tests for a specific crate
@@ -201,7 +222,7 @@ let mut client = FerridynClient::connect("/tmp/ferridyn.sock").await?;
 
 // Regular operations
 client.put_item("users", json!({"user_id": "bob", "name": "Bob"})).await?;
-let item = client.get_item("users", json!("bob"), None).await?;
+let item = client.get_item("users", json!("bob"), None, None).await?;
 
 // Atomic partial updates
 use ferridyn_server::client::UpdateActionInput;
@@ -375,7 +396,7 @@ FerridynDB follows the LMDB concurrency model: one writer at a time (via file lo
 
 ### Partition Schemas & Secondary Indexes
 
-Secondary indexes are scoped to partition schemas — prefix-based entity type declarations that define expected attributes. Indexes are backed by plain B+Tree lookups with lazy GC for orphaned entries. This enables efficient attribute-value queries without full table scans.
+Secondary indexes can be **scoped** (limited to a partition schema prefix) or **global** (spanning all items in the table). Scoped indexes are tied to partition schemas — prefix-based entity type declarations that define expected attributes. Global indexes match any item that has the indexed attribute, regardless of partition key prefix. Both types are backed by plain B+Tree lookups with lazy GC for orphaned entries. Dropping an index reclaims all of its B+Tree pages.
 
 ### No B+Tree Rebalancing (v1)
 

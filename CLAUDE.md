@@ -74,6 +74,7 @@ PRDs live in `docs/prds/` and track feature implementation across phases.
 - **Update the PRD status** after each phase is committed and pushed (e.g., "In Progress (Phase 1 complete)")
 - **Move to `docs/prds/completed/`** with status "Complete" once all phases are committed and pushed
 - Include the PRD status update or move in the same commit as the code, or as an immediate follow-up commit
+- **Keep documentation up to date** with every code change — update the root README, server README, and CLAUDE.md (test count, feature descriptions, API examples) in the same commit or as an immediate follow-up
 
 ## Key Design Decisions
 
