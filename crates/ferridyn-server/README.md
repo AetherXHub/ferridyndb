@@ -14,6 +14,9 @@ JSON-over-newlines on Unix domain socket. Each request is one JSON line, each re
 {"op":"put_item","table":"users","item":{"user_id":"alice","name":"Alice"}}
 {"op":"put_item","table":"users","item":{"user_id":"alice","name":"Updated"},"expected_version":5}
 {"op":"delete_item","table":"users","partition_key":"alice"}
+{"op":"put_item","table":"users","item":{"user_id":"alice","name":"Updated"},"return_values":"ALL_OLD"}
+{"op":"delete_item","table":"users","partition_key":"alice","return_values":"ALL_OLD"}
+{"op":"update_item","table":"users","partition_key":"alice","updates":[{"action":"set","path":"name","value":"New"}],"return_values":"ALL_NEW"}
 {"op":"query","table":"users","partition_key":"alice","limit":20}
 {"op":"query","table":"users","partition_key":"alice","filter":{"Gt":[{"Attr":"age"},{"Literal":25}]}}
 {"op":"scan","table":"users","limit":100}
@@ -54,6 +57,17 @@ client.delete_item("users", json!("alice"), None).await?;
 let keys = vec![(json!("alice"), None), (json!("bob"), None)];
 let results = client.batch_get_item("users", &keys).await?;
 
+// ReturnValues — get old/new document atomically
+let old = client.put_item_returning_old("users", json!({"user_id": "alice", "name": "Updated"})).await?;
+// old == Some(previous document) or None if new
+
+let deleted = client.delete_item_returning_old("users", json!("alice"), None).await?;
+
+use ferridyn_server::client::UpdateActionInput;
+let new_doc = client.update_item_returning_new("users", json!("bob"), None, &[
+    UpdateActionInput { action: "set".into(), path: "name".into(), value: Some(json!("Bob Updated")) },
+]).await?;
+
 // Version conflict detection
 let v = client.get_item_versioned("users", json!("alice"), None).await?;
 client.put_item_conditional(
@@ -92,6 +106,6 @@ ferridyn-server [--db PATH] [--socket PATH]
 The server inherits FerridynDB's concurrency semantics:
 
 - **Read operations** (get, batch_get, query, scan, list_*) execute concurrently via read lock
-- **Write operations** (put, delete, create_table) are serialized via write lock
+- **Write operations** (put, delete, update, create_table) are serialized via write lock
 - **Version conflicts** are detected and reported as VersionMismatch errors
 - **Snapshot isolation** is maintained per-transaction

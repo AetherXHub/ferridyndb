@@ -137,14 +137,23 @@ fn dispatch(db: &FerridynDB, req: Request) -> Response {
             item,
             expected_version,
             condition,
-        } => handle_put_item(db, &table, item, expected_version, condition),
+            return_values,
+        } => handle_put_item(db, &table, item, expected_version, condition, return_values),
 
         Request::DeleteItem {
             table,
             partition_key,
             sort_key,
             condition,
-        } => handle_delete_item(db, &table, partition_key, sort_key, condition),
+            return_values,
+        } => handle_delete_item(
+            db,
+            &table,
+            partition_key,
+            sort_key,
+            condition,
+            return_values,
+        ),
 
         Request::UpdateItem {
             table,
@@ -152,7 +161,16 @@ fn dispatch(db: &FerridynDB, req: Request) -> Response {
             sort_key,
             updates,
             condition,
-        } => handle_update_item(db, &table, partition_key, sort_key, updates, condition),
+            return_values,
+        } => handle_update_item(
+            db,
+            &table,
+            partition_key,
+            sort_key,
+            updates,
+            condition,
+            return_values,
+        ),
 
         Request::Query {
             table,
@@ -296,17 +314,37 @@ fn handle_put_item(
     item: serde_json::Value,
     expected_version: Option<u64>,
     condition: Option<FilterExpr>,
+    return_values: Option<String>,
 ) -> Response {
-    let result = if let Some(ev) = expected_version {
-        db.put_item_conditional(table, item, ev)
-    } else if let Some(cond) = condition {
-        db.put(table, item).condition(cond).execute()
+    let want_old = matches!(
+        return_values.as_deref(),
+        Some("ALL_OLD" | "all_old" | "ALLOLD")
+    );
+
+    if let Some(ev) = expected_version {
+        // Conditional put does not support return_values.
+        match db.put_item_conditional(table, item, ev) {
+            Ok(()) => Response::ok_empty(),
+            Err(e) => dyn_error_to_response(e),
+        }
+    } else if want_old {
+        let mut builder = db.put(table, item);
+        if let Some(cond) = condition {
+            builder = builder.condition(cond);
+        }
+        match builder.return_old().execute() {
+            Ok(old) => Response::ok_item(old),
+            Err(e) => dyn_error_to_response(e),
+        }
     } else {
-        db.put_item(table, item)
-    };
-    match result {
-        Ok(()) => Response::ok_empty(),
-        Err(e) => dyn_error_to_response(e),
+        let mut builder = db.put(table, item);
+        if let Some(cond) = condition {
+            builder = builder.condition(cond);
+        }
+        match builder.execute() {
+            Ok(()) => Response::ok_empty(),
+            Err(e) => dyn_error_to_response(e),
+        }
     }
 }
 
@@ -316,17 +354,37 @@ fn handle_delete_item(
     partition_key: serde_json::Value,
     sort_key: Option<serde_json::Value>,
     condition: Option<FilterExpr>,
+    return_values: Option<String>,
 ) -> Response {
-    let mut builder = db.delete_item(table).partition_key(partition_key);
-    if let Some(sk) = sort_key {
-        builder = builder.sort_key(sk);
-    }
-    if let Some(cond) = condition {
-        builder = builder.condition(cond);
-    }
-    match builder.execute() {
-        Ok(()) => Response::ok_empty(),
-        Err(e) => dyn_error_to_response(e),
+    let want_old = matches!(
+        return_values.as_deref(),
+        Some("ALL_OLD" | "all_old" | "ALLOLD")
+    );
+
+    if want_old {
+        let mut builder = db.delete_item(table).partition_key(partition_key);
+        if let Some(sk) = sort_key {
+            builder = builder.sort_key(sk);
+        }
+        if let Some(cond) = condition {
+            builder = builder.condition(cond);
+        }
+        match builder.return_old().execute() {
+            Ok(old) => Response::ok_item(old),
+            Err(e) => dyn_error_to_response(e),
+        }
+    } else {
+        let mut builder = db.delete_item(table).partition_key(partition_key);
+        if let Some(sk) = sort_key {
+            builder = builder.sort_key(sk);
+        }
+        if let Some(cond) = condition {
+            builder = builder.condition(cond);
+        }
+        match builder.execute() {
+            Ok(()) => Response::ok_empty(),
+            Err(e) => dyn_error_to_response(e),
+        }
     }
 }
 
@@ -337,7 +395,18 @@ fn handle_update_item(
     sort_key: Option<serde_json::Value>,
     updates: Vec<UpdateActionWire>,
     condition: Option<FilterExpr>,
+    return_values: Option<String>,
 ) -> Response {
+    let want_old = matches!(
+        return_values.as_deref(),
+        Some("ALL_OLD" | "all_old" | "ALLOLD")
+    );
+    let want_new = matches!(
+        return_values.as_deref(),
+        Some("ALL_NEW" | "all_new" | "ALLNEW")
+    );
+
+    // Build the common update actions on a NoReturn builder first.
     let mut builder = db.update_item(table).partition_key(partition_key);
     if let Some(sk) = sort_key {
         builder = builder.sort_key(sk);
@@ -391,9 +460,22 @@ fn handle_update_item(
     if let Some(cond) = condition {
         builder = builder.condition(cond);
     }
-    match builder.execute() {
-        Ok(()) => Response::ok_empty(),
-        Err(e) => dyn_error_to_response(e),
+
+    if want_old {
+        match builder.return_old().execute() {
+            Ok(old) => Response::ok_item(old),
+            Err(e) => dyn_error_to_response(e),
+        }
+    } else if want_new {
+        match builder.return_new().execute() {
+            Ok(new_doc) => Response::ok_item(new_doc),
+            Err(e) => dyn_error_to_response(e),
+        }
+    } else {
+        match builder.execute() {
+            Ok(()) => Response::ok_empty(),
+            Err(e) => dyn_error_to_response(e),
+        }
     }
 }
 

@@ -45,6 +45,17 @@ pub struct VersionedItem {
     pub version: TxnId,
 }
 
+/// Controls whether a write operation returns the old or new document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReturnValues {
+    /// Return nothing (default).
+    None,
+    /// Return the item as it was before the operation.
+    AllOld,
+    /// Return the item after the operation (UpdateItem only).
+    AllNew,
+}
+
 /// Size of a single slot entry in a slotted page (offset: u16 + length: u16).
 pub const SLOT_SIZE: usize = 4;
 

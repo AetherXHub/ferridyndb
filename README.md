@@ -12,6 +12,7 @@ A local, embedded, DynamoDB-style document database written in Rust with single-
 - **Byte-ordered key encoding** — Enables fast `memcmp`-based comparisons for partition and sort keys
 - **TTL support** — Optional time-to-live attributes with automatic expiry filtering
 - **Condition expressions** — Predicates on write operations (`put`, `delete`, `update`) that evaluate against the existing item before proceeding, enabling prevent-overwrite and business rule enforcement
+- **ReturnValues** — Write operations optionally return the old or new document via type-state builders (`.return_old()`, `.return_new()`) with compile-time return type safety
 - **Version-aware API** — Optimistic concurrency control with versioned reads and conditional writes
 - **Unix socket server** — Multi-process access with async client library
 
@@ -80,6 +81,29 @@ db.update_item("users")
     .add("login_count", 1)
     .execute()
     .unwrap();
+
+// ReturnValues — get the old document back atomically
+let old = db.put_item("users", json!({
+    "user_id": "alice",
+    "name": "Alice Updated",
+    "age": 31
+})).return_old().execute().unwrap();
+// old == Some(previous document) or None if new
+
+// Works on delete and update too
+let deleted = db.delete_item("users")
+    .partition_key("alice")
+    .return_old()
+    .execute()
+    .unwrap();
+
+let new_doc = db.update_item("users")
+    .partition_key("bob")
+    .set("name", "Bob Updated")
+    .return_new()
+    .execute()
+    .unwrap();
+// new_doc == Some(document after updates applied)
 ```
 
 ### Secondary Indexes
@@ -136,7 +160,7 @@ assert_eq!(result.items[0]["name"], "Alice");
 # Compile all crates
 cargo build
 
-# Run all tests (614 tests across workspace)
+# Run all tests (642 tests across workspace)
 cargo test
 
 # Run tests for a specific crate

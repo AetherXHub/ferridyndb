@@ -1347,3 +1347,160 @@ async fn test_batch_get_exceeds_limit() {
         "expected BatchSizeLimitExceeded error, got: {err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// ReturnValues tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_server_put_return_old() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    client
+        .create_table(
+            "users",
+            KeyDef {
+                name: "id".to_string(),
+                key_type: "String".to_string(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Put initial item.
+    client
+        .put_item("users", json!({"id": "alice", "name": "Alice", "age": 30}))
+        .await
+        .unwrap();
+
+    // Put again with return_values=ALL_OLD.
+    let old = client
+        .put_item_returning_old("users", json!({"id": "alice", "name": "Alice2", "age": 31}))
+        .await
+        .unwrap();
+
+    assert!(old.is_some());
+    let old = old.unwrap();
+    assert_eq!(old["name"], "Alice");
+    assert_eq!(old["age"], 30);
+
+    // Put new item with return_values=ALL_OLD — should return None.
+    let old = client
+        .put_item_returning_old("users", json!({"id": "bob", "name": "Bob"}))
+        .await
+        .unwrap();
+    assert!(old.is_none());
+}
+
+#[tokio::test]
+async fn test_server_delete_return_old() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    client
+        .create_table(
+            "users",
+            KeyDef {
+                name: "id".to_string(),
+                key_type: "String".to_string(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    client
+        .put_item("users", json!({"id": "alice", "name": "Alice"}))
+        .await
+        .unwrap();
+
+    // Delete with return_values=ALL_OLD.
+    let old = client
+        .delete_item_returning_old("users", json!("alice"), None)
+        .await
+        .unwrap();
+
+    assert!(old.is_some());
+    assert_eq!(old.unwrap()["name"], "Alice");
+
+    // Verify deleted.
+    let item = client
+        .get_item("users", json!("alice"), None)
+        .await
+        .unwrap();
+    assert!(item.is_none());
+
+    // Delete non-existent with return_values=ALL_OLD.
+    let old = client
+        .delete_item_returning_old("users", json!("nobody"), None)
+        .await
+        .unwrap();
+    assert!(old.is_none());
+}
+
+#[tokio::test]
+async fn test_server_update_return_new() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    client
+        .create_table(
+            "users",
+            KeyDef {
+                name: "id".to_string(),
+                key_type: "String".to_string(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    client
+        .put_item("users", json!({"id": "alice", "name": "Alice", "age": 30}))
+        .await
+        .unwrap();
+
+    // Update with return_values=ALL_NEW.
+    let new_doc = client
+        .update_item_returning_new(
+            "users",
+            json!("alice"),
+            None,
+            &[UpdateActionInput {
+                action: "set".to_string(),
+                path: "name".to_string(),
+                value: Some(json!("Alice2")),
+            }],
+        )
+        .await
+        .unwrap();
+
+    assert!(new_doc.is_some());
+    let new_doc = new_doc.unwrap();
+    assert_eq!(new_doc["name"], "Alice2");
+    assert_eq!(new_doc["age"], 30);
+
+    // Update with return_values=ALL_OLD.
+    let old = client
+        .update_item_returning_old(
+            "users",
+            json!("alice"),
+            None,
+            &[UpdateActionInput {
+                action: "set".to_string(),
+                path: "name".to_string(),
+                value: Some(json!("Alice3")),
+            }],
+        )
+        .await
+        .unwrap();
+
+    assert!(old.is_some());
+    let old = old.unwrap();
+    assert_eq!(old["name"], "Alice2"); // was Alice2 before this update
+}

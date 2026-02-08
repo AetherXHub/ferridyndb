@@ -5,7 +5,7 @@ use crate::encoding::composite;
 use crate::error::{Error, QueryError, SchemaError, StorageError, TxnError};
 use crate::mvcc::ops as mvcc_ops;
 use crate::storage::tombstone::TombstoneEntry;
-use crate::types::{PageId, TxnId, VersionedItem};
+use crate::types::{PageId, ReturnValues, TxnId, VersionedItem};
 
 use super::filter::FilterExpr;
 use super::key_utils;
@@ -150,17 +150,14 @@ fn evaluate_condition(condition: &FilterExpr, existing_doc: Option<&Value>) -> R
 }
 
 impl Transaction {
-    /// Insert or replace an item in a table.
-    ///
-    /// If `condition` is provided, the existing item (or empty object for
-    /// non-existent items) must satisfy the condition or the operation fails
-    /// with `ConditionCheckFailed`.
-    pub fn put_item(
+    /// Internal put_item implementation that optionally returns the old document.
+    fn put_item_inner(
         &mut self,
         table: &str,
         document: Value,
         condition: Option<&FilterExpr>,
-    ) -> Result<(), Error> {
+        need_old: bool,
+    ) -> Result<Option<Value>, Error> {
         // 1. Validate document size.
         let doc_bytes = key_utils::validate_document_size(&document)?;
 
@@ -194,8 +191,9 @@ impl Transaction {
         // 5. Encode composite key.
         let composite_key = composite::encode_composite(&pk, sk.as_ref())?;
 
-        // 5a. Read old document for condition evaluation and index maintenance.
-        let old_doc: Option<Value> = if condition.is_some() || !entry.indexes.is_empty() {
+        // 5a. Read old document for condition evaluation, index maintenance, or return.
+        let old_doc: Option<Value> = if condition.is_some() || !entry.indexes.is_empty() || need_old
+        {
             mvcc_ops::mvcc_get(
                 &self.store,
                 entry.data_root_page,
@@ -241,7 +239,32 @@ impl Transaction {
             self.update_catalog_entry(table, &updated)?;
         }
 
+        Ok(old_doc)
+    }
+
+    /// Insert or replace an item in a table.
+    ///
+    /// If `condition` is provided, the existing item (or empty object for
+    /// non-existent items) must satisfy the condition or the operation fails
+    /// with `ConditionCheckFailed`.
+    pub fn put_item(
+        &mut self,
+        table: &str,
+        document: Value,
+        condition: Option<&FilterExpr>,
+    ) -> Result<(), Error> {
+        self.put_item_inner(table, document, condition, false)?;
         Ok(())
+    }
+
+    /// Insert or replace an item, returning the old document if one existed.
+    pub fn put_item_returning_old(
+        &mut self,
+        table: &str,
+        document: Value,
+        condition: Option<&FilterExpr>,
+    ) -> Result<Option<Value>, Error> {
+        self.put_item_inner(table, document, condition, true)
     }
 
     /// Insert or replace an item with optimistic concurrency control.
@@ -424,17 +447,15 @@ impl Transaction {
         }
     }
 
-    /// Delete an item by key.
-    ///
-    /// If `condition` is provided, the existing item must satisfy the condition
-    /// or the operation fails with `ConditionCheckFailed`.
-    pub fn delete_item(
+    /// Internal delete_item implementation that optionally returns the old document.
+    fn delete_item_inner(
         &mut self,
         table: &str,
         partition_key: &Value,
         sort_key: Option<&Value>,
         condition: Option<&FilterExpr>,
-    ) -> Result<(), Error> {
+        need_old: bool,
+    ) -> Result<Option<Value>, Error> {
         let entry = catalog::ops::get_table(&self.store, self.catalog_root, table)?;
         let schema = &entry.schema;
 
@@ -458,8 +479,9 @@ impl Transaction {
 
         let composite_key = composite::encode_composite(&pk, sk.as_ref())?;
 
-        // Read document before delete for condition evaluation and index maintenance.
-        let old_doc: Option<Value> = if condition.is_some() || !entry.indexes.is_empty() {
+        // Read document before delete for condition evaluation, index maintenance, or return.
+        let old_doc: Option<Value> = if condition.is_some() || !entry.indexes.is_empty() || need_old
+        {
             mvcc_ops::mvcc_get(
                 &self.store,
                 entry.data_root_page,
@@ -507,25 +529,45 @@ impl Transaction {
             self.update_catalog_entry(table, &updated)?;
         }
 
+        Ok(old_doc)
+    }
+
+    /// Delete an item by key.
+    ///
+    /// If `condition` is provided, the existing item must satisfy the condition
+    /// or the operation fails with `ConditionCheckFailed`.
+    pub fn delete_item(
+        &mut self,
+        table: &str,
+        partition_key: &Value,
+        sort_key: Option<&Value>,
+        condition: Option<&FilterExpr>,
+    ) -> Result<(), Error> {
+        self.delete_item_inner(table, partition_key, sort_key, condition, false)?;
         Ok(())
     }
 
-    /// Partially update an item by applying a list of update actions.
-    ///
-    /// If the item doesn't exist, an upsert creates it with the key
-    /// attributes plus the SET values.
-    ///
-    /// If `condition` is provided, the existing item (or empty object for
-    /// non-existent items) must satisfy the condition or the operation fails
-    /// with `ConditionCheckFailed`.
-    pub fn update_item(
+    /// Delete an item by key, returning the old document if one existed.
+    pub fn delete_item_returning_old(
+        &mut self,
+        table: &str,
+        partition_key: &Value,
+        sort_key: Option<&Value>,
+        condition: Option<&FilterExpr>,
+    ) -> Result<Option<Value>, Error> {
+        self.delete_item_inner(table, partition_key, sort_key, condition, true)
+    }
+
+    /// Internal update_item implementation that optionally returns the old or new document.
+    fn update_item_inner(
         &mut self,
         table: &str,
         partition_key: &Value,
         sort_key: Option<&Value>,
         actions: &[UpdateAction],
         condition: Option<&FilterExpr>,
-    ) -> Result<(), Error> {
+        return_values: ReturnValues,
+    ) -> Result<Option<Value>, Error> {
         // 1. Look up table schema.
         let entry = catalog::ops::get_table(&self.store, self.catalog_root, table)?;
         let schema = &entry.schema;
@@ -627,7 +669,59 @@ impl Transaction {
             self.update_catalog_entry(table, &updated)?;
         }
 
+        // 12. Return requested value.
+        match return_values {
+            ReturnValues::AllOld => Ok(old_doc),
+            ReturnValues::AllNew => Ok(Some(document)),
+            ReturnValues::None => Ok(None),
+        }
+    }
+
+    /// Partially update an item by applying a list of update actions.
+    ///
+    /// If the item doesn't exist, an upsert creates it with the key
+    /// attributes plus the SET values.
+    ///
+    /// If `condition` is provided, the existing item (or empty object for
+    /// non-existent items) must satisfy the condition or the operation fails
+    /// with `ConditionCheckFailed`.
+    pub fn update_item(
+        &mut self,
+        table: &str,
+        partition_key: &Value,
+        sort_key: Option<&Value>,
+        actions: &[UpdateAction],
+        condition: Option<&FilterExpr>,
+    ) -> Result<(), Error> {
+        self.update_item_inner(
+            table,
+            partition_key,
+            sort_key,
+            actions,
+            condition,
+            ReturnValues::None,
+        )?;
         Ok(())
+    }
+
+    /// Partially update an item, returning the old or new document.
+    pub fn update_item_returning(
+        &mut self,
+        table: &str,
+        partition_key: &Value,
+        sort_key: Option<&Value>,
+        actions: &[UpdateAction],
+        condition: Option<&FilterExpr>,
+        return_values: ReturnValues,
+    ) -> Result<Option<Value>, Error> {
+        self.update_item_inner(
+            table,
+            partition_key,
+            sort_key,
+            actions,
+            condition,
+            return_values,
+        )
     }
 
     /// Update a catalog entry after a B+Tree mutation.

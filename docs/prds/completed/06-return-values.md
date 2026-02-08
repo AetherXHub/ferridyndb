@@ -1,8 +1,8 @@
 # PRD: ReturnValues Support
 
 **Priority:** 6
-**Status:** Approved
-**Proposal:** [docs/proposals/accepted/return-values.md](../proposals/accepted/return-values.md)
+**Status:** Complete
+**Proposal:** [docs/proposals/accepted/return-values.md](../../proposals/accepted/return-values.md)
 
 ## Summary
 

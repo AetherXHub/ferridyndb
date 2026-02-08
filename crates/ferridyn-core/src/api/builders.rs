@@ -1,3 +1,4 @@
+use std::marker::PhantomData;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
@@ -7,13 +8,22 @@ use crate::catalog;
 use crate::encoding::composite;
 use crate::error::{Error, QueryError, SchemaError, StorageError};
 use crate::mvcc::ops as mvcc_ops;
-use crate::types::{AttrType, AttributeDef, KeyDefinition, KeyType, TableSchema, VersionedItem};
+use crate::types::{
+    AttrType, AttributeDef, KeyDefinition, KeyType, ReturnValues, TableSchema, VersionedItem,
+};
 
 use super::database::FerridynDB;
 use super::filter::FilterExpr;
 use super::key_utils;
 use super::query::{QueryResult, SortCondition, compute_scan_bounds};
 use super::update::UpdateAction;
+
+/// Marker: builder returns `()` on execute (default).
+pub struct NoReturn;
+/// Marker: builder returns `Option<Value>` (old document) on execute.
+pub struct ReturnOld;
+/// Marker: builder returns `Option<Value>` (new document) on execute.
+pub struct ReturnNew;
 
 // ---------------------------------------------------------------------------
 // TableBuilder
@@ -346,28 +356,47 @@ impl<'a> BatchGetItemBuilder<'a> {
 // ---------------------------------------------------------------------------
 
 /// Builder for inserting or replacing an item with optional condition.
-pub struct PutItemBuilder<'a> {
+///
+/// The type parameter `R` controls the return type of `execute()`:
+/// - `NoReturn` (default): returns `Result<(), Error>`
+/// - `ReturnOld`: returns `Result<Option<Value>, Error>` with the previous document
+pub struct PutItemBuilder<'a, R = NoReturn> {
     db: &'a FerridynDB,
     table: String,
     document: Value,
     condition: Option<FilterExpr>,
+    _return: PhantomData<R>,
 }
 
-impl<'a> PutItemBuilder<'a> {
+impl<'a, R> PutItemBuilder<'a, R> {
+    /// Set a condition expression that must be satisfied by the existing item
+    /// (or empty object for non-existent items) for the put to proceed.
+    pub fn condition(mut self, expr: FilterExpr) -> Self {
+        self.condition = Some(expr);
+        self
+    }
+}
+
+impl<'a> PutItemBuilder<'a, NoReturn> {
     pub(crate) fn new(db: &'a FerridynDB, table: String, document: Value) -> Self {
         Self {
             db,
             table,
             document,
             condition: None,
+            _return: PhantomData,
         }
     }
 
-    /// Set a condition expression that must be satisfied by the existing item
-    /// (or empty object for non-existent items) for the put to proceed.
-    pub fn condition(mut self, expr: FilterExpr) -> Self {
-        self.condition = Some(expr);
-        self
+    /// Request the old document be returned on execute.
+    pub fn return_old(self) -> PutItemBuilder<'a, ReturnOld> {
+        PutItemBuilder {
+            db: self.db,
+            table: self.table,
+            document: self.document,
+            condition: self.condition,
+            _return: PhantomData,
+        }
     }
 
     /// Execute the put operation.
@@ -381,26 +410,33 @@ impl<'a> PutItemBuilder<'a> {
     }
 }
 
+impl<'a> PutItemBuilder<'a, ReturnOld> {
+    /// Execute the put operation, returning the old document if one existed.
+    pub fn execute(self) -> Result<Option<Value>, Error> {
+        let table = self.table;
+        let document = self.document;
+        let condition = self.condition;
+
+        self.db
+            .transact(move |txn| txn.put_item_returning_old(&table, document, condition.as_ref()))
+    }
+}
+
 /// Builder for deleting an item by key.
-pub struct DeleteItemBuilder<'a> {
+///
+/// The type parameter `R` controls the return type of `execute()`:
+/// - `NoReturn` (default): returns `Result<(), Error>`
+/// - `ReturnOld`: returns `Result<Option<Value>, Error>` with the deleted document
+pub struct DeleteItemBuilder<'a, R = NoReturn> {
     db: &'a FerridynDB,
     table: String,
     partition_key: Option<Value>,
     sort_key: Option<Value>,
     condition: Option<FilterExpr>,
+    _return: PhantomData<R>,
 }
 
-impl<'a> DeleteItemBuilder<'a> {
-    pub(crate) fn new(db: &'a FerridynDB, table: String) -> Self {
-        Self {
-            db,
-            table,
-            partition_key: None,
-            sort_key: None,
-            condition: None,
-        }
-    }
-
+impl<'a, R> DeleteItemBuilder<'a, R> {
     /// Set the partition key value.
     pub fn partition_key(mut self, value: impl Into<Value>) -> Self {
         self.partition_key = Some(value.into());
@@ -419,6 +455,31 @@ impl<'a> DeleteItemBuilder<'a> {
         self.condition = Some(expr);
         self
     }
+}
+
+impl<'a> DeleteItemBuilder<'a, NoReturn> {
+    pub(crate) fn new(db: &'a FerridynDB, table: String) -> Self {
+        Self {
+            db,
+            table,
+            partition_key: None,
+            sort_key: None,
+            condition: None,
+            _return: PhantomData,
+        }
+    }
+
+    /// Request the old document be returned on execute.
+    pub fn return_old(self) -> DeleteItemBuilder<'a, ReturnOld> {
+        DeleteItemBuilder {
+            db: self.db,
+            table: self.table,
+            partition_key: self.partition_key,
+            sort_key: self.sort_key,
+            condition: self.condition,
+            _return: PhantomData,
+        }
+    }
 
     /// Execute the delete operation.
     pub fn execute(self) -> Result<(), Error> {
@@ -433,6 +494,20 @@ impl<'a> DeleteItemBuilder<'a> {
     }
 }
 
+impl<'a> DeleteItemBuilder<'a, ReturnOld> {
+    /// Execute the delete operation, returning the old document if one existed.
+    pub fn execute(self) -> Result<Option<Value>, Error> {
+        let pk_val = self.partition_key.ok_or(QueryError::PartitionKeyRequired)?;
+        let sk_val = self.sort_key;
+        let table = self.table;
+        let condition = self.condition;
+
+        self.db.transact(move |txn| {
+            txn.delete_item_returning_old(&table, &pk_val, sk_val.as_ref(), condition.as_ref())
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // UpdateItemBuilder
 // ---------------------------------------------------------------------------
@@ -442,27 +517,22 @@ impl<'a> DeleteItemBuilder<'a> {
 /// Collects SET and REMOVE actions, then applies them atomically inside a
 /// write transaction. If the item doesn't exist, an upsert creates it with
 /// the key attributes plus the SET values.
-pub struct UpdateItemBuilder<'a> {
+///
+/// The type parameter `R` controls the return type of `execute()`:
+/// - `NoReturn` (default): returns `Result<(), Error>`
+/// - `ReturnOld`: returns `Result<Option<Value>, Error>` with the pre-update document
+/// - `ReturnNew`: returns `Result<Option<Value>, Error>` with the post-update document
+pub struct UpdateItemBuilder<'a, R = NoReturn> {
     db: &'a FerridynDB,
     table: String,
     partition_key: Option<Value>,
     sort_key: Option<Value>,
     actions: Vec<UpdateAction>,
     condition: Option<FilterExpr>,
+    _return: PhantomData<R>,
 }
 
-impl<'a> UpdateItemBuilder<'a> {
-    pub(crate) fn new(db: &'a FerridynDB, table: String) -> Self {
-        Self {
-            db,
-            table,
-            partition_key: None,
-            sort_key: None,
-            actions: Vec::new(),
-            condition: None,
-        }
-    }
-
+impl<'a, R> UpdateItemBuilder<'a, R> {
     /// Set the partition key value.
     pub fn partition_key(mut self, value: impl Into<Value>) -> Self {
         self.partition_key = Some(value.into());
@@ -529,6 +599,46 @@ impl<'a> UpdateItemBuilder<'a> {
         self.condition = Some(expr);
         self
     }
+}
+
+impl<'a> UpdateItemBuilder<'a, NoReturn> {
+    pub(crate) fn new(db: &'a FerridynDB, table: String) -> Self {
+        Self {
+            db,
+            table,
+            partition_key: None,
+            sort_key: None,
+            actions: Vec::new(),
+            condition: None,
+            _return: PhantomData,
+        }
+    }
+
+    /// Request the pre-update document be returned on execute.
+    pub fn return_old(self) -> UpdateItemBuilder<'a, ReturnOld> {
+        UpdateItemBuilder {
+            db: self.db,
+            table: self.table,
+            partition_key: self.partition_key,
+            sort_key: self.sort_key,
+            actions: self.actions,
+            condition: self.condition,
+            _return: PhantomData,
+        }
+    }
+
+    /// Request the post-update document be returned on execute.
+    pub fn return_new(self) -> UpdateItemBuilder<'a, ReturnNew> {
+        UpdateItemBuilder {
+            db: self.db,
+            table: self.table,
+            partition_key: self.partition_key,
+            sort_key: self.sort_key,
+            actions: self.actions,
+            condition: self.condition,
+            _return: PhantomData,
+        }
+    }
 
     /// Execute the update operation.
     pub fn execute(self) -> Result<(), Error> {
@@ -545,6 +655,50 @@ impl<'a> UpdateItemBuilder<'a> {
                 sk_val.as_ref(),
                 &actions,
                 condition.as_ref(),
+            )
+        })
+    }
+}
+
+impl<'a> UpdateItemBuilder<'a, ReturnOld> {
+    /// Execute the update operation, returning the pre-update document.
+    pub fn execute(self) -> Result<Option<Value>, Error> {
+        let pk_val = self.partition_key.ok_or(QueryError::PartitionKeyRequired)?;
+        let sk_val = self.sort_key;
+        let table = self.table;
+        let actions = self.actions;
+        let condition = self.condition;
+
+        self.db.transact(move |txn| {
+            txn.update_item_returning(
+                &table,
+                &pk_val,
+                sk_val.as_ref(),
+                &actions,
+                condition.as_ref(),
+                ReturnValues::AllOld,
+            )
+        })
+    }
+}
+
+impl<'a> UpdateItemBuilder<'a, ReturnNew> {
+    /// Execute the update operation, returning the post-update document.
+    pub fn execute(self) -> Result<Option<Value>, Error> {
+        let pk_val = self.partition_key.ok_or(QueryError::PartitionKeyRequired)?;
+        let sk_val = self.sort_key;
+        let table = self.table;
+        let actions = self.actions;
+        let condition = self.condition;
+
+        self.db.transact(move |txn| {
+            txn.update_item_returning(
+                &table,
+                &pk_val,
+                sk_val.as_ref(),
+                &actions,
+                condition.as_ref(),
+                ReturnValues::AllNew,
             )
         })
     }

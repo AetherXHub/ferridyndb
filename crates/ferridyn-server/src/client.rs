@@ -221,6 +221,82 @@ impl FerridynClient {
         check_ok(&resp)
     }
 
+    /// Put an item, returning the old document if one existed.
+    pub async fn put_item_returning_old(
+        &mut self,
+        table: &str,
+        item: Value,
+    ) -> Result<Option<Value>> {
+        let req = serde_json::json!({
+            "op": "put_item",
+            "table": table,
+            "item": item,
+            "return_values": "ALL_OLD",
+        });
+        let resp = self.send_request(&req).await?;
+        item_from_response(&resp)
+    }
+
+    /// Delete an item, returning the old document if one existed.
+    pub async fn delete_item_returning_old(
+        &mut self,
+        table: &str,
+        partition_key: Value,
+        sort_key: Option<Value>,
+    ) -> Result<Option<Value>> {
+        let req = serde_json::json!({
+            "op": "delete_item",
+            "table": table,
+            "partition_key": partition_key,
+            "sort_key": sort_key,
+            "return_values": "ALL_OLD",
+        });
+        let resp = self.send_request(&req).await?;
+        item_from_response(&resp)
+    }
+
+    /// Update an item, returning the old document.
+    pub async fn update_item_returning_old(
+        &mut self,
+        table: &str,
+        partition_key: Value,
+        sort_key: Option<Value>,
+        updates: &[UpdateActionInput],
+    ) -> Result<Option<Value>> {
+        let updates_json = updates_to_json(updates);
+        let req = serde_json::json!({
+            "op": "update_item",
+            "table": table,
+            "partition_key": partition_key,
+            "sort_key": sort_key,
+            "updates": updates_json,
+            "return_values": "ALL_OLD",
+        });
+        let resp = self.send_request(&req).await?;
+        item_from_response(&resp)
+    }
+
+    /// Update an item, returning the new document after updates are applied.
+    pub async fn update_item_returning_new(
+        &mut self,
+        table: &str,
+        partition_key: Value,
+        sort_key: Option<Value>,
+        updates: &[UpdateActionInput],
+    ) -> Result<Option<Value>> {
+        let updates_json = updates_to_json(updates);
+        let req = serde_json::json!({
+            "op": "update_item",
+            "table": table,
+            "partition_key": partition_key,
+            "sort_key": sort_key,
+            "updates": updates_json,
+            "return_values": "ALL_NEW",
+        });
+        let resp = self.send_request(&req).await?;
+        item_from_response(&resp)
+    }
+
     /// Update an item with a set of update actions.
     pub async fn update_item(
         &mut self,
@@ -668,6 +744,28 @@ impl FerridynClient {
             serde_json::from_str(self.line_buf.trim()).map_err(ClientError::Serialization)?;
         Ok(resp)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Request helpers
+// ---------------------------------------------------------------------------
+
+fn updates_to_json(updates: &[UpdateActionInput]) -> Vec<Value> {
+    updates
+        .iter()
+        .map(|u| {
+            let mut obj = serde_json::json!({
+                "action": u.action,
+                "path": u.path,
+            });
+            if let Some(v) = &u.value {
+                obj.as_object_mut()
+                    .unwrap()
+                    .insert("value".to_string(), v.clone());
+            }
+            obj
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

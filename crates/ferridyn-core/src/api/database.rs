@@ -5520,3 +5520,219 @@ mod batch_get_item_tests {
         assert!(results[3].is_none());
     }
 }
+
+#[cfg(test)]
+mod return_values_tests {
+    use super::*;
+    use crate::api::filter::FilterExpr;
+    use crate::types::KeyType;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    fn create_test_db() -> (FerridynDB, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = FerridynDB::create(&db_path).unwrap();
+        (db, dir)
+    }
+
+    #[test]
+    fn test_put_returning_old_existing() {
+        let (db, _dir) = create_test_db();
+        db.create_table("users")
+            .partition_key("id", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put_item("users", json!({"id": "alice", "name": "Alice", "age": 30}))
+            .unwrap();
+
+        let old = db
+            .put("users", json!({"id": "alice", "name": "Alice2", "age": 31}))
+            .return_old()
+            .execute()
+            .unwrap();
+
+        assert!(old.is_some());
+        let old = old.unwrap();
+        assert_eq!(old["name"], "Alice");
+        assert_eq!(old["age"], 30);
+    }
+
+    #[test]
+    fn test_put_returning_old_new() {
+        let (db, _dir) = create_test_db();
+        db.create_table("users")
+            .partition_key("id", KeyType::String)
+            .execute()
+            .unwrap();
+
+        let old = db
+            .put("users", json!({"id": "alice", "name": "Alice"}))
+            .return_old()
+            .execute()
+            .unwrap();
+
+        assert!(old.is_none());
+    }
+
+    #[test]
+    fn test_put_returning_old_with_condition() {
+        let (db, _dir) = create_test_db();
+        db.create_table("users")
+            .partition_key("id", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put_item("users", json!({"id": "alice", "name": "Alice", "age": 30}))
+            .unwrap();
+
+        let old = db
+            .put("users", json!({"id": "alice", "name": "Alice2", "age": 31}))
+            .condition(FilterExpr::ge(
+                FilterExpr::attr("age"),
+                FilterExpr::literal(25),
+            ))
+            .return_old()
+            .execute()
+            .unwrap();
+
+        assert!(old.is_some());
+        assert_eq!(old.unwrap()["name"], "Alice");
+    }
+
+    #[test]
+    fn test_delete_returning_old_existing() {
+        let (db, _dir) = create_test_db();
+        db.create_table("users")
+            .partition_key("id", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put_item("users", json!({"id": "alice", "name": "Alice"}))
+            .unwrap();
+
+        let old = db
+            .delete_item("users")
+            .partition_key("alice")
+            .return_old()
+            .execute()
+            .unwrap();
+
+        assert!(old.is_some());
+        assert_eq!(old.unwrap()["name"], "Alice");
+
+        // Verify item is actually deleted.
+        let item = db
+            .get_item("users")
+            .partition_key("alice")
+            .execute()
+            .unwrap();
+        assert!(item.is_none());
+    }
+
+    #[test]
+    fn test_delete_returning_old_nonexistent() {
+        let (db, _dir) = create_test_db();
+        db.create_table("users")
+            .partition_key("id", KeyType::String)
+            .execute()
+            .unwrap();
+
+        let old = db
+            .delete_item("users")
+            .partition_key("nobody")
+            .return_old()
+            .execute()
+            .unwrap();
+
+        assert!(old.is_none());
+    }
+
+    #[test]
+    fn test_update_returning_old() {
+        let (db, _dir) = create_test_db();
+        db.create_table("users")
+            .partition_key("id", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put_item("users", json!({"id": "alice", "name": "Alice", "age": 30}))
+            .unwrap();
+
+        let old = db
+            .update_item("users")
+            .partition_key("alice")
+            .set("name", json!("Alice2"))
+            .return_old()
+            .execute()
+            .unwrap();
+
+        assert!(old.is_some());
+        let old = old.unwrap();
+        assert_eq!(old["name"], "Alice");
+        assert_eq!(old["age"], 30);
+    }
+
+    #[test]
+    fn test_update_returning_new() {
+        let (db, _dir) = create_test_db();
+        db.create_table("users")
+            .partition_key("id", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put_item("users", json!({"id": "alice", "name": "Alice", "age": 30}))
+            .unwrap();
+
+        let new_doc = db
+            .update_item("users")
+            .partition_key("alice")
+            .set("name", json!("Alice2"))
+            .return_new()
+            .execute()
+            .unwrap();
+
+        assert!(new_doc.is_some());
+        let new_doc = new_doc.unwrap();
+        assert_eq!(new_doc["name"], "Alice2");
+        assert_eq!(new_doc["age"], 30);
+    }
+
+    #[test]
+    fn test_update_returning_new_upsert() {
+        let (db, _dir) = create_test_db();
+        db.create_table("users")
+            .partition_key("id", KeyType::String)
+            .execute()
+            .unwrap();
+
+        let new_doc = db
+            .update_item("users")
+            .partition_key("bob")
+            .set("name", json!("Bob"))
+            .return_new()
+            .execute()
+            .unwrap();
+
+        assert!(new_doc.is_some());
+        let new_doc = new_doc.unwrap();
+        assert_eq!(new_doc["id"], "bob");
+        assert_eq!(new_doc["name"], "Bob");
+    }
+
+    #[test]
+    fn test_default_put_unchanged() {
+        let (db, _dir) = create_test_db();
+        db.create_table("users")
+            .partition_key("id", KeyType::String)
+            .execute()
+            .unwrap();
+
+        // This is a compile-time check: without .return_old(), execute() returns Result<()>.
+        let result: Result<(), _> = db
+            .put("users", json!({"id": "alice", "name": "Alice"}))
+            .execute();
+        assert!(result.is_ok());
+    }
+}
