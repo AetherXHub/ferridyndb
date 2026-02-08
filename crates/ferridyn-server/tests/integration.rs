@@ -6,7 +6,7 @@ use tokio::time::{Duration, sleep};
 
 use ferridyn_core::api::{FerridynDB, FilterExpr};
 use ferridyn_server::client::{AttributeDefInput, FerridynClient, UpdateActionInput};
-use ferridyn_server::protocol::KeyDef;
+use ferridyn_server::protocol::{KeyDef, SortKeyCondition};
 use ferridyn_server::server::FerridynServer;
 
 /// Start a server on a temp socket and return the socket path.
@@ -698,7 +698,15 @@ async fn test_index_crud() {
 
     // Create index.
     client
-        .create_index("data", "email-idx", Some("CONTACT"), "email", "String")
+        .create_index(
+            "data",
+            "email-idx",
+            Some("CONTACT"),
+            "email",
+            "String",
+            None,
+            None,
+        )
         .await
         .unwrap();
 
@@ -760,7 +768,15 @@ async fn test_query_index() {
         .unwrap();
 
     client
-        .create_index("data", "email-idx", Some("CONTACT"), "email", "String")
+        .create_index(
+            "data",
+            "email-idx",
+            Some("CONTACT"),
+            "email",
+            "String",
+            None,
+            None,
+        )
         .await
         .unwrap();
 
@@ -798,6 +814,7 @@ async fn test_query_index() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -809,6 +826,7 @@ async fn test_query_index() {
             "data",
             "email-idx",
             json!("bob@example.com"),
+            None,
             None,
             None,
             None,
@@ -826,6 +844,7 @@ async fn test_query_index() {
             "data",
             "email-idx",
             json!("nobody@example.com"),
+            None,
             None,
             None,
             None,
@@ -885,7 +904,15 @@ async fn test_query_index_with_limit() {
         .unwrap();
 
     client
-        .create_index("data", "status-idx", Some("ITEM"), "status", "String")
+        .create_index(
+            "data",
+            "status-idx",
+            Some("ITEM"),
+            "status",
+            "String",
+            None,
+            None,
+        )
         .await
         .unwrap();
 
@@ -905,6 +932,7 @@ async fn test_query_index_with_limit() {
             "data",
             "status-idx",
             json!("active"),
+            None,
             Some(2),
             None,
             None,
@@ -1224,7 +1252,15 @@ async fn test_index_pagination_over_wire() {
         .unwrap();
 
     client
-        .create_index("data", "status-idx", Some("ITEM"), "status", "String")
+        .create_index(
+            "data",
+            "status-idx",
+            Some("ITEM"),
+            "status",
+            "String",
+            None,
+            None,
+        )
         .await
         .unwrap();
 
@@ -1249,6 +1285,7 @@ async fn test_index_pagination_over_wire() {
             "data",
             "status-idx",
             json!("active"),
+            None,
             Some(4),
             None,
             None,
@@ -1266,6 +1303,7 @@ async fn test_index_pagination_over_wire() {
             "data",
             "status-idx",
             json!("active"),
+            None,
             Some(4),
             None,
             None,
@@ -1283,6 +1321,7 @@ async fn test_index_pagination_over_wire() {
             "data",
             "status-idx",
             json!("active"),
+            None,
             Some(4),
             None,
             None,
@@ -1653,4 +1692,93 @@ async fn test_projection_over_wire() {
         assert!(item.get("name").is_some());
         assert!(item.get("age").is_none());
     }
+}
+
+#[tokio::test]
+async fn test_composite_index_over_wire() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    client
+        .create_table(
+            "data",
+            KeyDef {
+                name: "pk".to_string(),
+                key_type: "String".to_string(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Create composite index with sort key.
+    client
+        .create_index(
+            "data",
+            "cat-price-idx",
+            None,
+            "category",
+            "String",
+            Some("price"),
+            Some("Number"),
+        )
+        .await
+        .unwrap();
+
+    // Verify index has sort key info.
+    let idx = client
+        .describe_index("data", "cat-price-idx")
+        .await
+        .unwrap();
+    assert_eq!(idx.index_key_name, "category");
+    assert_eq!(idx.index_sort_key_name, Some("price".to_string()));
+    assert_eq!(idx.index_sort_key_type, Some("Number".to_string()));
+
+    // Insert documents.
+    for (pk, cat, price) in [
+        ("p1", "electronics", 10.0),
+        ("p2", "electronics", 50.0),
+        ("p3", "electronics", 100.0),
+        ("p4", "books", 20.0),
+    ] {
+        client
+            .put_item("data", json!({"pk": pk, "category": cat, "price": price}))
+            .await
+            .unwrap();
+    }
+
+    // Query with sort condition via wire protocol.
+    let result = client
+        .query_index(
+            "data",
+            "cat-price-idx",
+            json!("electronics"),
+            Some(SortKeyCondition::Gt { value: json!(40.0) }),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.items.len(), 2);
+
+    // Query without sort condition — all electronics.
+    let result = client
+        .query_index(
+            "data",
+            "cat-price-idx",
+            json!("electronics"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.items.len(), 3);
 }

@@ -8,7 +8,7 @@ A local, embedded, DynamoDB-style document database written in Rust with single-
 - **Single-file storage** — Copy-on-write pages with atomic double-buffered header commits (no WAL)
 - **MVCC snapshot isolation** — Single writer, unlimited concurrent readers with version chains
 - **B+Tree indexing** — Efficient range scans with slotted pages and overflow support
-- **Partition schemas & secondary indexes** — Declare entity types with prefix-based schemas, create scoped or global secondary indexes with automatic backfill, and query by indexed attribute values
+- **Partition schemas & secondary indexes** — Declare entity types with prefix-based schemas, create scoped or global secondary indexes with composite keys (partition + sort) and automatic backfill, and query by indexed attribute values with sort key range conditions
 - **Byte-ordered key encoding** — Enables fast `memcmp`-based comparisons for partition and sort keys
 - **TTL support** — Optional time-to-live attributes with automatic expiry filtering
 - **Condition expressions** — Predicates on write operations (`put`, `delete`, `update`) that evaluate against the existing item before proceeding, enabling prevent-overwrite and business rule enforcement
@@ -173,6 +173,26 @@ let result = db.query_index("data", "status-idx")
     .execute()
     .unwrap();
 assert_eq!(result.items.len(), 2); // Both entity types returned
+
+// Composite index — partition key + sort key for range queries
+db.create_index("data")
+    .name("status-price-idx")
+    .index_key("status", KeyType::String)
+    .index_sort_key("price", KeyType::Number)
+    .execute()
+    .unwrap();
+
+db.put_item("data", json!({"pk": "ITEM#1", "status": "active", "price": 10.0})).unwrap();
+db.put_item("data", json!({"pk": "ITEM#2", "status": "active", "price": 50.0})).unwrap();
+db.put_item("data", json!({"pk": "ITEM#3", "status": "active", "price": 100.0})).unwrap();
+
+// Range query on the index sort key
+let result = db.query_index("data", "status-price-idx")
+    .key_value("active")
+    .sort_key_between(json!(20.0), json!(80.0))
+    .execute()
+    .unwrap();
+assert_eq!(result.items.len(), 1); // Only price=50 in range
 ```
 
 ### Build and Test

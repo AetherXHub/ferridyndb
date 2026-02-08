@@ -1028,6 +1028,7 @@ mod tests {
                 name: "email".to_string(),
                 key_type: KeyType::String,
             },
+            None,
             1,
         )
         .unwrap();
@@ -1067,6 +1068,7 @@ mod tests {
                 name: "email".to_string(),
                 key_type: KeyType::String,
             },
+            None,
             1,
         )
         .unwrap();
@@ -1109,6 +1111,7 @@ mod tests {
                 name: "email".to_string(),
                 key_type: KeyType::String,
             },
+            None,
             1,
         )
         .unwrap();
@@ -1168,6 +1171,7 @@ mod tests {
                 name: "email".to_string(),
                 key_type: KeyType::String,
             },
+            None,
             1,
         )
         .unwrap();
@@ -1207,6 +1211,7 @@ mod tests {
                 name: "email".to_string(),
                 key_type: KeyType::String,
             },
+            None,
             1,
         )
         .unwrap();

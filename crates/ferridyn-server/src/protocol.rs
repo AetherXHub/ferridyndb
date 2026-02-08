@@ -137,6 +137,8 @@ pub enum Request {
         #[serde(default)]
         partition_schema: Option<String>,
         index_key: KeyDef,
+        #[serde(default)]
+        index_sort_key: Option<KeyDef>,
     },
     DropIndex {
         table: String,
@@ -153,6 +155,8 @@ pub enum Request {
         table: String,
         index_name: String,
         key_value: Value,
+        #[serde(default)]
+        sort_key_condition: Option<SortKeyCondition>,
         #[serde(default)]
         limit: Option<usize>,
         #[serde(default)]
@@ -237,6 +241,8 @@ pub struct IndexDefWire {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partition_schema: Option<String>,
     pub index_key: KeyDefWire,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_sort_key: Option<KeyDefWire>,
 }
 
 /// A response sent back to the client.

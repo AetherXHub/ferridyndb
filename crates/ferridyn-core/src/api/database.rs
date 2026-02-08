@@ -6511,4 +6511,660 @@ mod global_index_tests {
             .unwrap();
         assert_eq!(result.items.len(), 1);
     }
+
+    // -----------------------------------------------------------------------
+    // Composite index keys (PRD-09 Phase 2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_composite_index_create() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("cat-price-idx")
+            .index_key("category", KeyType::String)
+            .index_sort_key("price", KeyType::Number)
+            .execute()
+            .unwrap();
+
+        let indexes = db.list_indexes("data").unwrap();
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes[0].name, "cat-price-idx");
+        assert!(indexes[0].index_sort_key.is_some());
+        let sk = indexes[0].index_sort_key.as_ref().unwrap();
+        assert_eq!(sk.name, "price");
+        assert_eq!(sk.key_type, KeyType::Number);
+    }
+
+    #[test]
+    fn test_composite_index_backfill() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        // Insert docs before creating the index.
+        db.put_item(
+            "data",
+            json!({"pk": "p1", "category": "electronics", "price": 100.0}),
+        )
+        .unwrap();
+        db.put_item(
+            "data",
+            json!({"pk": "p2", "category": "electronics", "price": 50.0}),
+        )
+        .unwrap();
+        db.put_item(
+            "data",
+            json!({"pk": "p3", "category": "books", "price": 20.0}),
+        )
+        .unwrap();
+
+        // Create composite index AFTER data exists.
+        db.create_index("data")
+            .name("cat-price-idx")
+            .index_key("category", KeyType::String)
+            .index_sort_key("price", KeyType::Number)
+            .execute()
+            .unwrap();
+
+        // Query electronics — should backfill both.
+        let result = db
+            .query_index("data", "cat-price-idx")
+            .key_value("electronics")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 2);
+    }
+
+    #[test]
+    fn test_composite_index_range_query() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("cat-price-idx")
+            .index_key("category", KeyType::String)
+            .index_sort_key("price", KeyType::Number)
+            .execute()
+            .unwrap();
+
+        db.put_item(
+            "data",
+            json!({"pk": "p1", "category": "electronics", "price": 10.0}),
+        )
+        .unwrap();
+        db.put_item(
+            "data",
+            json!({"pk": "p2", "category": "electronics", "price": 50.0}),
+        )
+        .unwrap();
+        db.put_item(
+            "data",
+            json!({"pk": "p3", "category": "electronics", "price": 100.0}),
+        )
+        .unwrap();
+        db.put_item(
+            "data",
+            json!({"pk": "p4", "category": "electronics", "price": 200.0}),
+        )
+        .unwrap();
+
+        // sort_key_gt: price > 50
+        let result = db
+            .query_index("data", "cat-price-idx")
+            .key_value("electronics")
+            .sort_key_gt(json!(50.0))
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 2);
+        let prices: Vec<f64> = result
+            .items
+            .iter()
+            .map(|i| i["price"].as_f64().unwrap())
+            .collect();
+        assert!(prices.contains(&100.0));
+        assert!(prices.contains(&200.0));
+
+        // sort_key_lt: price < 50
+        let result = db
+            .query_index("data", "cat-price-idx")
+            .key_value("electronics")
+            .sort_key_lt(json!(50.0))
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["price"], 10.0);
+    }
+
+    #[test]
+    fn test_composite_index_between() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("cat-price-idx")
+            .index_key("category", KeyType::String)
+            .index_sort_key("price", KeyType::Number)
+            .execute()
+            .unwrap();
+
+        for i in 1..=10 {
+            db.put_item(
+                "data",
+                json!({"pk": format!("p{i}"), "category": "toys", "price": (i as f64) * 10.0}),
+            )
+            .unwrap();
+        }
+
+        // Between 30.0 and 70.0 inclusive.
+        let result = db
+            .query_index("data", "cat-price-idx")
+            .key_value("toys")
+            .sort_key_between(json!(30.0), json!(70.0))
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 5); // 30, 40, 50, 60, 70
+    }
+
+    #[test]
+    fn test_composite_index_eq() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("cat-price-idx")
+            .index_key("category", KeyType::String)
+            .index_sort_key("price", KeyType::Number)
+            .execute()
+            .unwrap();
+
+        db.put_item(
+            "data",
+            json!({"pk": "p1", "category": "books", "price": 25.0}),
+        )
+        .unwrap();
+        db.put_item(
+            "data",
+            json!({"pk": "p2", "category": "books", "price": 25.0}),
+        )
+        .unwrap();
+        db.put_item(
+            "data",
+            json!({"pk": "p3", "category": "books", "price": 50.0}),
+        )
+        .unwrap();
+
+        let result = db
+            .query_index("data", "cat-price-idx")
+            .key_value("books")
+            .sort_key_eq(json!(25.0))
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 2);
+    }
+
+    #[test]
+    fn test_composite_index_begins_with() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("status-name-idx")
+            .index_key("status", KeyType::String)
+            .index_sort_key("name", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put_item(
+            "data",
+            json!({"pk": "u1", "status": "active", "name": "alice"}),
+        )
+        .unwrap();
+        db.put_item(
+            "data",
+            json!({"pk": "u2", "status": "active", "name": "amy"}),
+        )
+        .unwrap();
+        db.put_item(
+            "data",
+            json!({"pk": "u3", "status": "active", "name": "bob"}),
+        )
+        .unwrap();
+
+        let result = db
+            .query_index("data", "status-name-idx")
+            .key_value("active")
+            .sort_key_begins_with("a")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 2);
+        let names: Vec<&str> = result
+            .items
+            .iter()
+            .map(|i| i["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"alice"));
+        assert!(names.contains(&"amy"));
+    }
+
+    #[test]
+    fn test_composite_index_missing_sort_key_skipped() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("cat-price-idx")
+            .index_key("category", KeyType::String)
+            .index_sort_key("price", KeyType::Number)
+            .execute()
+            .unwrap();
+
+        // Doc WITH sort key attr.
+        db.put_item(
+            "data",
+            json!({"pk": "p1", "category": "books", "price": 10.0}),
+        )
+        .unwrap();
+        // Doc WITHOUT sort key attr — should be silently skipped.
+        db.put_item("data", json!({"pk": "p2", "category": "books"}))
+            .unwrap();
+
+        let result = db
+            .query_index("data", "cat-price-idx")
+            .key_value("books")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["pk"], "p1");
+    }
+
+    #[test]
+    fn test_composite_index_pagination() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("cat-price-idx")
+            .index_key("category", KeyType::String)
+            .index_sort_key("price", KeyType::Number)
+            .execute()
+            .unwrap();
+
+        for i in 1..=10 {
+            db.put_item(
+                "data",
+                json!({"pk": format!("p{i}"), "category": "toys", "price": (i as f64) * 5.0}),
+            )
+            .unwrap();
+        }
+
+        // Page 1: limit 4.
+        let page1 = db
+            .query_index("data", "cat-price-idx")
+            .key_value("toys")
+            .limit(4)
+            .execute()
+            .unwrap();
+        assert_eq!(page1.items.len(), 4);
+        assert!(page1.last_evaluated_key.is_some());
+
+        // Page 2: limit 4 with cursor.
+        let page2 = db
+            .query_index("data", "cat-price-idx")
+            .key_value("toys")
+            .limit(4)
+            .exclusive_start_key(page1.last_evaluated_key.unwrap())
+            .execute()
+            .unwrap();
+        assert_eq!(page2.items.len(), 4);
+        assert!(page2.last_evaluated_key.is_some());
+
+        // Page 3: limit 4 — should get 2 remaining.
+        let page3 = db
+            .query_index("data", "cat-price-idx")
+            .key_value("toys")
+            .limit(4)
+            .exclusive_start_key(page2.last_evaluated_key.unwrap())
+            .execute()
+            .unwrap();
+        assert_eq!(page3.items.len(), 2);
+        assert!(page3.last_evaluated_key.is_none());
+    }
+
+    #[test]
+    fn test_composite_index_no_sort_condition() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("cat-price-idx")
+            .index_key("category", KeyType::String)
+            .index_sort_key("price", KeyType::Number)
+            .execute()
+            .unwrap();
+
+        db.put_item(
+            "data",
+            json!({"pk": "p1", "category": "books", "price": 10.0}),
+        )
+        .unwrap();
+        db.put_item(
+            "data",
+            json!({"pk": "p2", "category": "books", "price": 50.0}),
+        )
+        .unwrap();
+        db.put_item(
+            "data",
+            json!({"pk": "p3", "category": "toys", "price": 20.0}),
+        )
+        .unwrap();
+
+        // No sort condition — should return all items for the PK.
+        let result = db
+            .query_index("data", "cat-price-idx")
+            .key_value("books")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 2);
+    }
+
+    #[test]
+    fn test_simple_index_sort_condition_errors() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        // Simple (non-composite) index.
+        db.create_index("data")
+            .name("status-idx")
+            .index_key("status", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put_item("data", json!({"pk": "p1", "status": "active"}))
+            .unwrap();
+
+        // Using sort condition on non-composite index should error.
+        let result = db
+            .query_index("data", "status-idx")
+            .key_value("active")
+            .sort_key_eq(json!(42.0))
+            .execute();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_composite_index_le_ge() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("cat-price-idx")
+            .index_key("category", KeyType::String)
+            .index_sort_key("price", KeyType::Number)
+            .execute()
+            .unwrap();
+
+        db.put_item(
+            "data",
+            json!({"pk": "p1", "category": "toys", "price": 10.0}),
+        )
+        .unwrap();
+        db.put_item(
+            "data",
+            json!({"pk": "p2", "category": "toys", "price": 20.0}),
+        )
+        .unwrap();
+        db.put_item(
+            "data",
+            json!({"pk": "p3", "category": "toys", "price": 30.0}),
+        )
+        .unwrap();
+        db.put_item(
+            "data",
+            json!({"pk": "p4", "category": "toys", "price": 40.0}),
+        )
+        .unwrap();
+
+        // Le: price <= 20.0 — should include boundary.
+        let result = db
+            .query_index("data", "cat-price-idx")
+            .key_value("toys")
+            .sort_key_le(json!(20.0))
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 2);
+        let prices: Vec<f64> = result
+            .items
+            .iter()
+            .map(|i| i["price"].as_f64().unwrap())
+            .collect();
+        assert!(prices.contains(&10.0));
+        assert!(prices.contains(&20.0));
+
+        // Ge: price >= 30.0 — should include boundary.
+        let result = db
+            .query_index("data", "cat-price-idx")
+            .key_value("toys")
+            .sort_key_ge(json!(30.0))
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 2);
+        let prices: Vec<f64> = result
+            .items
+            .iter()
+            .map(|i| i["price"].as_f64().unwrap())
+            .collect();
+        assert!(prices.contains(&30.0));
+        assert!(prices.contains(&40.0));
+    }
+
+    #[test]
+    fn test_composite_index_reverse_scan() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("cat-price-idx")
+            .index_key("category", KeyType::String)
+            .index_sort_key("price", KeyType::Number)
+            .execute()
+            .unwrap();
+
+        for i in 1..=5 {
+            db.put_item(
+                "data",
+                json!({"pk": format!("p{i}"), "category": "toys", "price": (i as f64) * 10.0}),
+            )
+            .unwrap();
+        }
+
+        // Forward scan — ascending order.
+        let fwd = db
+            .query_index("data", "cat-price-idx")
+            .key_value("toys")
+            .execute()
+            .unwrap();
+        let fwd_prices: Vec<f64> = fwd
+            .items
+            .iter()
+            .map(|i| i["price"].as_f64().unwrap())
+            .collect();
+        assert_eq!(fwd_prices, vec![10.0, 20.0, 30.0, 40.0, 50.0]);
+
+        // Reverse scan — descending order.
+        let rev = db
+            .query_index("data", "cat-price-idx")
+            .key_value("toys")
+            .scan_forward(false)
+            .execute()
+            .unwrap();
+        let rev_prices: Vec<f64> = rev
+            .items
+            .iter()
+            .map(|i| i["price"].as_f64().unwrap())
+            .collect();
+        assert_eq!(rev_prices, vec![50.0, 40.0, 30.0, 20.0, 10.0]);
+
+        // Reverse scan with sort condition: price >= 30.
+        let rev_ge = db
+            .query_index("data", "cat-price-idx")
+            .key_value("toys")
+            .sort_key_ge(json!(30.0))
+            .scan_forward(false)
+            .execute()
+            .unwrap();
+        let rev_ge_prices: Vec<f64> = rev_ge
+            .items
+            .iter()
+            .map(|i| i["price"].as_f64().unwrap())
+            .collect();
+        assert_eq!(rev_ge_prices, vec![50.0, 40.0, 30.0]);
+    }
+
+    #[test]
+    fn test_composite_index_maintenance_on_put_update_delete() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("cat-price-idx")
+            .index_key("category", KeyType::String)
+            .index_sort_key("price", KeyType::Number)
+            .execute()
+            .unwrap();
+
+        // Insert a document.
+        db.put_item(
+            "data",
+            json!({"pk": "p1", "category": "toys", "price": 25.0}),
+        )
+        .unwrap();
+        let result = db
+            .query_index("data", "cat-price-idx")
+            .key_value("toys")
+            .sort_key_eq(json!(25.0))
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+
+        // Update: change the sort key value (price 25 -> 50).
+        db.put_item(
+            "data",
+            json!({"pk": "p1", "category": "toys", "price": 50.0}),
+        )
+        .unwrap();
+
+        // Old value should return nothing.
+        let result = db
+            .query_index("data", "cat-price-idx")
+            .key_value("toys")
+            .sort_key_eq(json!(25.0))
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 0);
+
+        // New value should be found.
+        let result = db
+            .query_index("data", "cat-price-idx")
+            .key_value("toys")
+            .sort_key_eq(json!(50.0))
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+
+        // Delete the document.
+        db.delete_item("data")
+            .partition_key("p1")
+            .execute()
+            .unwrap();
+
+        // Should be gone from the index entirely.
+        let result = db
+            .query_index("data", "cat-price-idx")
+            .key_value("toys")
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 0);
+    }
+
+    #[test]
+    fn test_composite_index_between_boundary_inclusion() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("cat-price-idx")
+            .index_key("category", KeyType::String)
+            .index_sort_key("price", KeyType::Number)
+            .execute()
+            .unwrap();
+
+        // Insert items at exact boundary values.
+        db.put_item("data", json!({"pk": "p1", "category": "x", "price": 10.0}))
+            .unwrap();
+        db.put_item("data", json!({"pk": "p2", "category": "x", "price": 20.0}))
+            .unwrap();
+        db.put_item("data", json!({"pk": "p3", "category": "x", "price": 30.0}))
+            .unwrap();
+
+        // Between(10, 30) should include both boundaries.
+        let result = db
+            .query_index("data", "cat-price-idx")
+            .key_value("x")
+            .sort_key_between(json!(10.0), json!(30.0))
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 3);
+
+        // Between(15, 25) should exclude all (nothing in range).
+        let result = db
+            .query_index("data", "cat-price-idx")
+            .key_value("x")
+            .sort_key_between(json!(15.0), json!(25.0))
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1); // only 20.0
+    }
 }

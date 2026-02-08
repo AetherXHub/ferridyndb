@@ -198,6 +198,7 @@ pub fn list_partition_schemas(
 /// partition schema and only documents whose partition key starts with the
 /// prefix are indexed. When `None`, the index is global and all documents
 /// with the indexed attribute are included.
+#[allow(clippy::too_many_arguments)]
 pub fn create_index(
     store: &mut impl PageStore,
     catalog_root: PageId,
@@ -205,6 +206,7 @@ pub fn create_index(
     name: String,
     partition_schema: Option<String>,
     index_key: KeyDefinition,
+    index_sort_key: Option<KeyDefinition>,
     txn_id: TxnId,
 ) -> Result<PageId, Error> {
     use crate::api::key_utils;
@@ -235,6 +237,7 @@ pub fn create_index(
         name: name.clone(),
         partition_schema: partition_schema.clone(),
         index_key,
+        index_sort_key,
         root_page: index_root,
     };
 
@@ -638,6 +641,7 @@ mod tests {
                 name: "email".to_string(),
                 key_type: KeyType::String,
             },
+            None,
             1,
         )
         .unwrap();
@@ -673,6 +677,7 @@ mod tests {
                 name: "email".to_string(),
                 key_type: KeyType::String,
             },
+            None,
             1,
         )
         .unwrap();
@@ -707,6 +712,7 @@ mod tests {
                 name: "email".to_string(),
                 key_type: KeyType::String,
             },
+            None,
             1,
         )
         .unwrap();
@@ -721,6 +727,7 @@ mod tests {
                 name: "email".to_string(),
                 key_type: KeyType::String,
             },
+            None,
             1,
         );
         assert!(result.is_err());
@@ -743,6 +750,7 @@ mod tests {
                 name: "email".to_string(),
                 key_type: KeyType::String,
             },
+            None,
             1,
         );
         assert!(result.is_err());
@@ -807,6 +815,7 @@ mod tests {
                 name: "email".to_string(),
                 key_type: KeyType::String,
             },
+            None,
             4,
         )
         .unwrap();
@@ -872,6 +881,7 @@ mod tests {
                 name: "email".to_string(),
                 key_type: KeyType::String,
             },
+            None,
             3,
         )
         .unwrap();
@@ -906,6 +916,7 @@ mod tests {
                 name: "email".to_string(),
                 key_type: KeyType::String,
             },
+            None,
             1,
         )
         .unwrap();

@@ -141,6 +141,106 @@ fn increment_string_prefix(s: &str) -> Option<String> {
     String::from_utf8(incremented).ok()
 }
 
+/// Encode a single `KeyValue` with its type tag prefix.
+fn encode_tagged_kv(kv: &KeyValue) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::new();
+    out.push(composite::key_value_tag(kv));
+    out.extend(super::key_utils::encode_kv(kv)?);
+    Ok(out)
+}
+
+/// Encode an index partition key prefix: `[tag][pk_value]`.
+///
+/// All index entries with this PK value will sort after this prefix
+/// and before `increment_bytes(prefix)`.
+fn encode_index_prefix(index_pk: &KeyValue) -> Result<Vec<u8>, Error> {
+    encode_tagged_kv(index_pk)
+}
+
+/// Encode an index composite prefix: `[tag][pk_value][tag][sk_value]`.
+fn encode_index_composite(index_pk: &KeyValue, index_sk: &KeyValue) -> Result<Vec<u8>, Error> {
+    let mut out = encode_tagged_kv(index_pk)?;
+    out.push(composite::key_value_tag(index_sk));
+    out.extend(super::key_utils::encode_kv(index_sk)?);
+    Ok(out)
+}
+
+/// Compute the (start_key, end_key) for an index B+Tree range scan given
+/// the index partition key value and optional sort key condition.
+///
+/// Both bounds are byte vectors for the index key encoding.
+/// start_key is inclusive (>=), end_key is exclusive (<).
+pub fn compute_index_scan_bounds(
+    index_pk: &KeyValue,
+    sort_condition: Option<&SortCondition>,
+    sort_key_type: Option<KeyType>,
+) -> Result<ScanBounds, Error> {
+    let prefix = encode_index_prefix(index_pk)?;
+    let prefix_end = increment_bytes(&prefix);
+
+    match sort_condition {
+        None => {
+            // No sort condition: scan all entries with this index PK.
+            Ok((Some(prefix), prefix_end))
+        }
+        Some(cond) => {
+            let sk_type = sort_key_type.unwrap_or(KeyType::String);
+            match cond {
+                SortCondition::Eq(v) => {
+                    let sk = json_to_key_value(v, sk_type, "index_sort_key")?;
+                    let start = encode_index_composite(index_pk, &sk)?;
+                    let mut end = start.clone();
+                    end.push(0xFF);
+                    Ok((Some(start), Some(end)))
+                }
+                SortCondition::Lt(v) => {
+                    let sk = json_to_key_value(v, sk_type, "index_sort_key")?;
+                    let end = encode_index_composite(index_pk, &sk)?;
+                    Ok((Some(prefix), Some(end)))
+                }
+                SortCondition::Le(v) => {
+                    let sk = json_to_key_value(v, sk_type, "index_sort_key")?;
+                    let mut end = encode_index_composite(index_pk, &sk)?;
+                    end.push(0xFF);
+                    Ok((Some(prefix), Some(end)))
+                }
+                SortCondition::Gt(v) => {
+                    let sk = json_to_key_value(v, sk_type, "index_sort_key")?;
+                    let mut start = encode_index_composite(index_pk, &sk)?;
+                    start.push(0xFF);
+                    Ok((Some(start), prefix_end))
+                }
+                SortCondition::Ge(v) => {
+                    let sk = json_to_key_value(v, sk_type, "index_sort_key")?;
+                    let start = encode_index_composite(index_pk, &sk)?;
+                    Ok((Some(start), prefix_end))
+                }
+                SortCondition::Between(lo, hi) => {
+                    let sk_lo = json_to_key_value(lo, sk_type, "index_sort_key")?;
+                    let sk_hi = json_to_key_value(hi, sk_type, "index_sort_key")?;
+                    let start = encode_index_composite(index_pk, &sk_lo)?;
+                    let mut end = encode_index_composite(index_pk, &sk_hi)?;
+                    end.push(0xFF);
+                    Ok((Some(start), Some(end)))
+                }
+                SortCondition::BeginsWith(s) => {
+                    let sk_start = KeyValue::String(s.clone());
+                    let start = encode_index_composite(index_pk, &sk_start)?;
+
+                    let end = if let Some(incremented) = increment_string_prefix(s) {
+                        let sk_end = KeyValue::String(incremented);
+                        Some(encode_index_composite(index_pk, &sk_end)?)
+                    } else {
+                        prefix_end
+                    };
+
+                    Ok((Some(start), end))
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

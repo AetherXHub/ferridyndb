@@ -1,7 +1,7 @@
 use serde_json::Value;
 
 use crate::encoding::KeyValue;
-use crate::encoding::{binary, string};
+use crate::encoding::string;
 use crate::error::{EncodingError, Error, SchemaError};
 use crate::types::{
     IndexDefinition, KeyDefinition, KeyType, MAX_DOCUMENT_SIZE, MAX_PARTITION_KEY_SIZE,
@@ -156,6 +156,16 @@ pub fn extract_pk_prefix(pk: &KeyValue) -> Option<String> {
     }
 }
 
+/// Encode a [`KeyValue`] into its raw byte representation (without type tag).
+pub(crate) fn encode_kv(kv: &crate::encoding::KeyValue) -> Result<Vec<u8>, Error> {
+    use crate::encoding::{binary, number, string};
+    match kv {
+        crate::encoding::KeyValue::String(s) => Ok(string::encode_string(s)),
+        crate::encoding::KeyValue::Number(n) => Ok(number::encode_number(*n)?.to_vec()),
+        crate::encoding::KeyValue::Binary(b) => Ok(binary::encode_binary(b)),
+    }
+}
+
 /// Build the B+Tree key for a secondary index entry.
 ///
 /// The index key encodes: `(indexed_attribute_value, primary_composite_key_as_Binary)`.
@@ -168,7 +178,7 @@ pub fn build_index_key(
     doc: &Value,
     table_schema: &TableSchema,
 ) -> Result<Option<Vec<u8>>, Error> {
-    use crate::encoding::{binary, composite};
+    use crate::encoding::composite;
 
     // Extract the indexed attribute value from the document.
     let index_attr_val = match doc.get(&index.index_key.name) {
@@ -194,23 +204,29 @@ pub fn build_index_key(
     };
     let primary_key_bytes = composite::encode_composite(&pk, sk.as_ref())?;
 
-    // Build the index key manually: indexed_value + TAG_BINARY + primary_key_bytes
+    // Build the index key manually: indexed_value [+ sort_key_value] + TAG_BINARY + primary_key_bytes
     // The primary key bytes are the LAST component, so we don't need a terminator.
     let mut index_key = Vec::new();
 
-    // Part 1: encode the indexed attribute value
-    index_key.push(match &index_kv {
-        KeyValue::String(_) => composite::TAG_STRING,
-        KeyValue::Number(_) => composite::TAG_NUMBER,
-        KeyValue::Binary(_) => composite::TAG_BINARY,
-    });
-    index_key.extend(match &index_kv {
-        KeyValue::String(s) => crate::encoding::string::encode_string(s),
-        KeyValue::Number(n) => crate::encoding::number::encode_number(*n)?.to_vec(),
-        KeyValue::Binary(b) => binary::encode_binary(b),
-    });
+    // Part 1: encode the indexed attribute value (index partition key)
+    index_key.push(composite::key_value_tag(&index_kv));
+    index_key.extend(encode_kv(&index_kv)?);
 
-    // Part 2: append the TAG_BINARY and raw primary key bytes (no terminator needed - it's the last field)
+    // Part 2 (optional): encode the index sort key value
+    if let Some(ref sk_def) = index.index_sort_key {
+        let sk_val = match doc.get(&sk_def.name) {
+            Some(val) => val,
+            None => return Ok(None), // Missing sort key attr → skip
+        };
+        let sk_kv = match json_to_key_value(sk_val, sk_def.key_type, &sk_def.name) {
+            Ok(kv) => kv,
+            Err(_) => return Ok(None), // Type mismatch → skip
+        };
+        index_key.push(composite::key_value_tag(&sk_kv));
+        index_key.extend(encode_kv(&sk_kv)?);
+    }
+
+    // Part 3: append the TAG_BINARY and raw primary key bytes (no terminator needed - it's the last field)
     index_key.push(composite::TAG_BINARY);
     index_key.extend(&primary_key_bytes);
 
@@ -219,44 +235,43 @@ pub fn build_index_key(
 
 /// Decode the primary composite key bytes from an index entry's B+Tree key.
 ///
-/// The index key is: indexed_value + TAG_BINARY + primary_key_bytes.
-/// This extracts the primary key bytes (everything after the TAG_BINARY).
-pub fn decode_primary_key_from_index_entry(index_key: &[u8]) -> Result<Vec<u8>, Error> {
+/// The index key is:
+/// - Without sort key: `[tag][pk_value][TAG_BINARY][primary_key_bytes]`
+/// - With sort key:    `[tag][pk_value][tag][sk_value][TAG_BINARY][primary_key_bytes]`
+///
+/// When `index_sort_key_type` is `Some`, the decoder skips past the sort key
+/// component before looking for `TAG_BINARY + primary_key_bytes`.
+pub fn decode_primary_key_from_index_entry(
+    index_key: &[u8],
+    index_sort_key_type: Option<KeyType>,
+) -> Result<Vec<u8>, Error> {
     use crate::encoding::composite;
 
     if index_key.is_empty() {
         return Err(crate::error::EncodingError::MalformedKey.into());
     }
 
-    // Decode the first component (indexed value)
+    // Decode the first component (index partition key value)
     let first_tag = index_key[0];
-    let first_type = composite::tag_to_key_type(first_tag)?;
+    let (_first_kv, first_consumed) = composite::decode_key_value(first_tag, &index_key[1..])?;
+    let mut offset = 1 + first_consumed; // tag + value bytes
 
-    // Calculate how many bytes the first component consumed
-    let bytes_consumed = match first_type {
-        crate::types::KeyType::String => {
-            // Find the null terminator
-            let pos = index_key[1..]
-                .iter()
-                .position(|&b| b == 0x00)
-                .ok_or(crate::error::EncodingError::MalformedKey)?;
-            1 + pos + 1 // tag + string bytes + terminator
+    // If index has a sort key, decode and skip the second component
+    if index_sort_key_type.is_some() {
+        if offset >= index_key.len() {
+            return Err(crate::error::EncodingError::MalformedKey.into());
         }
-        crate::types::KeyType::Number => {
-            1 + 8 // tag + 8 bytes for f64
-        }
-        crate::types::KeyType::Binary => {
-            let (_decoded, consumed) = binary::decode_binary(&index_key[1..])?;
-            1 + consumed // tag + escaped binary with terminator
-        }
-    };
+        let sk_tag = index_key[offset];
+        let (_sk_kv, sk_consumed) = composite::decode_key_value(sk_tag, &index_key[offset + 1..])?;
+        offset += 1 + sk_consumed;
+    }
 
     // The rest should be: TAG_BINARY + primary_key_bytes
-    if bytes_consumed >= index_key.len() {
+    if offset >= index_key.len() {
         return Err(crate::error::EncodingError::MalformedKey.into());
     }
 
-    let remaining = &index_key[bytes_consumed..];
+    let remaining = &index_key[offset..];
     if remaining.is_empty() || remaining[0] != composite::TAG_BINARY {
         return Err(crate::error::StorageError::CorruptedPage(
             "index entry missing TAG_BINARY for primary key component".to_string(),
@@ -406,6 +421,7 @@ mod tests {
                 name: "email".to_string(),
                 key_type: KeyType::String,
             },
+            index_sort_key: None,
             root_page: 0,
         };
         let doc = json!({
@@ -419,7 +435,7 @@ mod tests {
         assert!(index_key.is_some());
 
         let index_key = index_key.unwrap();
-        let primary_bytes = decode_primary_key_from_index_entry(&index_key).unwrap();
+        let primary_bytes = decode_primary_key_from_index_entry(&index_key, None).unwrap();
 
         // Verify the primary key bytes match what encode_composite would produce
         use crate::encoding::composite;
@@ -449,6 +465,7 @@ mod tests {
                 name: "email".to_string(),
                 key_type: KeyType::String,
             },
+            index_sort_key: None,
             root_page: 0,
         };
         let doc = json!({"pk": "CONTACT#alice", "name": "Alice"});
@@ -475,6 +492,7 @@ mod tests {
                 name: "email".to_string(),
                 key_type: KeyType::String,
             },
+            index_sort_key: None,
             root_page: 0,
         };
         // email is a number, but index expects String
@@ -502,6 +520,7 @@ mod tests {
                 name: "email".to_string(),
                 key_type: KeyType::String,
             },
+            index_sort_key: None,
             root_page: 0,
         };
         let doc = json!({"pk": "CONTACT#alice", "email": "alice@example.com"});
@@ -509,7 +528,7 @@ mod tests {
         let index_key = build_index_key(&index, &doc, &table_schema).unwrap();
         assert!(index_key.is_some());
 
-        let primary_bytes = decode_primary_key_from_index_entry(&index_key.unwrap()).unwrap();
+        let primary_bytes = decode_primary_key_from_index_entry(&index_key.unwrap(), None).unwrap();
         use crate::encoding::composite;
         let expected =
             composite::encode_composite(&KeyValue::String("CONTACT#alice".to_string()), None)

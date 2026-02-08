@@ -30,7 +30,9 @@ JSON-over-newlines on Unix domain socket. Each request is one JSON line, each re
 {"op":"batch_get_item","table":"users","keys":[{"partition_key":"alice"},{"partition_key":"bob"}],"projection":["name"]}
 {"op":"create_index","table":"data","name":"email-idx","partition_schema":"CONTACT","index_key":{"name":"email","type":"String"}}
 {"op":"create_index","table":"data","name":"status-idx","index_key":{"name":"status","type":"String"}}
+{"op":"create_index","table":"data","name":"age-status-idx","index_key":{"name":"status","type":"String"},"index_sort_key":{"name":"age","type":"Number"}}
 {"op":"query_index","table":"data","index_name":"status-idx","key_value":"active"}
+{"op":"query_index","table":"data","index_name":"age-status-idx","key_value":"active","sort_key_condition":{"Between":[25,50]}}
 {"op":"query_index","table":"data","index_name":"email-idx","key_value":"alice@example.com","projection":["name"]}
 {"op":"drop_index","table":"data","index_name":"status-idx"}
 {"op":"list_partition_keys","table":"users","limit":20}
@@ -116,7 +118,7 @@ ferridyn-server [--db PATH] [--socket PATH]
 - **Stale socket cleanup**: Automatically removes socket file from crashed servers
 - **Version tracking**: Optimistic locking with version numbers for conditional updates
 - **Projection expressions**: Return only selected attributes from read operations (get, query, scan, batch_get, query_index)
-- **Secondary indexes**: Scoped (partition schema prefix) and global (table-wide) secondary indexes with automatic backfill and page reclamation on drop
+- **Secondary indexes**: Scoped (partition schema prefix) and global (table-wide) secondary indexes with composite keys (partition + sort), automatic backfill, sort key range conditions, and page reclamation on drop
 
 ## Concurrency Model
 

@@ -398,6 +398,8 @@ fn exec_create_index(
         Some(schema_prefix),
         key_attr,
         key_type_to_str(key_type),
+        None,
+        None,
     ))?;
     Ok(CommandResult::Ok(format!(
         "Index '{name}' created on table '{table}'."
@@ -443,7 +445,8 @@ fn exec_query_index(
     desc: bool,
 ) -> Result<CommandResult, ClientError> {
     let fwd = if desc { Some(false) } else { None };
-    let result = rt
-        .block_on(client.query_index(table, index_name, key_value, limit, fwd, None, None, None))?;
+    let result = rt.block_on(client.query_index(
+        table, index_name, key_value, None, limit, fwd, None, None, None,
+    ))?;
     Ok(CommandResult::QueryResult(result))
 }

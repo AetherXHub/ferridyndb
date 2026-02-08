@@ -66,6 +66,8 @@ pub struct IndexInfo {
     pub partition_schema: Option<String>,
     pub index_key_name: String,
     pub index_key_type: String,
+    pub index_sort_key_name: Option<String>,
+    pub index_sort_key_type: Option<String>,
 }
 
 /// Input for creating a partition schema attribute.
@@ -619,6 +621,7 @@ impl FerridynClient {
     // -- Secondary index operations --
 
     /// Create a secondary index.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_index(
         &mut self,
         table: &str,
@@ -626,6 +629,8 @@ impl FerridynClient {
         partition_schema: Option<&str>,
         index_key_name: &str,
         index_key_type: &str,
+        index_sort_key_name: Option<&str>,
+        index_sort_key_type: Option<&str>,
     ) -> Result<()> {
         let mut req = serde_json::json!({
             "op": "create_index",
@@ -638,6 +643,12 @@ impl FerridynClient {
         });
         if let Some(ps) = partition_schema {
             req["partition_schema"] = serde_json::Value::String(ps.to_string());
+        }
+        if let (Some(sk_name), Some(sk_type)) = (index_sort_key_name, index_sort_key_type) {
+            req["index_sort_key"] = serde_json::json!({
+                "name": sk_name,
+                "type": sk_type,
+            });
         }
         let resp = self.send_request(&req).await?;
         check_ok(&resp)
@@ -718,6 +729,7 @@ impl FerridynClient {
         table: &str,
         index_name: &str,
         key_value: Value,
+        sort_key_condition: Option<SortKeyCondition>,
         limit: Option<usize>,
         scan_forward: Option<bool>,
         filter: Option<FilterExpr>,
@@ -731,6 +743,12 @@ impl FerridynClient {
             "key_value": key_value,
         });
         let obj = req.as_object_mut().unwrap();
+        if let Some(cond) = sort_key_condition {
+            obj.insert(
+                "sort_key_condition".to_string(),
+                serde_json::to_value(cond).unwrap(),
+            );
+        }
         if let Some(n) = limit {
             obj.insert("limit".to_string(), serde_json::json!(n));
         }
@@ -1038,5 +1056,15 @@ fn parse_index_info(v: &Value) -> IndexInfo {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
+        index_sort_key_name: v
+            .get("index_sort_key")
+            .and_then(|v| v.get("name"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        index_sort_key_type: v
+            .get("index_sort_key")
+            .and_then(|v| v.get("type"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
     }
 }

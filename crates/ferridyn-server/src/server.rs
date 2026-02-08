@@ -244,7 +244,15 @@ fn dispatch(db: &FerridynDB, req: Request) -> Response {
             name,
             partition_schema,
             index_key,
-        } => handle_create_index(db, &table, &name, partition_schema.as_deref(), index_key),
+            index_sort_key,
+        } => handle_create_index(
+            db,
+            &table,
+            &name,
+            partition_schema.as_deref(),
+            index_key,
+            index_sort_key,
+        ),
 
         Request::DropIndex { table, name } => handle_drop_index(db, &table, &name),
 
@@ -256,6 +264,7 @@ fn dispatch(db: &FerridynDB, req: Request) -> Response {
             table,
             index_name,
             key_value,
+            sort_key_condition,
             limit,
             scan_forward,
             filter,
@@ -266,6 +275,7 @@ fn dispatch(db: &FerridynDB, req: Request) -> Response {
             &table,
             &index_name,
             key_value,
+            sort_key_condition,
             limit,
             scan_forward,
             filter,
@@ -727,6 +737,7 @@ fn handle_create_index(
     name: &str,
     partition_schema: Option<&str>,
     index_key: KeyDef,
+    index_sort_key: Option<KeyDef>,
 ) -> Response {
     let key_type = match parse_key_type(&index_key.key_type) {
         Some(t) => t,
@@ -737,11 +748,26 @@ fn handle_create_index(
             );
         }
     };
-    let mut builder = db.create_index(table).name(name);
+    let mut builder = db
+        .create_index(table)
+        .name(name)
+        .index_key(&index_key.name, key_type);
     if let Some(ps) = partition_schema {
         builder = builder.partition_schema(ps);
     }
-    match builder.index_key(&index_key.name, key_type).execute() {
+    if let Some(sk) = index_sort_key {
+        let sk_type = match parse_key_type(&sk.key_type) {
+            Some(t) => t,
+            None => {
+                return Response::error(
+                    "InvalidKeyType",
+                    format!("unknown index sort key type: {}", sk.key_type),
+                );
+            }
+        };
+        builder = builder.index_sort_key(&sk.name, sk_type);
+    }
+    match builder.execute() {
         Ok(()) => Response::ok_empty(),
         Err(e) => dyn_error_to_response(e),
     }
@@ -774,6 +800,7 @@ fn handle_query_index(
     table: &str,
     index_name: &str,
     key_value: serde_json::Value,
+    sort_key_condition: Option<SortKeyCondition>,
     limit: Option<usize>,
     scan_forward: Option<bool>,
     filter: Option<FilterExpr>,
@@ -781,6 +808,19 @@ fn handle_query_index(
     projection: Option<Vec<String>>,
 ) -> Response {
     let mut builder = db.query_index(table, index_name).key_value(key_value);
+
+    if let Some(cond) = sort_key_condition {
+        builder = match cond {
+            SortKeyCondition::Eq { value } => builder.sort_key_eq(value),
+            SortKeyCondition::Lt { value } => builder.sort_key_lt(value),
+            SortKeyCondition::Le { value } => builder.sort_key_le(value),
+            SortKeyCondition::Gt { value } => builder.sort_key_gt(value),
+            SortKeyCondition::Ge { value } => builder.sort_key_ge(value),
+            SortKeyCondition::Between { low, high } => builder.sort_key_between(low, high),
+            SortKeyCondition::BeginsWith { prefix } => builder.sort_key_begins_with(&prefix),
+        };
+    }
+
     if let Some(n) = limit {
         builder = builder.limit(n);
     }
@@ -896,6 +936,10 @@ fn index_to_wire(index: &IndexDefinition) -> IndexDefWire {
             name: index.index_key.name.clone(),
             key_type: key_type_str(index.index_key.key_type).to_string(),
         },
+        index_sort_key: index.index_sort_key.as_ref().map(|sk| KeyDefWire {
+            name: sk.name.clone(),
+            key_type: key_type_str(sk.key_type).to_string(),
+        }),
     }
 }
 

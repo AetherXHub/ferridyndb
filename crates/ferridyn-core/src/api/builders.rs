@@ -16,7 +16,7 @@ use super::database::FerridynDB;
 use super::filter::FilterExpr;
 use super::key_utils;
 use super::projection;
-use super::query::{QueryResult, SortCondition, compute_scan_bounds};
+use super::query::{QueryResult, SortCondition, compute_index_scan_bounds, compute_scan_bounds};
 use super::update::UpdateAction;
 
 /// Marker: builder returns `()` on execute (default).
@@ -1282,6 +1282,7 @@ pub struct IndexQueryBuilder<'a> {
     table: String,
     index_name: String,
     key_value: Option<Value>,
+    sort_condition: Option<SortCondition>,
     limit: Option<usize>,
     scan_forward: bool,
     filter: Option<FilterExpr>,
@@ -1296,6 +1297,7 @@ impl<'a> IndexQueryBuilder<'a> {
             table,
             index_name,
             key_value: None,
+            sort_condition: None,
             limit: None,
             scan_forward: true,
             filter: None,
@@ -1304,9 +1306,51 @@ impl<'a> IndexQueryBuilder<'a> {
         }
     }
 
-    /// Set the indexed attribute value to search for.
+    /// Set the indexed attribute value to search for (index partition key).
     pub fn key_value(mut self, val: impl Into<Value>) -> Self {
         self.key_value = Some(val.into());
+        self
+    }
+
+    /// Set the sort key condition to `= value` (composite index only).
+    pub fn sort_key_eq(mut self, value: impl Into<Value>) -> Self {
+        self.sort_condition = Some(SortCondition::Eq(value.into()));
+        self
+    }
+
+    /// Set the sort key condition to `< value` (composite index only).
+    pub fn sort_key_lt(mut self, value: impl Into<Value>) -> Self {
+        self.sort_condition = Some(SortCondition::Lt(value.into()));
+        self
+    }
+
+    /// Set the sort key condition to `<= value` (composite index only).
+    pub fn sort_key_le(mut self, value: impl Into<Value>) -> Self {
+        self.sort_condition = Some(SortCondition::Le(value.into()));
+        self
+    }
+
+    /// Set the sort key condition to `> value` (composite index only).
+    pub fn sort_key_gt(mut self, value: impl Into<Value>) -> Self {
+        self.sort_condition = Some(SortCondition::Gt(value.into()));
+        self
+    }
+
+    /// Set the sort key condition to `>= value` (composite index only).
+    pub fn sort_key_ge(mut self, value: impl Into<Value>) -> Self {
+        self.sort_condition = Some(SortCondition::Ge(value.into()));
+        self
+    }
+
+    /// Set the sort key condition to `BETWEEN low AND high` (composite index only).
+    pub fn sort_key_between(mut self, low: impl Into<Value>, high: impl Into<Value>) -> Self {
+        self.sort_condition = Some(SortCondition::Between(low.into(), high.into()));
+        self
+    }
+
+    /// Set the sort key condition to `begins_with(prefix)` (composite index only).
+    pub fn sort_key_begins_with(mut self, prefix: &str) -> Self {
+        self.sort_condition = Some(SortCondition::BeginsWith(prefix.to_string()));
         self
     }
 
@@ -1357,6 +1401,14 @@ impl<'a> IndexQueryBuilder<'a> {
                 .find(|idx| idx.name == self.index_name)
                 .ok_or_else(|| SchemaError::IndexNotFound(self.index_name.clone()))?;
 
+            // Validate: sort condition requires a composite index with a sort key.
+            if self.sort_condition.is_some() && index.index_sort_key.is_none() {
+                return Err(QueryError::InvalidCondition(
+                    "sort key condition on index without a sort key".to_string(),
+                )
+                .into());
+            }
+
             // Convert the search value to a KeyValue.
             let indexed_kv = key_utils::json_to_key_value(
                 &search_value,
@@ -1364,8 +1416,10 @@ impl<'a> IndexQueryBuilder<'a> {
                 &index.index_key.name,
             )?;
 
-            // Compute scan bounds for all entries with this indexed value.
-            let (start_key, end_key) = compute_scan_bounds(&indexed_kv, None, None)?;
+            // Compute scan bounds using index-specific encoding.
+            let idx_sk_type = index.index_sort_key.as_ref().map(|k| k.key_type);
+            let (start_key, end_key) =
+                compute_index_scan_bounds(&indexed_kv, self.sort_condition.as_ref(), idx_sk_type)?;
 
             // Encode the exclusive_start_key if provided.
             let skip_key = if let Some(ref esk) = self.exclusive_start_key {
@@ -1400,7 +1454,10 @@ impl<'a> IndexQueryBuilder<'a> {
                 }
 
                 // Decode the primary composite key bytes from the index entry.
-                let primary_key_bytes = key_utils::decode_primary_key_from_index_entry(index_key)?;
+                let primary_key_bytes = key_utils::decode_primary_key_from_index_entry(
+                    index_key,
+                    index.index_sort_key.as_ref().map(|k| k.key_type),
+                )?;
 
                 // Fetch the full document from the primary table.
                 let doc_bytes = mvcc_ops::mvcc_get(
@@ -1582,6 +1639,7 @@ pub struct CreateIndexBuilder<'a> {
     name: Option<String>,
     partition_schema: Option<String>,
     index_key: Option<(String, KeyType)>,
+    index_sort_key: Option<(String, KeyType)>,
 }
 
 impl<'a> CreateIndexBuilder<'a> {
@@ -1592,6 +1650,7 @@ impl<'a> CreateIndexBuilder<'a> {
             name: None,
             partition_schema: None,
             index_key: None,
+            index_sort_key: None,
         }
     }
 
@@ -1607,9 +1666,15 @@ impl<'a> CreateIndexBuilder<'a> {
         self
     }
 
-    /// Set the attribute to index and its key type.
+    /// Set the attribute to index and its key type (index partition key).
     pub fn index_key(mut self, attr_name: &str, key_type: KeyType) -> Self {
         self.index_key = Some((attr_name.to_string(), key_type));
+        self
+    }
+
+    /// Set an optional index sort key attribute and type for composite index keys.
+    pub fn index_sort_key(mut self, attr_name: &str, key_type: KeyType) -> Self {
+        self.index_sort_key = Some((attr_name.to_string(), key_type));
         self
     }
 
@@ -1625,6 +1690,9 @@ impl<'a> CreateIndexBuilder<'a> {
             name: attr_name,
             key_type,
         };
+        let sort_key_def = self
+            .index_sort_key
+            .map(|(name, key_type)| KeyDefinition { name, key_type });
         let table = self.table;
 
         self.db.transact(move |txn| {
@@ -1635,6 +1703,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 name,
                 partition_schema,
                 key_def,
+                sort_key_def,
                 txn.txn_id,
             )?;
             txn.catalog_root = new_root;
@@ -1698,7 +1767,7 @@ fn encode_index_exclusive_start_key(
     schema: &TableSchema,
     index: &crate::types::IndexDefinition,
 ) -> Result<Vec<u8>, Error> {
-    use crate::encoding::{binary, composite};
+    use crate::encoding::composite;
 
     // Extract and validate the indexed attribute value.
     let index_attr_val = esk.get(&index.index_key.name).ok_or_else(|| {
@@ -1758,18 +1827,31 @@ fn encode_index_exclusive_start_key(
     // Build the primary composite key bytes.
     let primary_key_bytes = composite::encode_composite(&pk, sk.as_ref())?;
 
-    // Build the index key: [tag][indexed_value][TAG_BINARY][primary_key_bytes]
+    // Build the index key: [tag][indexed_value]([tag][sk_value])?[TAG_BINARY][primary_key_bytes]
     // Same format as build_index_key() in key_utils.rs.
     let mut index_key = Vec::new();
 
     index_key.push(composite::key_value_tag(&index_kv));
-    index_key.extend(match &index_kv {
-        crate::encoding::KeyValue::String(s) => crate::encoding::string::encode_string(s),
-        crate::encoding::KeyValue::Number(n) => {
-            crate::encoding::number::encode_number(*n)?.to_vec()
-        }
-        crate::encoding::KeyValue::Binary(b) => binary::encode_binary(b),
-    });
+    index_key.extend(key_utils::encode_kv(&index_kv)?);
+
+    // Encode the optional index sort key component.
+    if let Some(ref sk_def) = index.index_sort_key {
+        let sk_attr_val = esk.get(&sk_def.name).ok_or_else(|| {
+            QueryError::InvalidIndexCursor(format!(
+                "missing index sort key '{}' in cursor",
+                sk_def.name
+            ))
+        })?;
+        let sk_kv = key_utils::json_to_key_value(sk_attr_val, sk_def.key_type, &sk_def.name)
+            .map_err(|e| {
+                QueryError::InvalidIndexCursor(format!(
+                    "invalid type for index sort key '{}': {e}",
+                    sk_def.name
+                ))
+            })?;
+        index_key.push(composite::key_value_tag(&sk_kv));
+        index_key.extend(key_utils::encode_kv(&sk_kv)?);
+    }
 
     index_key.push(composite::TAG_BINARY);
     index_key.extend(&primary_key_bytes);
@@ -1789,10 +1871,26 @@ fn build_index_last_evaluated_key(
 
     // Decode the indexed attribute value from the first component.
     let tag = index_key_bytes[0];
-    let (index_kv, _consumed) = composite::decode_key_value(tag, &index_key_bytes[1..])?;
+    let (index_kv, consumed) = composite::decode_key_value(tag, &index_key_bytes[1..])?;
+
+    // Decode the optional index sort key from the second component.
+    let index_sk_kv = if index.index_sort_key.is_some() {
+        let rest = &index_key_bytes[1 + consumed..];
+        if rest.is_empty() {
+            return Err(crate::error::EncodingError::MalformedKey.into());
+        }
+        let sk_tag = rest[0];
+        let (sk_kv, _sk_consumed) = composite::decode_key_value(sk_tag, &rest[1..])?;
+        Some(sk_kv)
+    } else {
+        None
+    };
 
     // Extract primary key bytes from the index entry.
-    let primary_bytes = key_utils::decode_primary_key_from_index_entry(index_key_bytes)?;
+    let primary_bytes = key_utils::decode_primary_key_from_index_entry(
+        index_key_bytes,
+        index.index_sort_key.as_ref().map(|k| k.key_type),
+    )?;
 
     // Decode the primary composite key.
     let has_sort_key = schema.sort_key.is_some();
@@ -1804,6 +1902,9 @@ fn build_index_last_evaluated_key(
         index.index_key.name.clone(),
         key_utils::key_value_to_json(&index_kv),
     );
+    if let (Some(sk_def), Some(sk_kv)) = (&index.index_sort_key, index_sk_kv) {
+        obj.insert(sk_def.name.clone(), key_utils::key_value_to_json(&sk_kv));
+    }
     obj.insert(
         schema.partition_key.name.clone(),
         key_utils::key_value_to_json(&pk),

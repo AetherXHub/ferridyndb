@@ -126,6 +126,10 @@ pub struct PartitionSchema {
 /// When `partition_schema` is `Some(prefix)`, only documents whose partition
 /// key starts with that prefix are indexed (scoped index). When `None`, all
 /// documents with the indexed attribute are indexed (global index).
+///
+/// When `index_sort_key` is set, the index key becomes a composite:
+/// `[tag][pk_value][tag][sk_value][TAG_BINARY][primary_key_bytes]`.
+/// This enables range queries on the index sort key within an index partition.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IndexDefinition {
     /// Unique index name (e.g., `"contact-email-index"`).
@@ -134,8 +138,11 @@ pub struct IndexDefinition {
     /// global indexes that span the entire table.
     #[serde(default)]
     pub partition_schema: Option<String>,
-    /// The document attribute to index on.
+    /// The document attribute to index on (index partition key).
     pub index_key: KeyDefinition,
+    /// Optional index sort key for composite index keys.
+    #[serde(default)]
+    pub index_sort_key: Option<KeyDefinition>,
     /// B+Tree root page for this index.
     pub root_page: PageId,
 }
