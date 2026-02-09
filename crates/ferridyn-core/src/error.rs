@@ -135,6 +135,9 @@ pub enum SchemaError {
 
     #[error("stream not enabled on table: {0}")]
     StreamNotEnabled(String),
+
+    #[error("table has no ttl_attribute configured: {0}")]
+    TtlNotConfigured(String),
 }
 
 #[derive(Debug, Error)]
@@ -159,6 +162,9 @@ pub enum QueryError {
 
     #[error("invalid index pagination cursor: {0}")]
     InvalidIndexCursor(String),
+
+    #[error("item not found")]
+    ItemNotFound,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

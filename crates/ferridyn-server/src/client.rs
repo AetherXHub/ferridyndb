@@ -918,6 +918,71 @@ impl FerridynClient {
         stream_info_from_response(&resp)
     }
 
+    // -- TTL operations --
+
+    /// Set a TTL on an existing item.
+    pub async fn set_ttl(
+        &mut self,
+        table: &str,
+        partition_key: Value,
+        sort_key: Option<Value>,
+        ttl_seconds: u64,
+    ) -> Result<()> {
+        let req = serde_json::json!({
+            "op": "set_ttl",
+            "table": table,
+            "partition_key": partition_key,
+            "sort_key": sort_key,
+            "ttl_seconds": ttl_seconds,
+        });
+        let resp = self.send_request(&req).await?;
+        check_ok(&resp)
+    }
+
+    /// Remove the TTL from an item, making it permanent.
+    pub async fn remove_ttl(
+        &mut self,
+        table: &str,
+        partition_key: Value,
+        sort_key: Option<Value>,
+    ) -> Result<()> {
+        let req = serde_json::json!({
+            "op": "remove_ttl",
+            "table": table,
+            "partition_key": partition_key,
+            "sort_key": sort_key,
+        });
+        let resp = self.send_request(&req).await?;
+        check_ok(&resp)
+    }
+
+    /// Get the remaining TTL (in seconds) for an item.
+    pub async fn get_ttl(
+        &mut self,
+        table: &str,
+        partition_key: Value,
+        sort_key: Option<Value>,
+    ) -> Result<Option<u64>> {
+        let req = serde_json::json!({
+            "op": "get_ttl",
+            "table": table,
+            "partition_key": partition_key,
+            "sort_key": sort_key,
+        });
+        let resp = self.send_request(&req).await?;
+        ttl_from_response(&resp)
+    }
+
+    /// Sweep expired TTL items from a table.
+    pub async fn sweep_expired_ttl(&mut self, table: &str) -> Result<usize> {
+        let req = serde_json::json!({
+            "op": "sweep_expired_ttl",
+            "table": table,
+        });
+        let resp = self.send_request(&req).await?;
+        succeeded_from_response(&resp)
+    }
+
     /// Prune old stream records based on retention settings.
     pub async fn prune_stream(&mut self, table: &str) -> Result<()> {
         let req = serde_json::json!({
@@ -1283,6 +1348,13 @@ fn stream_info_from_response(resp: &Value) -> Result<StreamInfo> {
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as usize,
     })
+}
+
+fn ttl_from_response(resp: &Value) -> Result<Option<u64>> {
+    check_error(resp)?;
+    Ok(resp
+        .get("remaining_seconds")
+        .and_then(|v| if v.is_null() { None } else { v.as_u64() }))
 }
 
 fn parse_stream_record(v: &Value) -> StreamRecordInfo {

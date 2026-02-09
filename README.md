@@ -10,7 +10,7 @@ A local, embedded, DynamoDB-style document database written in Rust with single-
 - **B+Tree indexing** — Efficient range scans with slotted pages and overflow support
 - **Partition schemas & secondary indexes** — Declare entity types with prefix-based schemas, create scoped or global secondary indexes (GSI) with composite keys (partition + sort), local secondary indexes (LSI) with alternate sort keys, index projections (KeysOnly, Include, All), and automatic backfill, and query by indexed attribute values with sort key range conditions
 - **Byte-ordered key encoding** — Enables fast `memcmp`-based comparisons for partition and sort keys
-- **TTL support** — Optional time-to-live attributes with automatic expiry filtering
+- **TTL support** — Optional time-to-live attributes with automatic expiry filtering, convenience methods (`set_ttl`, `remove_ttl`, `get_ttl`), background reaper thread, and server wire protocol support
 - **Condition expressions** — Predicates on write operations (`put`, `delete`, `update`) that evaluate against the existing item before proceeding, enabling prevent-overwrite and business rule enforcement
 - **ReturnValues** — Write operations optionally return the old or new document via type-state builders (`.return_old()`, `.return_new()`) with compile-time return type safety
 - **Change streams** — Per-table change data capture (CDC) with configurable view types (KeysOnly, NewImage, OldImage, NewAndOldImages), poll-based consumption by sequence number, retention pruning, and atomic capture (stream records commit with data writes)
@@ -337,7 +337,7 @@ db2.disable_stream("users").unwrap(); // preserves existing records
 # Compile all crates
 cargo build
 
-# Run all tests (743 tests across workspace)
+# Run all tests (758 tests across workspace)
 cargo test
 
 # Run tests for a specific crate

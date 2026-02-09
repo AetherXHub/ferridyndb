@@ -596,6 +596,156 @@ impl FerridynDB {
         Ok(count)
     }
 
+    /// Start a background reaper thread that periodically sweeps expired TTL items.
+    ///
+    /// The reaper checks all tables at the given `interval`. For each table with
+    /// a `ttl_attribute`, it calls `sweep_expired_ttl()` in a loop until no more
+    /// expired items remain.
+    ///
+    /// Returns a [`super::reaper::ReaperHandle`] — dropping or calling `.stop()`
+    /// on it will terminate the background thread.
+    pub fn start_reaper(&self, interval: std::time::Duration) -> super::reaper::ReaperHandle {
+        super::reaper::start_reaper(self.clone(), interval)
+    }
+
+    /// Set a TTL (time-to-live) on an existing item.
+    ///
+    /// `ttl_seconds` is the number of seconds from now until the item expires.
+    /// The table must have a `ttl_attribute` configured, and the item must exist.
+    pub fn set_ttl(
+        &self,
+        table: &str,
+        partition_key: Value,
+        sort_key: Option<Value>,
+        ttl_seconds: u64,
+    ) -> Result<(), Error> {
+        let schema = self.describe_table(table)?;
+        let ttl_attr = schema
+            .ttl_attribute
+            .ok_or_else(|| SchemaError::TtlNotConfigured(table.to_string()))?;
+
+        // Verify the item exists (get_item filters expired items).
+        let mut builder = self.get_item(table).partition_key(partition_key.clone());
+        if let Some(ref sk) = sort_key {
+            builder = builder.sort_key(sk.clone());
+        }
+        if builder.execute()?.is_none() {
+            return Err(QueryError::ItemNotFound.into());
+        }
+
+        let expires_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as f64
+            + ttl_seconds as f64;
+
+        let mut update = self.update_item(table).partition_key(partition_key);
+        if let Some(sk) = sort_key {
+            update = update.sort_key(sk);
+        }
+        update.set(&ttl_attr, Value::from(expires_at)).execute()
+    }
+
+    /// Remove the TTL from an item, making it permanent.
+    ///
+    /// Sets the TTL attribute to 0 (which means "never expires").
+    /// The table must have a `ttl_attribute` configured.
+    pub fn remove_ttl(
+        &self,
+        table: &str,
+        partition_key: Value,
+        sort_key: Option<Value>,
+    ) -> Result<(), Error> {
+        let schema = self.describe_table(table)?;
+        let ttl_attr = schema
+            .ttl_attribute
+            .ok_or_else(|| SchemaError::TtlNotConfigured(table.to_string()))?;
+
+        let mut update = self.update_item(table).partition_key(partition_key);
+        if let Some(sk) = sort_key {
+            update = update.sort_key(sk);
+        }
+        update.set(&ttl_attr, Value::from(0)).execute()
+    }
+
+    /// Get the remaining TTL (in seconds) for an item.
+    ///
+    /// Returns:
+    /// - `Ok(None)` if the item doesn't exist or has no TTL set (attribute missing, zero, or non-numeric)
+    /// - `Ok(Some(0))` if the item is already expired
+    /// - `Ok(Some(n))` with the remaining seconds until expiry
+    pub fn get_ttl(
+        &self,
+        table: &str,
+        partition_key: Value,
+        sort_key: Option<Value>,
+    ) -> Result<Option<u64>, Error> {
+        let schema = self.describe_table(table)?;
+        let ttl_attr = schema
+            .ttl_attribute
+            .ok_or_else(|| SchemaError::TtlNotConfigured(table.to_string()))?;
+
+        // Use read_snapshot to bypass TTL filtering (so we can read expired items).
+        let doc = self.read_snapshot(|store, catalog_root, snapshot_txn| {
+            let entry = self.cached_get_table(store, catalog_root, table)?;
+            let schema = &entry.schema;
+
+            use super::key_utils;
+            use crate::encoding::composite;
+
+            let pk = key_utils::json_to_key_value(
+                &partition_key,
+                schema.partition_key.key_type,
+                &schema.partition_key.name,
+            )?;
+            let sk = match (&sort_key, &schema.sort_key) {
+                (Some(sk_val), Some(sk_def)) => Some(key_utils::json_to_key_value(
+                    sk_val,
+                    sk_def.key_type,
+                    &sk_def.name,
+                )?),
+                _ => None,
+            };
+            let composite_key = composite::encode_composite(&pk, sk.as_ref())?;
+            let raw =
+                mvcc_ops::mvcc_get(store, entry.data_root_page, &composite_key, snapshot_txn)?;
+            match raw {
+                Some(value_bytes) => {
+                    let val: Value = rmp_serde::from_slice(&value_bytes).map_err(|e| {
+                        StorageError::CorruptedPage(format!("failed to deserialize document: {e}"))
+                    })?;
+                    Ok(Some(val))
+                }
+                None => Ok(None),
+            }
+        })?;
+
+        let Some(doc) = doc else {
+            return Ok(None);
+        };
+
+        let Some(ttl_val) = doc.get(&ttl_attr) else {
+            return Ok(None);
+        };
+        let Some(epoch_secs) = ttl_val.as_f64() else {
+            return Ok(None);
+        };
+        if epoch_secs == 0.0 {
+            return Ok(None);
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+
+        if epoch_secs <= now {
+            return Ok(Some(0));
+        }
+
+        Ok(Some((epoch_secs - now) as u64))
+    }
+
     /// Execute a write transaction.
     ///
     /// The closure receives a mutable [`Transaction`] to make changes.
@@ -2034,6 +2184,160 @@ mod ttl_tests {
         let result = db.query("events").partition_key("u1").execute().unwrap();
         assert_eq!(result.items.len(), 1);
         assert_eq!(result.items[0]["sk"], 2.0);
+    }
+
+    #[test]
+    fn test_set_ttl_updates_expiry() {
+        let (db, _dir) = create_test_db();
+        db.create_table("cache")
+            .partition_key("key", KeyType::String)
+            .ttl_attribute("expires")
+            .execute()
+            .unwrap();
+
+        // Insert an item with no TTL.
+        db.put_item("cache", json!({"key": "a", "val": "data"}))
+            .unwrap();
+
+        // Set a very short TTL (1 second).
+        db.set_ttl("cache", json!("a"), None, 1).unwrap();
+
+        // Item should still be visible immediately.
+        let item = db.get_item("cache").partition_key("a").execute().unwrap();
+        assert!(item.is_some(), "item should be visible right after set_ttl");
+
+        // Wait for TTL to expire.
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        // Item should now be invisible.
+        let item = db.get_item("cache").partition_key("a").execute().unwrap();
+        assert!(item.is_none(), "item should be invisible after TTL expires");
+    }
+
+    #[test]
+    fn test_set_ttl_on_table_without_ttl_attribute() {
+        let (db, _dir) = create_test_db();
+        db.create_table("plain")
+            .partition_key("id", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put_item("plain", json!({"id": "x", "val": 1})).unwrap();
+
+        let result = db.set_ttl("plain", json!("x"), None, 60);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("ttl_attribute"),
+            "expected TtlNotConfigured error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_set_ttl_on_nonexistent_item() {
+        let (db, _dir) = create_test_db();
+        db.create_table("cache")
+            .partition_key("key", KeyType::String)
+            .ttl_attribute("expires")
+            .execute()
+            .unwrap();
+
+        let result = db.set_ttl("cache", json!("nonexistent"), None, 60);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("not found"),
+            "expected ItemNotFound error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_remove_ttl_makes_permanent() {
+        let (db, _dir) = create_test_db();
+        db.create_table("cache")
+            .partition_key("key", KeyType::String)
+            .ttl_attribute("expires")
+            .execute()
+            .unwrap();
+
+        // Insert with a short TTL.
+        db.set_ttl("cache", json!("a"), None, 1).unwrap_err(); // item doesn't exist yet
+
+        db.put_item("cache", json!({"key": "a", "val": "data"}))
+            .unwrap();
+        db.set_ttl("cache", json!("a"), None, 1).unwrap();
+
+        // Remove the TTL immediately.
+        db.remove_ttl("cache", json!("a"), None).unwrap();
+
+        // Wait past what would have been the expiry.
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        // Item should still be visible (TTL was removed).
+        let item = db.get_item("cache").partition_key("a").execute().unwrap();
+        assert!(item.is_some(), "item should be permanent after remove_ttl");
+    }
+
+    #[test]
+    fn test_get_ttl_returns_remaining_seconds() {
+        let (db, _dir) = create_test_db();
+        db.create_table("cache")
+            .partition_key("key", KeyType::String)
+            .ttl_attribute("expires")
+            .execute()
+            .unwrap();
+
+        db.put_item("cache", json!({"key": "a", "val": "data"}))
+            .unwrap();
+
+        // Set a 3600-second TTL (1 hour).
+        db.set_ttl("cache", json!("a"), None, 3600).unwrap();
+
+        let remaining = db.get_ttl("cache", json!("a"), None).unwrap();
+        assert!(remaining.is_some());
+        let secs = remaining.unwrap();
+        // Should be close to 3600 (within 5 seconds of drift).
+        assert!(
+            secs >= 3595 && secs <= 3600,
+            "expected ~3600 remaining, got {secs}"
+        );
+    }
+
+    #[test]
+    fn test_get_ttl_no_ttl_set() {
+        let (db, _dir) = create_test_db();
+        db.create_table("cache")
+            .partition_key("key", KeyType::String)
+            .ttl_attribute("expires")
+            .execute()
+            .unwrap();
+
+        // Item without TTL attribute.
+        db.put_item("cache", json!({"key": "a", "val": "data"}))
+            .unwrap();
+
+        let remaining = db.get_ttl("cache", json!("a"), None).unwrap();
+        assert!(remaining.is_none(), "item without TTL should return None");
+    }
+
+    #[test]
+    fn test_get_ttl_already_expired() {
+        let (db, _dir) = create_test_db();
+        db.create_table("cache")
+            .partition_key("key", KeyType::String)
+            .ttl_attribute("expires")
+            .execute()
+            .unwrap();
+
+        // Insert with TTL in the past.
+        db.put_item(
+            "cache",
+            json!({"key": "old", "expires": 1000, "val": "expired"}),
+        )
+        .unwrap();
+
+        let remaining = db.get_ttl("cache", json!("old"), None).unwrap();
+        assert_eq!(remaining, Some(0), "expired item should return Some(0)");
     }
 }
 
@@ -8890,5 +9194,131 @@ mod sort_key_range_tests {
             .map(|i| i["ts"].as_f64().unwrap())
             .collect();
         assert_eq!(ts, vec![40.0, 30.0, 20.0]);
+    }
+}
+
+#[cfg(test)]
+mod reaper_tests {
+    use super::*;
+    use crate::types::KeyType;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    fn create_test_db() -> (FerridynDB, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = FerridynDB::create(&db_path).unwrap();
+        (db, dir)
+    }
+
+    #[test]
+    fn test_reaper_cleans_expired_items() {
+        let (db, _dir) = create_test_db();
+        db.create_table("cache")
+            .partition_key("key", KeyType::String)
+            .ttl_attribute("expires")
+            .execute()
+            .unwrap();
+
+        // Insert expired items.
+        db.put_item("cache", json!({"key": "a", "expires": 1000}))
+            .unwrap();
+        db.put_item("cache", json!({"key": "b", "expires": 2000}))
+            .unwrap();
+        db.put_item("cache", json!({"key": "alive", "expires": 9999999999.0}))
+            .unwrap();
+
+        // Start reaper with short interval.
+        let _handle = db.start_reaper(std::time::Duration::from_millis(100));
+
+        // Wait for the reaper to run at least once.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Expired items should be physically deleted (sweep removes them).
+        // Verify by checking sweep returns 0 (nothing left to clean).
+        let deleted = db.sweep_expired_ttl("cache").unwrap();
+        assert_eq!(
+            deleted, 0,
+            "reaper should have already cleaned expired items"
+        );
+
+        // The alive item should still be there.
+        let item = db
+            .get_item("cache")
+            .partition_key("alive")
+            .execute()
+            .unwrap();
+        assert!(item.is_some(), "non-expired item should survive reaper");
+    }
+
+    #[test]
+    fn test_reaper_skips_tables_without_ttl() {
+        let (db, _dir) = create_test_db();
+        db.create_table("plain")
+            .partition_key("id", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put_item("plain", json!({"id": "x", "expires": 1000, "val": "safe"}))
+            .unwrap();
+
+        let _handle = db.start_reaper(std::time::Duration::from_millis(100));
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Item should still exist — table has no TTL configured.
+        let item = db.get_item("plain").partition_key("x").execute().unwrap();
+        assert!(
+            item.is_some(),
+            "reaper should skip tables without ttl_attribute"
+        );
+    }
+
+    #[test]
+    fn test_reaper_stop() {
+        let (db, _dir) = create_test_db();
+
+        let mut handle = db.start_reaper(std::time::Duration::from_millis(100));
+
+        // Stop should return cleanly.
+        handle.stop();
+
+        // Calling stop again should be a no-op.
+        handle.stop();
+    }
+
+    #[test]
+    fn test_reaper_does_not_delete_live_items() {
+        let (db, _dir) = create_test_db();
+        db.create_table("cache")
+            .partition_key("key", KeyType::String)
+            .ttl_attribute("expires")
+            .execute()
+            .unwrap();
+
+        // All items have future TTL.
+        db.put_item(
+            "cache",
+            json!({"key": "a", "expires": 9999999999.0, "val": "live1"}),
+        )
+        .unwrap();
+        db.put_item(
+            "cache",
+            json!({"key": "b", "expires": 9999999999.0, "val": "live2"}),
+        )
+        .unwrap();
+        // Item with no TTL attribute (permanent).
+        db.put_item("cache", json!({"key": "c", "val": "permanent"}))
+            .unwrap();
+
+        let _handle = db.start_reaper(std::time::Duration::from_millis(100));
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // All items should still be visible.
+        let result = db.scan("cache").execute().unwrap();
+        assert_eq!(
+            result.items.len(),
+            3,
+            "reaper should not delete non-expired items"
+        );
     }
 }

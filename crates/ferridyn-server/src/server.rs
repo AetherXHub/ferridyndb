@@ -11,7 +11,7 @@ use tokio::net::UnixListener;
 use tracing::{error, info, warn};
 
 use ferridyn_core::api::{FerridynDB, FilterExpr};
-use ferridyn_core::error::{Error as DynError, SchemaError, TxnError};
+use ferridyn_core::error::{Error as DynError, QueryError, SchemaError, TxnError};
 use ferridyn_core::types::{AttrType, IndexDefinition, KeyType, PartitionSchema, TableSchema};
 
 use crate::protocol::{
@@ -311,6 +311,27 @@ fn dispatch(db: &FerridynDB, req: Request) -> Response {
         Request::GetStreamInfo { table } => handle_get_stream_info(db, &table),
 
         Request::PruneStream { table } => handle_prune_stream(db, &table),
+
+        Request::SetTtl {
+            table,
+            partition_key,
+            sort_key,
+            ttl_seconds,
+        } => handle_set_ttl(db, &table, partition_key, sort_key, ttl_seconds),
+
+        Request::RemoveTtl {
+            table,
+            partition_key,
+            sort_key,
+        } => handle_remove_ttl(db, &table, partition_key, sort_key),
+
+        Request::GetTtl {
+            table,
+            partition_key,
+            sort_key,
+        } => handle_get_ttl(db, &table, partition_key, sort_key),
+
+        Request::SweepExpiredTtl { table } => handle_sweep_expired_ttl(db, &table),
     }
 }
 
@@ -1018,6 +1039,50 @@ fn handle_prune_stream(db: &FerridynDB, table: &str) -> Response {
     }
 }
 
+fn handle_set_ttl(
+    db: &FerridynDB,
+    table: &str,
+    partition_key: serde_json::Value,
+    sort_key: Option<serde_json::Value>,
+    ttl_seconds: u64,
+) -> Response {
+    match db.set_ttl(table, partition_key, sort_key, ttl_seconds) {
+        Ok(()) => Response::ok_empty(),
+        Err(e) => dyn_error_to_response(e),
+    }
+}
+
+fn handle_remove_ttl(
+    db: &FerridynDB,
+    table: &str,
+    partition_key: serde_json::Value,
+    sort_key: Option<serde_json::Value>,
+) -> Response {
+    match db.remove_ttl(table, partition_key, sort_key) {
+        Ok(()) => Response::ok_empty(),
+        Err(e) => dyn_error_to_response(e),
+    }
+}
+
+fn handle_get_ttl(
+    db: &FerridynDB,
+    table: &str,
+    partition_key: serde_json::Value,
+    sort_key: Option<serde_json::Value>,
+) -> Response {
+    match db.get_ttl(table, partition_key, sort_key) {
+        Ok(remaining) => Response::ok_ttl(remaining),
+        Err(e) => dyn_error_to_response(e),
+    }
+}
+
+fn handle_sweep_expired_ttl(db: &FerridynDB, table: &str) -> Response {
+    match db.sweep_expired_ttl(table) {
+        Ok(count) => Response::ok_succeeded(count),
+        Err(e) => dyn_error_to_response(e),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -1198,6 +1263,13 @@ fn dyn_error_to_response(err: DynError) -> Response {
             "TableAlreadyExists",
             format!("table already exists: {name}"),
         ),
+        DynError::Schema(SchemaError::TtlNotConfigured(name)) => Response::error(
+            "TtlNotConfigured",
+            format!("table has no ttl_attribute configured: {name}"),
+        ),
+        DynError::Query(QueryError::ItemNotFound) => {
+            Response::error("ItemNotFound", "item not found")
+        }
         _ => Response::error("InternalError", err.to_string()),
     }
 }

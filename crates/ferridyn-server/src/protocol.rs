@@ -206,6 +206,29 @@ pub enum Request {
     PruneStream {
         table: String,
     },
+    // -- TTL operations --
+    SetTtl {
+        table: String,
+        partition_key: Value,
+        #[serde(default)]
+        sort_key: Option<Value>,
+        ttl_seconds: u64,
+    },
+    RemoveTtl {
+        table: String,
+        partition_key: Value,
+        #[serde(default)]
+        sort_key: Option<Value>,
+    },
+    GetTtl {
+        table: String,
+        partition_key: Value,
+        #[serde(default)]
+        sort_key: Option<Value>,
+    },
+    SweepExpiredTtl {
+        table: String,
+    },
 }
 
 /// Sort key condition for query requests.
@@ -400,6 +423,10 @@ pub enum OkResponse {
         ok: bool,
         stream_info: StreamInfoWire,
     },
+    Ttl {
+        ok: bool,
+        remaining_seconds: Option<u64>,
+    },
 }
 
 /// Table schema in wire format.
@@ -522,6 +549,13 @@ impl Response {
         Response::Ok(OkResponse::StreamInfoResult {
             ok: true,
             stream_info,
+        })
+    }
+
+    pub fn ok_ttl(remaining_seconds: Option<u64>) -> Self {
+        Response::Ok(OkResponse::Ttl {
+            ok: true,
+            remaining_seconds,
         })
     }
 }

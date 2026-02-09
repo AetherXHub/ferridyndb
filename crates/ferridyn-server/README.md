@@ -52,6 +52,10 @@ JSON-over-newlines on Unix domain socket. Each request is one JSON line, each re
 {"op":"get_stream_info","table":"orders"}
 {"op":"prune_stream","table":"orders"}
 {"op":"batch_write_item","operations":[{"op":"put","table":"users","item":{"user_id":"alice","name":"Alice"}},{"op":"delete","table":"users","partition_key":"old_user"}]}
+{"op":"set_ttl","table":"cache","partition_key":"a","ttl_seconds":3600}
+{"op":"remove_ttl","table":"cache","partition_key":"a"}
+{"op":"get_ttl","table":"cache","partition_key":"a"}
+{"op":"sweep_expired_ttl","table":"cache"}
 ```
 
 ### Response Examples
@@ -67,6 +71,8 @@ JSON-over-newlines on Unix domain socket. Each request is one JSON line, each re
 {"ok":true,"succeeded":2}
 {"ok":true,"records":[{"sequence_number":3,"sub_sequence":0,"event_type":"INSERT","keys":{"order_id":"o1"},"timestamp":1700000000.0}]}
 {"ok":true,"stream_info":{"enabled":true,"view_type":"NEW_AND_OLD_IMAGES","oldest_sequence":3,"latest_sequence":5,"record_count":3}}
+{"ok":true,"remaining_seconds":3595}
+{"ok":true,"remaining_seconds":null}
 ```
 
 ## Client Library
@@ -125,6 +131,12 @@ let records = client.get_stream_records("orders", None, Some(100)).await?;
 let info = client.get_stream_info("orders").await?;
 client.prune_stream("orders").await?;
 client.disable_stream("orders").await?;
+
+// TTL management
+client.set_ttl("cache", json!("session_123"), None, 3600).await?;      // expire in 1 hour
+let remaining = client.get_ttl("cache", json!("session_123"), None).await?; // Some(3599)
+client.remove_ttl("cache", json!("session_123"), None).await?;           // make permanent
+let swept = client.sweep_expired_ttl("cache").await?;                    // delete expired items
 ```
 
 ## Server Binary
@@ -154,6 +166,7 @@ ferridyn-server [--db PATH] [--socket PATH]
 - **Secondary indexes**: Scoped (partition schema prefix), global (table-wide), and local (same partition key, alternate sort key) secondary indexes with composite keys (partition + sort), index projections (KEYS_ONLY, INCLUDE, ALL), automatic backfill, sort key range conditions, and page reclamation on drop
 - **Batch writes**: Atomic multi-table put/delete batches (up to 25 operations) with all-or-nothing semantics
 - **Change streams**: Per-table change data capture with configurable view types (KEYS_ONLY, NEW_IMAGE, OLD_IMAGE, NEW_AND_OLD_IMAGES), poll-based consumption with sequence pagination, stream info, retention pruning, and enable/disable on existing tables
+- **TTL management**: Set, remove, and query item TTLs over the wire protocol; sweep expired items on demand
 
 ## Concurrency Model
 

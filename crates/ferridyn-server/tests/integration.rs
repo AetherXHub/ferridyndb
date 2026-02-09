@@ -2667,3 +2667,173 @@ async fn test_batch_write_empty() {
     let count = client.batch_write_item(&ops).await.unwrap();
     assert_eq!(count, 0);
 }
+
+// ---------------------------------------------------------------------------
+// TTL operations
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_set_ttl_over_wire() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    client
+        .create_table(
+            "cache",
+            KeyDef {
+                name: "key".to_string(),
+                key_type: "String".to_string(),
+            },
+            None,
+            Some("expires".to_string()),
+        )
+        .await
+        .unwrap();
+
+    client
+        .put_item("cache", json!({"key": "a", "val": "data"}))
+        .await
+        .unwrap();
+
+    // Set a 3600-second TTL.
+    client
+        .set_ttl("cache", json!("a"), None, 3600)
+        .await
+        .unwrap();
+
+    // Verify via get_ttl.
+    let remaining = client.get_ttl("cache", json!("a"), None).await.unwrap();
+    assert!(remaining.is_some());
+    let secs = remaining.unwrap();
+    assert!(
+        secs >= 3595 && secs <= 3600,
+        "expected ~3600 remaining, got {secs}"
+    );
+}
+
+#[tokio::test]
+async fn test_remove_ttl_over_wire() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    client
+        .create_table(
+            "cache",
+            KeyDef {
+                name: "key".to_string(),
+                key_type: "String".to_string(),
+            },
+            None,
+            Some("expires".to_string()),
+        )
+        .await
+        .unwrap();
+
+    client
+        .put_item("cache", json!({"key": "a", "val": "data"}))
+        .await
+        .unwrap();
+
+    // Set a TTL, then remove it.
+    client.set_ttl("cache", json!("a"), None, 60).await.unwrap();
+    client.remove_ttl("cache", json!("a"), None).await.unwrap();
+
+    // get_ttl should return None (TTL=0 means permanent).
+    let remaining = client.get_ttl("cache", json!("a"), None).await.unwrap();
+    assert!(
+        remaining.is_none(),
+        "after remove_ttl, get_ttl should return None"
+    );
+
+    // Item should still be accessible.
+    let item = client
+        .get_item("cache", json!("a"), None, None)
+        .await
+        .unwrap();
+    assert!(item.is_some(), "item should be permanent after remove_ttl");
+}
+
+#[tokio::test]
+async fn test_get_ttl_over_wire() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    client
+        .create_table(
+            "cache",
+            KeyDef {
+                name: "key".to_string(),
+                key_type: "String".to_string(),
+            },
+            None,
+            Some("expires".to_string()),
+        )
+        .await
+        .unwrap();
+
+    // Item without TTL.
+    client
+        .put_item("cache", json!({"key": "no_ttl", "val": "permanent"}))
+        .await
+        .unwrap();
+    let remaining = client
+        .get_ttl("cache", json!("no_ttl"), None)
+        .await
+        .unwrap();
+    assert!(remaining.is_none(), "item without TTL should return None");
+
+    // Item with expired TTL.
+    client
+        .put_item("cache", json!({"key": "old", "expires": 1000}))
+        .await
+        .unwrap();
+    let remaining = client.get_ttl("cache", json!("old"), None).await.unwrap();
+    assert_eq!(remaining, Some(0), "expired item should return Some(0)");
+}
+
+#[tokio::test]
+async fn test_sweep_ttl_over_wire() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    client
+        .create_table(
+            "cache",
+            KeyDef {
+                name: "key".to_string(),
+                key_type: "String".to_string(),
+            },
+            None,
+            Some("expires".to_string()),
+        )
+        .await
+        .unwrap();
+
+    // Insert 2 expired and 1 alive.
+    client
+        .put_item("cache", json!({"key": "exp1", "expires": 1000}))
+        .await
+        .unwrap();
+    client
+        .put_item("cache", json!({"key": "exp2", "expires": 2000}))
+        .await
+        .unwrap();
+    client
+        .put_item("cache", json!({"key": "alive", "expires": 9999999999.0}))
+        .await
+        .unwrap();
+
+    let count = client.sweep_expired_ttl("cache").await.unwrap();
+    assert_eq!(count, 2, "should sweep 2 expired items");
+
+    // Second sweep should find nothing.
+    let count2 = client.sweep_expired_ttl("cache").await.unwrap();
+    assert_eq!(count2, 0, "second sweep should find nothing");
+
+    // Alive item should still be there.
+    let item = client
+        .get_item("cache", json!("alive"), None, None)
+        .await
+        .unwrap();
+    assert!(item.is_some(), "non-expired item should survive sweep");
+}

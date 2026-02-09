@@ -1,7 +1,7 @@
 # PRD: TTL Enhancements
 
 **Priority:** 13
-**Status:** Approved
+**Status:** Complete
 **Proposal:** [docs/proposals/accepted/ttl-enhancements.md](../proposals/accepted/ttl-enhancements.md)
 
 ## Summary
