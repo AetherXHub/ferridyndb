@@ -4,7 +4,7 @@ A local, embedded, DynamoDB-style document database written in Rust with single-
 
 ## Features
 
-- **DynamoDB-compatible API** — Builder-pattern methods for `put_item`, `get_item`, `delete_item`, `update_item`, `query`, and `scan` with server-side filter expressions
+- **DynamoDB-compatible API** — Builder-pattern methods for `put_item`, `get_item`, `delete_item`, `update_item`, `query`, and `scan` with server-side filter expressions, sort key range conditions (equals, between, gt, gte, lt, lte, begins_with), and atomic batch writes
 - **Single-file storage** — Copy-on-write pages with atomic double-buffered header commits (no WAL)
 - **MVCC snapshot isolation** — Single writer, unlimited concurrent readers with version chains
 - **B+Tree indexing** — Efficient range scans with slotted pages and overflow support
@@ -14,6 +14,7 @@ A local, embedded, DynamoDB-style document database written in Rust with single-
 - **Condition expressions** — Predicates on write operations (`put`, `delete`, `update`) that evaluate against the existing item before proceeding, enabling prevent-overwrite and business rule enforcement
 - **ReturnValues** — Write operations optionally return the old or new document via type-state builders (`.return_old()`, `.return_new()`) with compile-time return type safety
 - **Change streams** — Per-table change data capture (CDC) with configurable view types (KeysOnly, NewImage, OldImage, NewAndOldImages), poll-based consumption by sequence number, retention pruning, and atomic capture (stream records commit with data writes)
+- **Batch write operations** — Atomic multi-table put/delete batches over the wire protocol (up to 25 operations, all-or-nothing semantics)
 - **Version-aware API** — Optimistic concurrency control with versioned reads and conditional writes
 - **Unix socket server** — Multi-process access with async client library
 
@@ -49,16 +50,26 @@ let item = db.get_item("users")
     .unwrap();
 assert_eq!(item.unwrap()["name"], "Alice");
 
-// Query with sort key range
+// Query with sort key range conditions
 db.create_table("events")
     .partition_key("device_id", KeyType::String)
     .sort_key("timestamp", KeyType::Number)
     .execute()
     .unwrap();
 
+// Between (inclusive on both ends)
 let results = db.query("events")
     .partition_key("device_123")
     .sort_key_between(100.0, 200.0)
+    .execute()
+    .unwrap();
+
+// Other sort key conditions: eq, gt, ge, lt, le
+let recent = db.query("events")
+    .partition_key("device_123")
+    .sort_key_gt(json!(1000.0))
+    .scan_forward(false) // newest first
+    .limit(10)
     .execute()
     .unwrap();
 
@@ -326,7 +337,7 @@ db2.disable_stream("users").unwrap(); // preserves existing records
 # Compile all crates
 cargo build
 
-# Run all tests (723 tests across workspace)
+# Run all tests (743 tests across workspace)
 cargo test
 
 # Run tests for a specific crate
@@ -375,6 +386,14 @@ client.update_item("users", json!("bob"), None, &[
     UpdateActionInput { action: "set".into(), path: "email".into(), value: Some(json!("bob@example.com")) },
     UpdateActionInput { action: "add".into(), path: "login_count".into(), value: Some(json!(1)) },
 ]).await?;
+
+// Atomic batch writes (puts + deletes across tables, up to 25 ops)
+use ferridyn_server::client::BatchWriteInput;
+let count = client.batch_write_item(&[
+    BatchWriteInput::Put { table: "users".into(), item: json!({"user_id": "charlie", "name": "Charlie"}) },
+    BatchWriteInput::Delete { table: "users".into(), partition_key: json!("old_user"), sort_key: None },
+]).await?;
+// count == 2; all-or-nothing: if any op fails, entire batch rolls back
 
 // Version-aware reads for optimistic concurrency
 let versioned = client.get_item_versioned("users", json!("bob"), None).await?;

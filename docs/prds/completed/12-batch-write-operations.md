@@ -1,7 +1,7 @@
 # PRD: Batch Write Operations (Server Protocol)
 
 **Priority:** 12
-**Status:** Approved
+**Status:** Complete
 **Proposal:** [docs/proposals/accepted/batch-write-operations.md](../proposals/accepted/batch-write-operations.md)
 
 ## Summary

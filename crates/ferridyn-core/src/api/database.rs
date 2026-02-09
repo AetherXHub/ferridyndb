@@ -426,12 +426,8 @@ impl FerridynDB {
     ) -> Result<(), Error> {
         let table = table.to_string();
         self.transact(move |txn| {
-            txn.catalog_root = catalog::ops::enable_stream(
-                &mut txn.store,
-                txn.catalog_root,
-                &table,
-                view_type,
-            )?;
+            txn.catalog_root =
+                catalog::ops::enable_stream(&mut txn.store, txn.catalog_root, &table, view_type)?;
             Ok(())
         })
     }
@@ -8257,8 +8253,11 @@ mod stream_tests {
             .execute()
             .unwrap();
 
-        db.put_item("events", json!({"pk": "user1", "sk": 100.0, "data": "evt1"}))
-            .unwrap();
+        db.put_item(
+            "events",
+            json!({"pk": "user1", "sk": 100.0, "data": "evt1"}),
+        )
+        .unwrap();
 
         let records = db.get_stream_records("events").execute().unwrap();
         assert_eq!(records.len(), 1);
@@ -8385,8 +8384,7 @@ mod stream_tests {
 
         // Manually set max_count to 5 via a transact to update stream config.
         db.transact(|txn| {
-            let mut entry =
-                crate::catalog::ops::get_table(&txn.store, txn.catalog_root, "items")?;
+            let mut entry = crate::catalog::ops::get_table(&txn.store, txn.catalog_root, "items")?;
             if let Some(ref mut config) = entry.stream_config {
                 config.max_count = Some(5);
             }
@@ -8396,8 +8394,12 @@ mod stream_tests {
                 ))
             })?;
             let encoded_name = crate::encoding::string::encode_string("items");
-            txn.catalog_root =
-                crate::btree::ops::insert(&mut txn.store, txn.catalog_root, &encoded_name, &json_bytes)?;
+            txn.catalog_root = crate::btree::ops::insert(
+                &mut txn.store,
+                txn.catalog_root,
+                &encoded_name,
+                &json_bytes,
+            )?;
             Ok(())
         })
         .unwrap();
@@ -8420,8 +8422,7 @@ mod stream_tests {
 
         // Insert a record with a manually old timestamp via low-level API.
         db.transact(|txn| {
-            let mut entry =
-                crate::catalog::ops::get_table(&txn.store, txn.catalog_root, "items")?;
+            let mut entry = crate::catalog::ops::get_table(&txn.store, txn.catalog_root, "items")?;
             let stream_root = entry.stream_root_page.unwrap();
 
             // Append a record with timestamp 1000 seconds in the past.
@@ -8496,8 +8497,7 @@ mod stream_tests {
         db.put_item("users", json!({"pk": "alice"})).unwrap();
 
         // Enable stream.
-        db.enable_stream("users", StreamViewType::KeysOnly)
-            .unwrap();
+        db.enable_stream("users", StreamViewType::KeysOnly).unwrap();
 
         // No records from before enabling.
         let records = db.get_stream_records("users").execute().unwrap();
@@ -8603,11 +8603,292 @@ mod stream_tests {
                 .unwrap();
         }
 
-        let records = db
-            .get_stream_records("items")
-            .limit(3)
+        let records = db.get_stream_records("items").limit(3).execute().unwrap();
+        assert_eq!(records.len(), 3);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sort key range query tests (PRD-11)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod sort_key_range_tests {
+    use super::*;
+    use crate::types::KeyType;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    fn create_test_db() -> (FerridynDB, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = FerridynDB::create(&db_path).unwrap();
+        (db, dir)
+    }
+
+    /// Helper: create a table with pk (String) + sk, insert items with same pk.
+    fn setup_string_table(db: &FerridynDB) {
+        db.create_table("items")
+            .partition_key("pk", KeyType::String)
+            .sort_key("sk", KeyType::String)
             .execute()
             .unwrap();
-        assert_eq!(records.len(), 3);
+
+        for name in &["alpha", "bravo", "charlie", "delta", "echo"] {
+            db.put_item(
+                "items",
+                json!({"pk": "p1", "sk": *name, "data": format!("val_{name}")}),
+            )
+            .unwrap();
+        }
+    }
+
+    fn setup_number_table(db: &FerridynDB) {
+        db.create_table("metrics")
+            .partition_key("pk", KeyType::String)
+            .sort_key("ts", KeyType::Number)
+            .execute()
+            .unwrap();
+
+        for i in &[10.0_f64, 20.0, 30.0, 40.0, 50.0] {
+            db.put_item(
+                "metrics",
+                json!({"pk": "sensor1", "ts": *i, "reading": i * 2.0}),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn test_sort_key_equals() {
+        let (db, _dir) = create_test_db();
+        setup_string_table(&db);
+
+        let result = db
+            .query("items")
+            .partition_key("p1")
+            .sort_key_eq(json!("charlie"))
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["sk"], "charlie");
+        assert_eq!(result.items[0]["data"], "val_charlie");
+    }
+
+    #[test]
+    fn test_sort_key_between_string() {
+        let (db, _dir) = create_test_db();
+        setup_string_table(&db);
+
+        // Between "bravo" and "delta" inclusive.
+        let result = db
+            .query("items")
+            .partition_key("p1")
+            .sort_key_between(json!("bravo"), json!("delta"))
+            .execute()
+            .unwrap();
+        // Should include: bravo, charlie, delta.
+        assert_eq!(result.items.len(), 3);
+        let sks: Vec<&str> = result
+            .items
+            .iter()
+            .map(|i| i["sk"].as_str().unwrap())
+            .collect();
+        assert_eq!(sks, vec!["bravo", "charlie", "delta"]);
+    }
+
+    #[test]
+    fn test_sort_key_between_number() {
+        let (db, _dir) = create_test_db();
+        setup_number_table(&db);
+
+        // Between 20.0 and 40.0 inclusive.
+        let result = db
+            .query("metrics")
+            .partition_key("sensor1")
+            .sort_key_between(json!(20.0), json!(40.0))
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 3);
+        let ts: Vec<f64> = result
+            .items
+            .iter()
+            .map(|i| i["ts"].as_f64().unwrap())
+            .collect();
+        assert_eq!(ts, vec![20.0, 30.0, 40.0]);
+    }
+
+    #[test]
+    fn test_sort_key_gt() {
+        let (db, _dir) = create_test_db();
+        setup_string_table(&db);
+
+        let result = db
+            .query("items")
+            .partition_key("p1")
+            .sort_key_gt(json!("charlie"))
+            .execute()
+            .unwrap();
+        // Should include: delta, echo (strictly greater than "charlie").
+        assert_eq!(result.items.len(), 2);
+        let sks: Vec<&str> = result
+            .items
+            .iter()
+            .map(|i| i["sk"].as_str().unwrap())
+            .collect();
+        assert_eq!(sks, vec!["delta", "echo"]);
+    }
+
+    #[test]
+    fn test_sort_key_gte() {
+        let (db, _dir) = create_test_db();
+        setup_string_table(&db);
+
+        let result = db
+            .query("items")
+            .partition_key("p1")
+            .sort_key_ge(json!("charlie"))
+            .execute()
+            .unwrap();
+        // Should include: charlie, delta, echo.
+        assert_eq!(result.items.len(), 3);
+        let sks: Vec<&str> = result
+            .items
+            .iter()
+            .map(|i| i["sk"].as_str().unwrap())
+            .collect();
+        assert_eq!(sks, vec!["charlie", "delta", "echo"]);
+    }
+
+    #[test]
+    fn test_sort_key_lt() {
+        let (db, _dir) = create_test_db();
+        setup_string_table(&db);
+
+        let result = db
+            .query("items")
+            .partition_key("p1")
+            .sort_key_lt(json!("charlie"))
+            .execute()
+            .unwrap();
+        // Should include: alpha, bravo (strictly less than "charlie").
+        assert_eq!(result.items.len(), 2);
+        let sks: Vec<&str> = result
+            .items
+            .iter()
+            .map(|i| i["sk"].as_str().unwrap())
+            .collect();
+        assert_eq!(sks, vec!["alpha", "bravo"]);
+    }
+
+    #[test]
+    fn test_sort_key_lte() {
+        let (db, _dir) = create_test_db();
+        setup_string_table(&db);
+
+        let result = db
+            .query("items")
+            .partition_key("p1")
+            .sort_key_le(json!("charlie"))
+            .execute()
+            .unwrap();
+        // Should include: alpha, bravo, charlie.
+        assert_eq!(result.items.len(), 3);
+        let sks: Vec<&str> = result
+            .items
+            .iter()
+            .map(|i| i["sk"].as_str().unwrap())
+            .collect();
+        assert_eq!(sks, vec!["alpha", "bravo", "charlie"]);
+    }
+
+    #[test]
+    fn test_sort_key_between_empty_range() {
+        let (db, _dir) = create_test_db();
+        setup_string_table(&db);
+
+        // start > end: "echo" > "alpha" reversed — should return empty, not error.
+        let result = db
+            .query("items")
+            .partition_key("p1")
+            .sort_key_between(json!("echo"), json!("alpha"))
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 0);
+        assert!(result.last_evaluated_key.is_none());
+    }
+
+    #[test]
+    fn test_sort_key_range_with_limit() {
+        let (db, _dir) = create_test_db();
+        setup_number_table(&db);
+
+        // Range >= 10.0 with limit 2 — should get first 2 items and a pagination token.
+        let page1 = db
+            .query("metrics")
+            .partition_key("sensor1")
+            .sort_key_ge(json!(10.0))
+            .limit(2)
+            .execute()
+            .unwrap();
+        assert_eq!(page1.items.len(), 2);
+        assert!(page1.last_evaluated_key.is_some());
+        let ts: Vec<f64> = page1
+            .items
+            .iter()
+            .map(|i| i["ts"].as_f64().unwrap())
+            .collect();
+        assert_eq!(ts, vec![10.0, 20.0]);
+
+        // Page 2: use last_evaluated_key for pagination.
+        let page2 = db
+            .query("metrics")
+            .partition_key("sensor1")
+            .sort_key_ge(json!(10.0))
+            .limit(2)
+            .exclusive_start_key(page1.last_evaluated_key.unwrap())
+            .execute()
+            .unwrap();
+        assert_eq!(page2.items.len(), 2);
+        let ts2: Vec<f64> = page2
+            .items
+            .iter()
+            .map(|i| i["ts"].as_f64().unwrap())
+            .collect();
+        assert_eq!(ts2, vec![30.0, 40.0]);
+
+        // Page 3: should get 1 remaining.
+        let page3 = db
+            .query("metrics")
+            .partition_key("sensor1")
+            .sort_key_ge(json!(10.0))
+            .limit(2)
+            .exclusive_start_key(page2.last_evaluated_key.unwrap())
+            .execute()
+            .unwrap();
+        assert_eq!(page3.items.len(), 1);
+        assert!(page3.last_evaluated_key.is_none());
+    }
+
+    #[test]
+    fn test_sort_key_range_reverse() {
+        let (db, _dir) = create_test_db();
+        setup_number_table(&db);
+
+        // Range between 20.0 and 40.0 in reverse order.
+        let result = db
+            .query("metrics")
+            .partition_key("sensor1")
+            .sort_key_between(json!(20.0), json!(40.0))
+            .scan_forward(false)
+            .execute()
+            .unwrap();
+        assert_eq!(result.items.len(), 3);
+        let ts: Vec<f64> = result
+            .items
+            .iter()
+            .map(|i| i["ts"].as_f64().unwrap())
+            .collect();
+        assert_eq!(ts, vec![40.0, 30.0, 20.0]);
     }
 }

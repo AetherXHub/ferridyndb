@@ -15,7 +15,7 @@ DynamoDB's API is simple and effective for key-value and document workloads, but
 This is a Cargo workspace. Build/test from the repository root:
 
 - `cargo build` — compile all crates
-- `cargo test` — run all tests across the workspace (723 tests)
+- `cargo test` — run all tests across the workspace (743 tests)
 - `cargo test -p ferridyn-core` — test only the core crate
 - `cargo test -p ferridyn-core <test_name>` — run a single test by name
 - `cargo clippy --workspace -- -D warnings` — lint all crates (zero warnings required)
@@ -37,7 +37,7 @@ Six-layer stack, bottom to top:
 
 7. **Change Streams** (`stream/`) — Per-table change data capture. Dedicated B+Tree per stream keyed by `(txn_id, sub_sequence)`. Records commit atomically with data writes in the same CoW commit. Configurable view types: KeysOnly, NewImage, OldImage, NewAndOldImages. Poll-based consumption by sequence number with retention pruning (max age, max count).
 
-Public API (`api/`) sits on top: `put/get/delete/update/query/scan/query_index/batch_get_item/transact`, plus server-side filter expressions, condition expressions on write operations, return values on writes (type-state builders for old/new document retrieval), introspection for partition schemas and indexes, and change stream management (enable/disable/query/prune).
+Public API (`api/`) sits on top: `put/get/delete/update/query/scan/query_index/batch_get_item/batch_write_item/transact`, plus server-side filter expressions, sort key range conditions (eq, between, gt, gte, lt, lte, begins_with), condition expressions on write operations, return values on writes (type-state builders for old/new document retrieval), atomic batch writes (up to 25 put/delete operations across tables), introspection for partition schemas and indexes, and change stream management (enable/disable/query/prune).
 
 Documents are stored on disk as MessagePack (via rmp-serde) for compactness. The public API accepts and returns `serde_json::Value`.
 
@@ -61,7 +61,7 @@ crates/
       client.rs        # FerridynClient — async client for multi-process access
       protocol.rs      # Wire protocol (JSON over length-prefixed frames)
     tests/
-      integration.rs   # Server integration tests (33 tests)
+      integration.rs   # Server integration tests (35 tests)
   ferridyn-console/    # Interactive CLI client (connects to server via Unix socket)
     src/
       parser.rs        # SQL-like command parser

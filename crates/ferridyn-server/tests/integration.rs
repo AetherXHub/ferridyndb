@@ -1949,10 +1949,7 @@ async fn test_stream_records_over_wire() {
         .unwrap();
 
     // Enable stream.
-    client
-        .enable_stream("items", "KEYS_ONLY")
-        .await
-        .unwrap();
+    client.enable_stream("items", "KEYS_ONLY").await.unwrap();
 
     // Write some items.
     client
@@ -2075,10 +2072,7 @@ async fn test_stream_info_over_wire() {
 
     // Enable stream with a different error (already has stream config).
     // Re-enable should work.
-    client
-        .enable_stream("items", "KEYS_ONLY")
-        .await
-        .unwrap();
+    client.enable_stream("items", "KEYS_ONLY").await.unwrap();
     let info = client.get_stream_info("items").await.unwrap();
     assert!(info.enabled);
     assert_eq!(info.view_type, "KEYS_ONLY");
@@ -2110,4 +2104,566 @@ async fn test_stream_not_enabled_error() {
     // Trying to get stream info should fail.
     let result = client.get_stream_info("items").await;
     assert!(result.is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Sort key range query tests (PRD-11)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_sort_key_range_over_wire() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    // Create table with sort key.
+    client
+        .create_table(
+            "events",
+            KeyDef {
+                name: "pk".to_string(),
+                key_type: "String".to_string(),
+            },
+            Some(KeyDef {
+                name: "ts".to_string(),
+                key_type: "Number".to_string(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Insert 5 items with same pk, varying sort key.
+    for i in 1..=5 {
+        client
+            .put_item(
+                "events",
+                json!({"pk": "sensor1", "ts": (i as f64) * 10.0, "val": i}),
+            )
+            .await
+            .unwrap();
+    }
+
+    // Between condition: ts BETWEEN 20.0 AND 40.0.
+    let result = client
+        .query(
+            "events",
+            json!("sensor1"),
+            Some(SortKeyCondition::Between {
+                low: json!(20.0),
+                high: json!(40.0),
+            }),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.items.len(), 3);
+    let ts: Vec<f64> = result
+        .items
+        .iter()
+        .map(|i| i["ts"].as_f64().unwrap())
+        .collect();
+    assert_eq!(ts, vec![20.0, 30.0, 40.0]);
+
+    // Gt condition: ts > 30.0.
+    let result = client
+        .query(
+            "events",
+            json!("sensor1"),
+            Some(SortKeyCondition::Gt { value: json!(30.0) }),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.items.len(), 2);
+    let ts: Vec<f64> = result
+        .items
+        .iter()
+        .map(|i| i["ts"].as_f64().unwrap())
+        .collect();
+    assert_eq!(ts, vec![40.0, 50.0]);
+
+    // Lt condition: ts < 30.0.
+    let result = client
+        .query(
+            "events",
+            json!("sensor1"),
+            Some(SortKeyCondition::Lt { value: json!(30.0) }),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.items.len(), 2);
+    let ts: Vec<f64> = result
+        .items
+        .iter()
+        .map(|i| i["ts"].as_f64().unwrap())
+        .collect();
+    assert_eq!(ts, vec![10.0, 20.0]);
+
+    // Le condition: ts <= 30.0.
+    let result = client
+        .query(
+            "events",
+            json!("sensor1"),
+            Some(SortKeyCondition::Le { value: json!(30.0) }),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.items.len(), 3);
+
+    // Ge condition: ts >= 30.0.
+    let result = client
+        .query(
+            "events",
+            json!("sensor1"),
+            Some(SortKeyCondition::Ge { value: json!(30.0) }),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.items.len(), 3);
+}
+
+#[tokio::test]
+async fn test_sort_key_eq_over_wire() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    // Create table with string sort key.
+    client
+        .create_table(
+            "items",
+            KeyDef {
+                name: "pk".to_string(),
+                key_type: "String".to_string(),
+            },
+            Some(KeyDef {
+                name: "sk".to_string(),
+                key_type: "String".to_string(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Insert items.
+    for name in &["alpha", "bravo", "charlie"] {
+        client
+            .put_item(
+                "items",
+                json!({"pk": "p1", "sk": *name, "data": format!("val_{name}")}),
+            )
+            .await
+            .unwrap();
+    }
+
+    // Exact match via Eq condition.
+    let result = client
+        .query(
+            "items",
+            json!("p1"),
+            Some(SortKeyCondition::Eq {
+                value: json!("bravo"),
+            }),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.items.len(), 1);
+    assert_eq!(result.items[0]["sk"], "bravo");
+    assert_eq!(result.items[0]["data"], "val_bravo");
+
+    // Eq with nonexistent value — empty result.
+    let result = client
+        .query(
+            "items",
+            json!("p1"),
+            Some(SortKeyCondition::Eq {
+                value: json!("zulu"),
+            }),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.items.len(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Batch write tests (PRD-12)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_batch_write_put_over_wire() {
+    use ferridyn_server::client::BatchWriteInput;
+
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    client
+        .create_table(
+            "items",
+            KeyDef {
+                name: "id".to_string(),
+                key_type: "String".to_string(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let ops = vec![
+        BatchWriteInput::Put {
+            table: "items".to_string(),
+            item: json!({"id": "a", "val": 1}),
+        },
+        BatchWriteInput::Put {
+            table: "items".to_string(),
+            item: json!({"id": "b", "val": 2}),
+        },
+        BatchWriteInput::Put {
+            table: "items".to_string(),
+            item: json!({"id": "c", "val": 3}),
+        },
+    ];
+
+    let count = client.batch_write_item(&ops).await.unwrap();
+    assert_eq!(count, 3);
+
+    // Verify all items readable.
+    for (key, expected_val) in [("a", 1), ("b", 2), ("c", 3)] {
+        let item = client
+            .get_item("items", json!(key), None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(item["val"], expected_val);
+    }
+}
+
+#[tokio::test]
+async fn test_batch_write_delete_over_wire() {
+    use ferridyn_server::client::BatchWriteInput;
+
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    client
+        .create_table(
+            "items",
+            KeyDef {
+                name: "id".to_string(),
+                key_type: "String".to_string(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Insert items first.
+    for key in &["a", "b", "c"] {
+        client
+            .put_item("items", json!({"id": *key, "val": 1}))
+            .await
+            .unwrap();
+    }
+
+    // Batch delete a and b.
+    let ops = vec![
+        BatchWriteInput::Delete {
+            table: "items".to_string(),
+            partition_key: json!("a"),
+            sort_key: None,
+        },
+        BatchWriteInput::Delete {
+            table: "items".to_string(),
+            partition_key: json!("b"),
+            sort_key: None,
+        },
+    ];
+
+    let count = client.batch_write_item(&ops).await.unwrap();
+    assert_eq!(count, 2);
+
+    // Verify a and b are gone, c remains.
+    assert!(
+        client
+            .get_item("items", json!("a"), None, None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        client
+            .get_item("items", json!("b"), None, None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        client
+            .get_item("items", json!("c"), None, None)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn test_batch_write_mixed_over_wire() {
+    use ferridyn_server::client::BatchWriteInput;
+
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    client
+        .create_table(
+            "items",
+            KeyDef {
+                name: "id".to_string(),
+                key_type: "String".to_string(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Insert initial items.
+    client
+        .put_item("items", json!({"id": "a", "val": 1}))
+        .await
+        .unwrap();
+    client
+        .put_item("items", json!({"id": "b", "val": 2}))
+        .await
+        .unwrap();
+
+    // Mixed batch: delete a, put c.
+    let ops = vec![
+        BatchWriteInput::Delete {
+            table: "items".to_string(),
+            partition_key: json!("a"),
+            sort_key: None,
+        },
+        BatchWriteInput::Put {
+            table: "items".to_string(),
+            item: json!({"id": "c", "val": 3}),
+        },
+    ];
+
+    let count = client.batch_write_item(&ops).await.unwrap();
+    assert_eq!(count, 2);
+
+    assert!(
+        client
+            .get_item("items", json!("a"), None, None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        client
+            .get_item("items", json!("b"), None, None)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        client
+            .get_item("items", json!("c"), None, None)
+            .await
+            .unwrap()
+            .unwrap()["val"],
+        3
+    );
+}
+
+#[tokio::test]
+async fn test_batch_write_cross_table() {
+    use ferridyn_server::client::BatchWriteInput;
+
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    // Create two tables.
+    client
+        .create_table(
+            "users",
+            KeyDef {
+                name: "id".to_string(),
+                key_type: "String".to_string(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    client
+        .create_table(
+            "orders",
+            KeyDef {
+                name: "id".to_string(),
+                key_type: "String".to_string(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Batch write across both tables.
+    let ops = vec![
+        BatchWriteInput::Put {
+            table: "users".to_string(),
+            item: json!({"id": "alice", "name": "Alice"}),
+        },
+        BatchWriteInput::Put {
+            table: "orders".to_string(),
+            item: json!({"id": "order1", "user": "alice", "total": 42}),
+        },
+    ];
+
+    let count = client.batch_write_item(&ops).await.unwrap();
+    assert_eq!(count, 2);
+
+    let user = client
+        .get_item("users", json!("alice"), None, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(user["name"], "Alice");
+
+    let order = client
+        .get_item("orders", json!("order1"), None, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(order["total"], 42);
+}
+
+#[tokio::test]
+async fn test_batch_write_exceeds_limit() {
+    use ferridyn_server::client::BatchWriteInput;
+
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    client
+        .create_table(
+            "items",
+            KeyDef {
+                name: "id".to_string(),
+                key_type: "String".to_string(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Build 26 operations (exceeds limit of 25).
+    let ops: Vec<BatchWriteInput> = (0..26)
+        .map(|i| BatchWriteInput::Put {
+            table: "items".to_string(),
+            item: json!({"id": format!("item-{i}"), "val": i}),
+        })
+        .collect();
+
+    let result = client.batch_write_item(&ops).await;
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("BatchSizeLimitExceeded"),
+        "expected BatchSizeLimitExceeded error, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_batch_write_error_rolls_back() {
+    use ferridyn_server::client::BatchWriteInput;
+
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    client
+        .create_table(
+            "items",
+            KeyDef {
+                name: "id".to_string(),
+                key_type: "String".to_string(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Mix a valid put with a put to a nonexistent table.
+    let ops = vec![
+        BatchWriteInput::Put {
+            table: "items".to_string(),
+            item: json!({"id": "good", "val": 1}),
+        },
+        BatchWriteInput::Put {
+            table: "nonexistent".to_string(),
+            item: json!({"id": "bad"}),
+        },
+    ];
+
+    let result = client.batch_write_item(&ops).await;
+    assert!(result.is_err());
+
+    // "good" should NOT be visible because entire batch was rolled back.
+    let item = client
+        .get_item("items", json!("good"), None, None)
+        .await
+        .unwrap();
+    assert!(
+        item.is_none(),
+        "failed batch should not leave partial writes"
+    );
+}
+
+#[tokio::test]
+async fn test_batch_write_empty() {
+    use ferridyn_server::client::BatchWriteInput;
+
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    // No table needed — empty batch should succeed without touching anything.
+    let ops: Vec<BatchWriteInput> = vec![];
+    let count = client.batch_write_item(&ops).await.unwrap();
+    assert_eq!(count, 0);
 }

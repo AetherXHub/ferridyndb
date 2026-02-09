@@ -89,6 +89,20 @@ pub struct UpdateActionInput {
     pub value: Option<Value>,
 }
 
+/// Input for a batch write operation.
+#[derive(Debug, Clone)]
+pub enum BatchWriteInput {
+    Put {
+        table: String,
+        item: Value,
+    },
+    Delete {
+        table: String,
+        partition_key: Value,
+        sort_key: Option<Value>,
+    },
+}
+
 /// Stream record returned from server.
 #[derive(Debug, Clone)]
 pub struct StreamRecordInfo {
@@ -761,6 +775,48 @@ impl FerridynClient {
         batch_items_from_response(&resp)
     }
 
+    /// Write multiple items (puts and deletes) in a single atomic batch.
+    ///
+    /// Returns the number of operations that succeeded. The batch is
+    /// all-or-nothing: either all operations commit or none do.
+    pub async fn batch_write_item(&mut self, operations: &[BatchWriteInput]) -> Result<usize> {
+        let ops_json: Vec<Value> = operations
+            .iter()
+            .map(|op| match op {
+                BatchWriteInput::Put { table, item } => {
+                    serde_json::json!({
+                        "op": "put",
+                        "table": table,
+                        "item": item,
+                    })
+                }
+                BatchWriteInput::Delete {
+                    table,
+                    partition_key,
+                    sort_key,
+                } => {
+                    let mut obj = serde_json::json!({
+                        "op": "delete",
+                        "table": table,
+                        "partition_key": partition_key,
+                    });
+                    if let Some(sk) = sort_key {
+                        obj.as_object_mut()
+                            .unwrap()
+                            .insert("sort_key".to_string(), sk.clone());
+                    }
+                    obj
+                }
+            })
+            .collect();
+        let req = serde_json::json!({
+            "op": "batch_write_item",
+            "operations": ops_json,
+        });
+        let resp = self.send_request(&req).await?;
+        succeeded_from_response(&resp)
+    }
+
     /// Query a secondary index.
     #[allow(clippy::too_many_arguments)]
     pub async fn query_index(
@@ -1187,6 +1243,14 @@ fn parse_index_info(v: &Value) -> IndexInfo {
     }
 }
 
+fn succeeded_from_response(resp: &Value) -> Result<usize> {
+    check_error(resp)?;
+    resp.get("succeeded")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .ok_or_else(|| ClientError::Protocol("missing 'succeeded' in response".to_string()))
+}
+
 fn stream_records_from_response(resp: &Value) -> Result<Vec<StreamRecordInfo>> {
     check_error(resp)?;
     let records = resp
@@ -1203,7 +1267,10 @@ fn stream_info_from_response(resp: &Value) -> Result<StreamInfo> {
         .get("stream_info")
         .ok_or_else(|| ClientError::Protocol("missing 'stream_info' in response".to_string()))?;
     Ok(StreamInfo {
-        enabled: info.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false),
+        enabled: info
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
         view_type: info
             .get("view_type")
             .and_then(|v| v.as_str())
@@ -1224,20 +1291,14 @@ fn parse_stream_record(v: &Value) -> StreamRecordInfo {
             .get("sequence_number")
             .and_then(|v| v.as_u64())
             .unwrap_or(0),
-        sub_sequence: v
-            .get("sub_sequence")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32,
+        sub_sequence: v.get("sub_sequence").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
         event_type: v
             .get("event_type")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
         keys: v.get("keys").cloned().unwrap_or(Value::Null),
-        timestamp: v
-            .get("timestamp")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0),
+        timestamp: v.get("timestamp").and_then(|v| v.as_f64()).unwrap_or(0.0),
         new_image: v
             .get("new_image")
             .and_then(|v| if v.is_null() { None } else { Some(v.clone()) }),

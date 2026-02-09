@@ -21,6 +21,9 @@ JSON-over-newlines on Unix domain socket. Each request is one JSON line, each re
 {"op":"query","table":"users","partition_key":"alice","limit":20}
 {"op":"query","table":"users","partition_key":"alice","limit":20,"projection":["name","age"]}
 {"op":"query","table":"users","partition_key":"alice","filter":{"Gt":[{"Attr":"age"},{"Literal":25}]}}
+{"op":"query","table":"events","partition_key":"device1","sort_key_condition":{"op":"between","low":100,"high":200}}
+{"op":"query","table":"events","partition_key":"device1","sort_key_condition":{"op":"gt","value":1000}}
+{"op":"query","table":"events","partition_key":"device1","sort_key_condition":{"op":"eq","value":"specific_key"}}
 {"op":"scan","table":"users","limit":100}
 {"op":"scan","table":"users","limit":100,"projection":["name","status"]}
 {"op":"scan","table":"users","limit":100,"filter":{"And":[{"Eq":[{"Attr":"status"},{"Literal":"active"}]},{"Gt":[{"Attr":"age"},{"Literal":18}]}]}}
@@ -35,7 +38,9 @@ JSON-over-newlines on Unix domain socket. Each request is one JSON line, each re
 {"op":"create_index","table":"data","name":"status-all-idx","index_key":{"name":"status","type":"String"},"projection_type":"ALL"}
 {"op":"create_index","table":"orders","name":"ts-idx","index_sort_key":{"name":"timestamp","type":"Number"},"is_local":true}
 {"op":"query_index","table":"data","index_name":"status-idx","key_value":"active"}
-{"op":"query_index","table":"data","index_name":"age-status-idx","key_value":"active","sort_key_condition":{"Between":[25,50]}}
+{"op":"query_index","table":"data","index_name":"age-status-idx","key_value":"active","sort_key_condition":{"op":"between","low":25,"high":50}}
+{"op":"query_index","table":"data","index_name":"age-status-idx","key_value":"active","sort_key_condition":{"op":"gt","value":30}}
+{"op":"query_index","table":"data","index_name":"age-status-idx","key_value":"active","sort_key_condition":{"op":"eq","value":25}}
 {"op":"query_index","table":"data","index_name":"email-idx","key_value":"alice@example.com","projection":["name"]}
 {"op":"drop_index","table":"data","index_name":"status-idx"}
 {"op":"list_partition_keys","table":"users","limit":20}
@@ -46,6 +51,7 @@ JSON-over-newlines on Unix domain socket. Each request is one JSON line, each re
 {"op":"get_stream_records","table":"orders","after_sequence":5,"limit":100}
 {"op":"get_stream_info","table":"orders"}
 {"op":"prune_stream","table":"orders"}
+{"op":"batch_write_item","operations":[{"op":"put","table":"users","item":{"user_id":"alice","name":"Alice"}},{"op":"delete","table":"users","partition_key":"old_user"}]}
 ```
 
 ### Response Examples
@@ -58,6 +64,7 @@ JSON-over-newlines on Unix domain socket. Each request is one JSON line, each re
 {"ok":true}
 {"error":"VersionMismatch","message":"expected version 5, actual 8","expected":5,"actual":8}
 {"error":"TableNotFound","message":"table not found: nonexistent"}
+{"ok":true,"succeeded":2}
 {"ok":true,"records":[{"sequence_number":3,"sub_sequence":0,"event_type":"INSERT","keys":{"order_id":"o1"},"timestamp":1700000000.0}]}
 {"ok":true,"stream_info":{"enabled":true,"view_type":"NEW_AND_OLD_IMAGES","oldest_sequence":3,"latest_sequence":5,"record_count":3}}
 ```
@@ -104,6 +111,14 @@ client.put_item_conditional(
     v.unwrap().version
 ).await?;
 
+// Atomic batch writes (up to 25 ops, all-or-nothing)
+use ferridyn_server::client::BatchWriteInput;
+let count = client.batch_write_item(&[
+    BatchWriteInput::Put { table: "users".into(), item: json!({"user_id": "charlie", "name": "Charlie"}) },
+    BatchWriteInput::Delete { table: "users".into(), partition_key: json!("old_user"), sort_key: None },
+]).await?;
+// count == 2
+
 // Change streams
 client.enable_stream("orders", "NEW_AND_OLD_IMAGES").await?;
 let records = client.get_stream_records("orders", None, Some(100)).await?;
@@ -137,6 +152,7 @@ ferridyn-server [--db PATH] [--socket PATH]
 - **Version tracking**: Optimistic locking with version numbers for conditional updates
 - **Projection expressions**: Return only selected attributes from read operations (get, query, scan, batch_get, query_index)
 - **Secondary indexes**: Scoped (partition schema prefix), global (table-wide), and local (same partition key, alternate sort key) secondary indexes with composite keys (partition + sort), index projections (KEYS_ONLY, INCLUDE, ALL), automatic backfill, sort key range conditions, and page reclamation on drop
+- **Batch writes**: Atomic multi-table put/delete batches (up to 25 operations) with all-or-nothing semantics
 - **Change streams**: Per-table change data capture with configurable view types (KEYS_ONLY, NEW_IMAGE, OLD_IMAGE, NEW_AND_OLD_IMAGES), poll-based consumption with sequence pagination, stream info, retention pruning, and enable/disable on existing tables
 
 ## Concurrency Model

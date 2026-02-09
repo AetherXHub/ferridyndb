@@ -176,9 +176,7 @@ fn maintain_stream(
         crate::stream::StreamViewType::KeysOnly => (None, None),
         crate::stream::StreamViewType::NewImage => (new_doc.cloned(), None),
         crate::stream::StreamViewType::OldImage => (None, old_doc.cloned()),
-        crate::stream::StreamViewType::NewAndOldImages => {
-            (new_doc.cloned(), old_doc.cloned())
-        }
+        crate::stream::StreamViewType::NewAndOldImages => (new_doc.cloned(), old_doc.cloned()),
     };
 
     let record = crate::stream::StreamRecord {

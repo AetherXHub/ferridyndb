@@ -15,9 +15,9 @@ use ferridyn_core::error::{Error as DynError, SchemaError, TxnError};
 use ferridyn_core::types::{AttrType, IndexDefinition, KeyType, PartitionSchema, TableSchema};
 
 use crate::protocol::{
-    AttributeDefWire, BatchGetItemKey, IndexDefWire, KeyDef, KeyDefWire, PartitionSchemaWire,
-    Request, Response, SortKeyCondition, StreamInfoWire, StreamRecordWire, TableSchemaWire,
-    UpdateActionWire,
+    AttributeDefWire, BatchGetItemKey, BatchWriteOp, IndexDefWire, KeyDef, KeyDefWire,
+    PartitionSchemaWire, Request, Response, SortKeyCondition, StreamInfoWire, StreamRecordWire,
+    TableSchemaWire, UpdateActionWire,
 };
 
 /// A FerridynDB server listening on a Unix socket.
@@ -296,9 +296,9 @@ fn dispatch(db: &FerridynDB, req: Request) -> Response {
             projection,
         } => handle_batch_get_item(db, &table, keys, projection),
 
-        Request::EnableStream { table, view_type } => {
-            handle_enable_stream(db, &table, &view_type)
-        }
+        Request::BatchWriteItem { operations } => handle_batch_write_item(db, operations),
+
+        Request::EnableStream { table, view_type } => handle_enable_stream(db, &table, &view_type),
 
         Request::DisableStream { table } => handle_disable_stream(db, &table),
 
@@ -923,13 +923,48 @@ fn handle_batch_get_item(
     }
 }
 
+fn handle_batch_write_item(db: &FerridynDB, operations: Vec<BatchWriteOp>) -> Response {
+    const MAX_BATCH_SIZE: usize = 25;
+    if operations.len() > MAX_BATCH_SIZE {
+        return Response::error(
+            "BatchSizeLimitExceeded",
+            format!(
+                "batch size {} exceeds limit of {MAX_BATCH_SIZE}",
+                operations.len()
+            ),
+        );
+    }
+    let count = operations.len();
+    let mut batch = db.write_batch();
+    for op in operations {
+        match op {
+            BatchWriteOp::Put { table, item } => {
+                batch.put_item(&table, item);
+            }
+            BatchWriteOp::Delete {
+                table,
+                partition_key,
+                sort_key,
+            } => {
+                batch.delete_item(&table, partition_key, sort_key);
+            }
+        }
+    }
+    match batch.commit() {
+        Ok(()) => Response::ok_succeeded(count),
+        Err(e) => dyn_error_to_response(e),
+    }
+}
+
 fn handle_enable_stream(db: &FerridynDB, table: &str, view_type: &str) -> Response {
     let vt = match parse_stream_view_type(view_type) {
         Some(vt) => vt,
         None => {
             return Response::error(
                 "InvalidStreamViewType",
-                format!("unknown view type: {view_type}. Expected KEYS_ONLY, NEW_IMAGE, OLD_IMAGE, or NEW_AND_OLD_IMAGES"),
+                format!(
+                    "unknown view type: {view_type}. Expected KEYS_ONLY, NEW_IMAGE, OLD_IMAGE, or NEW_AND_OLD_IMAGES"
+                ),
             );
         }
     };

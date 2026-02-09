@@ -182,6 +182,9 @@ pub enum Request {
         #[serde(default)]
         projection: Option<Vec<String>>,
     },
+    BatchWriteItem {
+        operations: Vec<BatchWriteOp>,
+    },
     // -- Stream operations --
     EnableStream {
         table: String,
@@ -232,6 +235,22 @@ pub struct BatchGetItemKey {
     pub partition_key: Value,
     #[serde(default)]
     pub sort_key: Option<Value>,
+}
+
+/// A single operation within a batch write request.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum BatchWriteOp {
+    Put {
+        table: String,
+        item: Value,
+    },
+    Delete {
+        table: String,
+        partition_key: Value,
+        #[serde(default)]
+        sort_key: Option<Value>,
+    },
 }
 
 /// Update action in wire format.
@@ -369,6 +388,10 @@ pub enum OkResponse {
         ok: bool,
         items: Vec<Option<Value>>,
     },
+    Succeeded {
+        ok: bool,
+        succeeded: usize,
+    },
     StreamRecords {
         ok: bool,
         records: Vec<StreamRecordWire>,
@@ -482,6 +505,13 @@ impl Response {
 
     pub fn ok_batch_items(items: Vec<Option<Value>>) -> Self {
         Response::Ok(OkResponse::BatchItems { ok: true, items })
+    }
+
+    pub fn ok_succeeded(count: usize) -> Self {
+        Response::Ok(OkResponse::Succeeded {
+            ok: true,
+            succeeded: count,
+        })
     }
 
     pub fn ok_stream_records(records: Vec<StreamRecordWire>) -> Self {

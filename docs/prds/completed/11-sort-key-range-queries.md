@@ -1,7 +1,7 @@
 # PRD: Sort Key Range Queries
 
 **Priority:** 11
-**Status:** Approved
+**Status:** Complete
 **Proposal:** [docs/proposals/accepted/sort-key-range-queries.md](../proposals/accepted/sort-key-range-queries.md)
 
 ## Summary
