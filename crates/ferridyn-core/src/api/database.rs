@@ -8410,6 +8410,81 @@ mod stream_tests {
     }
 
     #[test]
+    fn test_stream_retention_max_age() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", crate::types::KeyType::String)
+            .stream(StreamViewType::KeysOnly)
+            .execute()
+            .unwrap();
+
+        // Insert a record with a manually old timestamp via low-level API.
+        db.transact(|txn| {
+            let mut entry =
+                crate::catalog::ops::get_table(&txn.store, txn.catalog_root, "items")?;
+            let stream_root = entry.stream_root_page.unwrap();
+
+            // Append a record with timestamp 1000 seconds in the past.
+            let old_record = crate::stream::StreamRecord {
+                sequence_number: 1,
+                sub_sequence: 0,
+                event_type: crate::stream::EventType::Insert,
+                keys: json!({"pk": "old_item"}),
+                timestamp: crate::stream::ops::now_epoch_secs() - 1000.0,
+                new_image: None,
+                old_image: None,
+            };
+            let new_root =
+                crate::stream::ops::append_stream_record(&mut txn.store, stream_root, &old_record)?;
+            entry.stream_root_page = Some(new_root);
+
+            // Append a recent record.
+            let new_record = crate::stream::StreamRecord {
+                sequence_number: 2,
+                sub_sequence: 0,
+                event_type: crate::stream::EventType::Insert,
+                keys: json!({"pk": "new_item"}),
+                timestamp: crate::stream::ops::now_epoch_secs(),
+                new_image: None,
+                old_image: None,
+            };
+            let new_root =
+                crate::stream::ops::append_stream_record(&mut txn.store, new_root, &new_record)?;
+            entry.stream_root_page = Some(new_root);
+
+            // Set max_age to 500 seconds (old record is 1000s old, should be pruned).
+            if let Some(ref mut config) = entry.stream_config {
+                config.max_age_secs = Some(500);
+            }
+
+            let json_bytes = serde_json::to_vec(&entry).map_err(|e| {
+                crate::error::StorageError::CorruptedPage(format!(
+                    "failed to serialize catalog entry: {e}"
+                ))
+            })?;
+            let encoded_name = crate::encoding::string::encode_string("items");
+            txn.catalog_root = crate::btree::ops::insert(
+                &mut txn.store,
+                txn.catalog_root,
+                &encoded_name,
+                &json_bytes,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let records = db.get_stream_records("items").execute().unwrap();
+        assert_eq!(records.len(), 2);
+
+        let pruned = db.prune_stream("items").unwrap();
+        assert_eq!(pruned, 1); // old record pruned
+
+        let records = db.get_stream_records("items").execute().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].keys["pk"], "new_item");
+    }
+
+    #[test]
     fn test_stream_enable_on_existing_table() {
         let (db, _dir) = create_test_db();
         db.create_table("users")
