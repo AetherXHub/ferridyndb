@@ -459,6 +459,38 @@ impl FerridynClient {
         items_from_response(&resp)
     }
 
+    /// Count items matching a partition key and optional conditions.
+    pub async fn count(
+        &mut self,
+        table: &str,
+        partition_key: Value,
+        sort_key_condition: Option<SortKeyCondition>,
+        filter: Option<FilterExpr>,
+    ) -> Result<usize> {
+        let mut req = serde_json::json!({
+            "op": "count",
+            "table": table,
+            "partition_key": partition_key,
+        });
+        let obj = req.as_object_mut().unwrap();
+        if let Some(cond) = sort_key_condition {
+            obj.insert(
+                "sort_key_condition".to_string(),
+                serde_json::to_value(cond).unwrap(),
+            );
+        }
+        if let Some(f) = filter {
+            obj.insert("filter".to_string(), serde_json::to_value(f).unwrap());
+        }
+
+        let resp = self.send_request(&req).await?;
+        let count = resp
+            .get("count")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| ClientError::Protocol("missing 'count' in response".to_string()))?;
+        Ok(count as usize)
+    }
+
     /// Scan all items in a table.
     pub async fn scan(
         &mut self,

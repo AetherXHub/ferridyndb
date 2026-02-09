@@ -229,6 +229,15 @@ pub enum Request {
     SweepExpiredTtl {
         table: String,
     },
+    // -- Count operation --
+    Count {
+        table: String,
+        partition_key: Value,
+        #[serde(default)]
+        sort_key_condition: Option<SortKeyCondition>,
+        #[serde(default)]
+        filter: Option<FilterExpr>,
+    },
 }
 
 /// Sort key condition for query requests.
@@ -427,6 +436,10 @@ pub enum OkResponse {
         ok: bool,
         remaining_seconds: Option<u64>,
     },
+    Count {
+        ok: bool,
+        count: usize,
+    },
 }
 
 /// Table schema in wire format.
@@ -557,5 +570,9 @@ impl Response {
             ok: true,
             remaining_seconds,
         })
+    }
+
+    pub fn ok_count(count: usize) -> Self {
+        Response::Ok(OkResponse::Count { ok: true, count })
     }
 }

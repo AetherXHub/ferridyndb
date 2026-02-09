@@ -2837,3 +2837,97 @@ async fn test_sweep_ttl_over_wire() {
         .unwrap();
     assert!(item.is_some(), "non-expired item should survive sweep");
 }
+
+#[tokio::test]
+async fn test_count_over_wire() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    client
+        .create_table(
+            "items",
+            KeyDef {
+                name: "pk".to_string(),
+                key_type: "String".to_string(),
+            },
+            Some(KeyDef {
+                name: "sk".to_string(),
+                key_type: "String".to_string(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+    for i in 0..5 {
+        client
+            .put_item("items", json!({"pk": "a", "sk": format!("s{i}"), "v": i}))
+            .await
+            .unwrap();
+    }
+
+    // Count all items in partition.
+    let count = client.count("items", json!("a"), None, None).await.unwrap();
+    assert_eq!(count, 5);
+
+    // Count with sort key condition.
+    let count_with_sk = client
+        .count(
+            "items",
+            json!("a"),
+            Some(SortKeyCondition::BeginsWith {
+                prefix: "s0".to_string(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(count_with_sk, 1);
+
+    // Count empty partition.
+    let count_empty = client
+        .count("items", json!("nonexistent"), None, None)
+        .await
+        .unwrap();
+    assert_eq!(count_empty, 0);
+}
+
+#[tokio::test]
+async fn test_count_with_filter_over_wire() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    client
+        .create_table(
+            "items",
+            KeyDef {
+                name: "pk".to_string(),
+                key_type: "String".to_string(),
+            },
+            Some(KeyDef {
+                name: "sk".to_string(),
+                key_type: "Number".to_string(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+    for i in 1..=10 {
+        client
+            .put_item("items", json!({"pk": "a", "sk": i, "even": i % 2 == 0}))
+            .await
+            .unwrap();
+    }
+
+    let filter = FilterExpr::Eq(
+        Box::new(FilterExpr::Attr("even".to_string())),
+        Box::new(FilterExpr::Literal(json!(true))),
+    );
+
+    let count = client
+        .count("items", json!("a"), None, Some(filter))
+        .await
+        .unwrap();
+    assert_eq!(count, 5, "should count only even items over wire");
+}

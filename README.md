@@ -4,7 +4,7 @@ A local, embedded, DynamoDB-style document database written in Rust with single-
 
 ## Features
 
-- **DynamoDB-compatible API** — Builder-pattern methods for `put_item`, `get_item`, `delete_item`, `update_item`, `query`, and `scan` with server-side filter expressions, sort key range conditions (equals, between, gt, gte, lt, lte, begins_with), and atomic batch writes
+- **DynamoDB-compatible API** — Builder-pattern methods for `put_item`, `get_item`, `delete_item`, `update_item`, `query`, `scan`, and `count` with server-side filter expressions, sort key range conditions (equals, between, gt, gte, lt, lte, begins_with), and atomic batch writes
 - **Single-file storage** — Copy-on-write pages with atomic double-buffered header commits (no WAL)
 - **MVCC snapshot isolation** — Single writer, unlimited concurrent readers with version chains
 - **B+Tree indexing** — Efficient range scans with slotted pages and overflow support
@@ -81,6 +81,13 @@ let results = db.query("events")
         FilterExpr::attr("temperature"),
         FilterExpr::Literal(json!(100.0)),
     ))
+    .execute()
+    .unwrap();
+
+// Count matching items without transferring document bodies
+let count = db.count("events")
+    .partition_key("device_123")
+    .sort_key_between(100.0, 200.0)
     .execute()
     .unwrap();
 
@@ -337,7 +344,7 @@ db2.disable_stream("users").unwrap(); // preserves existing records
 # Compile all crates
 cargo build
 
-# Run all tests (758 tests across workspace)
+# Run all tests (769 tests across workspace)
 cargo test
 
 # Run tests for a specific crate

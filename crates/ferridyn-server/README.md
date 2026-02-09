@@ -56,6 +56,9 @@ JSON-over-newlines on Unix domain socket. Each request is one JSON line, each re
 {"op":"remove_ttl","table":"cache","partition_key":"a"}
 {"op":"get_ttl","table":"cache","partition_key":"a"}
 {"op":"sweep_expired_ttl","table":"cache"}
+{"op":"count","table":"users","partition_key":"alice"}
+{"op":"count","table":"events","partition_key":"device1","sort_key_condition":{"op":"between","low":100,"high":200}}
+{"op":"count","table":"users","partition_key":"alice","filter":{"Eq":[{"Attr":"status"},{"Literal":"active"}]}}
 ```
 
 ### Response Examples
@@ -73,6 +76,7 @@ JSON-over-newlines on Unix domain socket. Each request is one JSON line, each re
 {"ok":true,"stream_info":{"enabled":true,"view_type":"NEW_AND_OLD_IMAGES","oldest_sequence":3,"latest_sequence":5,"record_count":3}}
 {"ok":true,"remaining_seconds":3595}
 {"ok":true,"remaining_seconds":null}
+{"ok":true,"count":42}
 ```
 
 ## Client Library
@@ -132,6 +136,12 @@ let info = client.get_stream_info("orders").await?;
 client.prune_stream("orders").await?;
 client.disable_stream("orders").await?;
 
+// Count (without transferring document bodies)
+let count = client.count("users", json!("alice"), None, None).await?;
+// With sort key condition
+let count = client.count("events", json!("device1"),
+    Some(SortKeyCondition::Between { low: json!(100), high: json!(200) }), None).await?;
+
 // TTL management
 client.set_ttl("cache", json!("session_123"), None, 3600).await?;      // expire in 1 hour
 let remaining = client.get_ttl("cache", json!("session_123"), None).await?; // Some(3599)
@@ -166,13 +176,14 @@ ferridyn-server [--db PATH] [--socket PATH]
 - **Secondary indexes**: Scoped (partition schema prefix), global (table-wide), and local (same partition key, alternate sort key) secondary indexes with composite keys (partition + sort), index projections (KEYS_ONLY, INCLUDE, ALL), automatic backfill, sort key range conditions, and page reclamation on drop
 - **Batch writes**: Atomic multi-table put/delete batches (up to 25 operations) with all-or-nothing semantics
 - **Change streams**: Per-table change data capture with configurable view types (KEYS_ONLY, NEW_IMAGE, OLD_IMAGE, NEW_AND_OLD_IMAGES), poll-based consumption with sequence pagination, stream info, retention pruning, and enable/disable on existing tables
+- **Count aggregation**: Count matching items without transferring document bodies; supports partition key, sort key conditions, and filter expressions
 - **TTL management**: Set, remove, and query item TTLs over the wire protocol; sweep expired items on demand
 
 ## Concurrency Model
 
 The server inherits FerridynDB's concurrency semantics:
 
-- **Read operations** (get, batch_get, query, scan, list_*) execute concurrently via read lock
+- **Read operations** (get, batch_get, query, scan, count, list_*) execute concurrently via read lock
 - **Write operations** (put, delete, update, create_table) are serialized via write lock
 - **Version conflicts** are detected and reported as VersionMismatch errors
 - **Snapshot isolation** is maintained per-transaction

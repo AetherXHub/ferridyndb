@@ -21,7 +21,7 @@ use crate::types::{IndexDefinition, PAGE_SIZE, PageId, PartitionSchema};
 
 use super::batch::{SyncMode, WriteBatch};
 use super::builders::{
-    BatchGetItemBuilder, CreateIndexBuilder, DeleteItemBuilder, GetItemBuilder,
+    BatchGetItemBuilder, CountBuilder, CreateIndexBuilder, DeleteItemBuilder, GetItemBuilder,
     GetItemVersionedBuilder, GetStreamRecordsBuilder, IndexQueryBuilder, ListPartitionKeysBuilder,
     ListSortKeyPrefixesBuilder, PartitionSchemaBuilder, PutItemBuilder, QueryBuilder, ScanBuilder,
     TableBuilder, UpdateItemBuilder,
@@ -299,6 +299,12 @@ impl FerridynDB {
     /// Query items with partition key and optional sort key conditions.
     pub fn query(&self, table: &str) -> QueryBuilder<'_> {
         QueryBuilder::new(self, table.to_string())
+    }
+
+    /// Count items matching a partition key and optional conditions without
+    /// transferring document bodies.
+    pub fn count(&self, table: &str) -> CountBuilder<'_> {
+        CountBuilder::new(self, table.to_string())
     }
 
     /// Scan all items in a table.
@@ -9320,5 +9326,200 @@ mod reaper_tests {
             3,
             "reaper should not delete non-expired items"
         );
+    }
+
+    // -- Count tests --
+
+    #[test]
+    fn test_count_basic() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", KeyType::String)
+            .sort_key("sk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        for i in 0..5 {
+            db.put_item("items", json!({"pk": "a", "sk": format!("s{i}"), "v": i}))
+                .unwrap();
+        }
+
+        let count = db.count("items").partition_key("a").execute().unwrap();
+        assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn test_count_with_sort_key_prefix() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", KeyType::String)
+            .sort_key("sk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put_item("items", json!({"pk": "a", "sk": "user#1"}))
+            .unwrap();
+        db.put_item("items", json!({"pk": "a", "sk": "user#2"}))
+            .unwrap();
+        db.put_item("items", json!({"pk": "a", "sk": "order#1"}))
+            .unwrap();
+
+        let count = db
+            .count("items")
+            .partition_key("a")
+            .sort_key_begins_with("user#")
+            .execute()
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_count_with_sort_key_range() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", KeyType::String)
+            .sort_key("sk", KeyType::Number)
+            .execute()
+            .unwrap();
+
+        for i in 1..=10 {
+            db.put_item("items", json!({"pk": "a", "sk": i})).unwrap();
+        }
+
+        let count = db
+            .count("items")
+            .partition_key("a")
+            .sort_key_between(3, 7)
+            .execute()
+            .unwrap();
+        assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn test_count_empty_partition() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        let count = db
+            .count("items")
+            .partition_key("nonexistent")
+            .execute()
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_count_excludes_expired() {
+        let (db, _dir) = create_test_db();
+        db.create_table("cache")
+            .partition_key("pk", KeyType::String)
+            .sort_key("sk", KeyType::String)
+            .ttl_attribute("expires")
+            .execute()
+            .unwrap();
+
+        // Expired item.
+        db.put_item("cache", json!({"pk": "a", "sk": "old", "expires": 1000}))
+            .unwrap();
+        // Live item.
+        db.put_item(
+            "cache",
+            json!({"pk": "a", "sk": "new", "expires": 9999999999.0}),
+        )
+        .unwrap();
+        // No TTL attribute (permanent).
+        db.put_item("cache", json!({"pk": "a", "sk": "perm"}))
+            .unwrap();
+
+        let count = db.count("cache").partition_key("a").execute().unwrap();
+        assert_eq!(count, 2, "expired item should not be counted");
+    }
+
+    #[test]
+    fn test_count_nonexistent_table() {
+        let (db, _dir) = create_test_db();
+        let result = db.count("nope").partition_key("a").execute();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_count_matches_query_len() {
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", KeyType::String)
+            .sort_key("sk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        for i in 0..8 {
+            db.put_item("items", json!({"pk": "a", "sk": format!("s{i}"), "v": i}))
+                .unwrap();
+        }
+
+        let count = db.count("items").partition_key("a").execute().unwrap();
+        let query_result = db.query("items").partition_key("a").execute().unwrap();
+        assert_eq!(count, query_result.items.len());
+    }
+
+    #[test]
+    fn test_count_with_filter() {
+        use crate::api::filter::FilterExpr;
+
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", KeyType::String)
+            .sort_key("sk", KeyType::Number)
+            .execute()
+            .unwrap();
+
+        for i in 1..=10 {
+            db.put_item("items", json!({"pk": "a", "sk": i, "even": i % 2 == 0}))
+                .unwrap();
+        }
+
+        let filter = FilterExpr::Eq(
+            Box::new(FilterExpr::Attr("even".to_string())),
+            Box::new(FilterExpr::Literal(json!(true))),
+        );
+
+        let count = db
+            .count("items")
+            .partition_key("a")
+            .filter(filter)
+            .execute()
+            .unwrap();
+        assert_eq!(count, 5, "should count only even items");
+    }
+
+    #[test]
+    fn test_count_filter_no_matches() {
+        use crate::api::filter::FilterExpr;
+
+        let (db, _dir) = create_test_db();
+        db.create_table("items")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put_item("items", json!({"pk": "a", "status": "active"}))
+            .unwrap();
+        db.put_item("items", json!({"pk": "a", "status": "active"}))
+            .unwrap();
+
+        let filter = FilterExpr::Eq(
+            Box::new(FilterExpr::Attr("status".to_string())),
+            Box::new(FilterExpr::Literal(json!("deleted"))),
+        );
+
+        let count = db
+            .count("items")
+            .partition_key("a")
+            .filter(filter)
+            .execute()
+            .unwrap();
+        assert_eq!(count, 0, "filter matching nothing should return 0");
     }
 }

@@ -1,7 +1,7 @@
 # PRD: Count / Basic Aggregation
 
 **Priority:** 14
-**Status:** Approved
+**Status:** Complete
 **Proposal:** [docs/proposals/accepted/count.md](../proposals/accepted/count.md)
 
 ## Summary

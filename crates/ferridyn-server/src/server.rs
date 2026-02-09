@@ -332,6 +332,13 @@ fn dispatch(db: &FerridynDB, req: Request) -> Response {
         } => handle_get_ttl(db, &table, partition_key, sort_key),
 
         Request::SweepExpiredTtl { table } => handle_sweep_expired_ttl(db, &table),
+
+        Request::Count {
+            table,
+            partition_key,
+            sort_key_condition,
+            filter,
+        } => handle_count(db, &table, partition_key, sort_key_condition, filter),
     }
 }
 
@@ -1079,6 +1086,37 @@ fn handle_get_ttl(
 fn handle_sweep_expired_ttl(db: &FerridynDB, table: &str) -> Response {
     match db.sweep_expired_ttl(table) {
         Ok(count) => Response::ok_succeeded(count),
+        Err(e) => dyn_error_to_response(e),
+    }
+}
+
+fn handle_count(
+    db: &FerridynDB,
+    table: &str,
+    partition_key: serde_json::Value,
+    sort_key_condition: Option<SortKeyCondition>,
+    filter: Option<FilterExpr>,
+) -> Response {
+    let mut builder = db.count(table).partition_key(partition_key);
+
+    if let Some(cond) = sort_key_condition {
+        builder = match cond {
+            SortKeyCondition::Eq { value } => builder.sort_key_eq(value),
+            SortKeyCondition::Lt { value } => builder.sort_key_lt(value),
+            SortKeyCondition::Le { value } => builder.sort_key_le(value),
+            SortKeyCondition::Gt { value } => builder.sort_key_gt(value),
+            SortKeyCondition::Ge { value } => builder.sort_key_ge(value),
+            SortKeyCondition::Between { low, high } => builder.sort_key_between(low, high),
+            SortKeyCondition::BeginsWith { prefix } => builder.sort_key_begins_with(&prefix),
+        };
+    }
+
+    if let Some(f) = filter {
+        builder = builder.filter(f);
+    }
+
+    match builder.execute() {
+        Ok(count) => Response::ok_count(count),
         Err(e) => dyn_error_to_response(e),
     }
 }

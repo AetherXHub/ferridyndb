@@ -978,6 +978,136 @@ impl<'a> QueryBuilder<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// CountBuilder
+// ---------------------------------------------------------------------------
+
+/// Builder for counting items matching a partition key, optional sort key
+/// condition, and optional filter expression — without transferring document
+/// bodies.
+pub struct CountBuilder<'a> {
+    db: &'a FerridynDB,
+    table: String,
+    partition_key: Option<Value>,
+    sort_condition: Option<SortCondition>,
+    filter: Option<FilterExpr>,
+}
+
+impl<'a> CountBuilder<'a> {
+    pub(crate) fn new(db: &'a FerridynDB, table: String) -> Self {
+        Self {
+            db,
+            table,
+            partition_key: None,
+            sort_condition: None,
+            filter: None,
+        }
+    }
+
+    pub fn partition_key(mut self, value: impl Into<Value>) -> Self {
+        self.partition_key = Some(value.into());
+        self
+    }
+
+    pub fn filter(mut self, expr: FilterExpr) -> Self {
+        self.filter = Some(expr);
+        self
+    }
+
+    pub fn sort_key_eq(mut self, value: impl Into<Value>) -> Self {
+        self.sort_condition = Some(SortCondition::Eq(value.into()));
+        self
+    }
+
+    pub fn sort_key_lt(mut self, value: impl Into<Value>) -> Self {
+        self.sort_condition = Some(SortCondition::Lt(value.into()));
+        self
+    }
+
+    pub fn sort_key_le(mut self, value: impl Into<Value>) -> Self {
+        self.sort_condition = Some(SortCondition::Le(value.into()));
+        self
+    }
+
+    pub fn sort_key_gt(mut self, value: impl Into<Value>) -> Self {
+        self.sort_condition = Some(SortCondition::Gt(value.into()));
+        self
+    }
+
+    pub fn sort_key_ge(mut self, value: impl Into<Value>) -> Self {
+        self.sort_condition = Some(SortCondition::Ge(value.into()));
+        self
+    }
+
+    pub fn sort_key_between(mut self, low: impl Into<Value>, high: impl Into<Value>) -> Self {
+        self.sort_condition = Some(SortCondition::Between(low.into(), high.into()));
+        self
+    }
+
+    pub fn sort_key_begins_with(mut self, prefix: &str) -> Self {
+        self.sort_condition = Some(SortCondition::BeginsWith(prefix.to_string()));
+        self
+    }
+
+    /// Execute the count query and return the number of matching items.
+    pub fn execute(self) -> Result<usize, Error> {
+        let pk_val = self.partition_key.ok_or(QueryError::PartitionKeyRequired)?;
+
+        self.db.read_snapshot(|store, catalog_root, snapshot_txn| {
+            let entry = self.db.cached_get_table(store, catalog_root, &self.table)?;
+            let schema = &entry.schema;
+
+            let pk = key_utils::json_to_key_value(
+                &pk_val,
+                schema.partition_key.key_type,
+                &schema.partition_key.name,
+            )?;
+            key_utils::validate_partition_key_size(&pk)?;
+
+            if self.sort_condition.is_some() && schema.sort_key.is_none() {
+                return Err(QueryError::SortKeyNotSupported.into());
+            }
+
+            let sk_type = schema.sort_key.as_ref().map(|sk| sk.key_type);
+            let (start_key, end_key) =
+                compute_scan_bounds(&pk, self.sort_condition.as_ref(), sk_type)?;
+
+            let raw_results = mvcc_ops::mvcc_range_scan(
+                store,
+                entry.data_root_page,
+                start_key.as_deref(),
+                end_key.as_deref(),
+                snapshot_txn,
+            )?;
+
+            let needs_deser = schema.ttl_attribute.is_some() || self.filter.is_some();
+
+            let mut count: usize = 0;
+            for (_key_bytes, value_bytes) in raw_results {
+                if needs_deser {
+                    let val: Value = rmp_serde::from_slice(&value_bytes).map_err(|e| {
+                        StorageError::CorruptedPage(format!("failed to deserialize document: {e}"))
+                    })?;
+
+                    if is_ttl_expired(&val, schema) {
+                        continue;
+                    }
+
+                    if let Some(ref filter) = self.filter
+                        && !filter.eval(&val).unwrap_or(false)
+                    {
+                        continue;
+                    }
+                }
+
+                count += 1;
+            }
+
+            Ok(count)
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ScanBuilder
 // ---------------------------------------------------------------------------
 
