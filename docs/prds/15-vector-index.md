@@ -41,7 +41,7 @@ This is the largest-scope feature in the roadmap and can be deferred. For small 
 | Question | Decision | Rationale |
 |----------|----------|-----------|
 | ANN algorithm? | HNSW via external pure Rust crate | O(log n) query time; mature implementations available; no C/C++ build dependency |
-| Library? | `instant-distance` or `hnsw_rs` (evaluate both) | Pure Rust, no native dependencies, compatible with ferridyn-core's zero-C/C++ policy |
+| Library? | `hora` (hora-search) | Pure Rust, 2.7k stars, actively maintained, supports HNSW + multiple metrics (cosine, euclidean, dot product), Python/JS/Java bindings demonstrate maturity |
 | Vector storage format? | Float32 array in MessagePack (documents) + serialized HNSW graph (index) | Documents in B+Tree as usual; HNSW graph persisted separately |
 | Index persistence? | Serialize HNSW graph to dedicated pages or sidecar file | Must survive restart; rebuilt from documents on first open if missing (cold start fallback) |
 | Dimension limit? | 4096 | Covers all common embedding models (OpenAI: 1536/3072, Cohere: 1024, etc.) |
@@ -77,22 +77,23 @@ pub struct ScoredItem {
 
 ## External Dependency Evaluation
 
-### Candidates
+### Selected: `hora` (hora-search)
 
-| Crate | Algorithm | Pure Rust | SIMD | Metrics | Notes |
-|-------|-----------|-----------|------|---------|-------|
-| `instant-distance` | HNSW | Yes | No | Euclidean (extensible via trait) | Simple API, small footprint, serializable graphs |
-| `hnsw_rs` | HNSW | Yes | Via `packed_simd` (optional) | Cosine, euclidean, dot product, custom | More features, SIMD support behind feature flag |
+| Crate | Algorithm | Pure Rust | Metrics | Stars | Notes |
+|-------|-----------|-----------|---------|-------|-------|
+| **`hora`** | HNSW, SSG, PQIVF, BruteForce | Yes | Cosine, Euclidean, Dot Product, Manhattan | 2,700 | Selected — actively maintained, multiple algorithm backends, embeddable |
+| `hnsw_rs` | HNSW | Yes | 7+ types | 230 | Runner-up — excellent serialization, but less active |
+| `instant-distance` | HNSW | Yes | Euclidean (trait-extensible) | 343 | Simpler but limited metric support and unclear serialization |
+| `arroy` | Random projections | Yes | 4 types | 299 | LMDB-based persistence, but not HNSW (lower recall for high-dim) |
 
-### Selection Criteria
+### Why Hora
 
-1. **Pure Rust** -- no C/C++ dependencies (hard requirement)
-2. **Serialization** -- graph must be persistable to disk
-3. **Metric support** -- cosine, euclidean, dot product at minimum
-4. **Incremental insert** -- add/remove vectors without full rebuild
-5. **Maintenance** -- actively maintained, reasonable download count
-
-Final library choice to be made during implementation after benchmarking both candidates.
+1. **Pure Rust** — "ALL IN RUST", no C/C++ FFI
+2. **Multiple algorithms** — HNSW default, with SSG and brute-force fallbacks
+3. **All required metrics** — Cosine, Euclidean, Dot Product built-in
+4. **Incremental insert** — supports adding vectors to built indexes
+5. **Active maintenance** — 2.7k stars, updated Feb 2025, cross-language bindings demonstrate maturity
+6. **Embeddable** — library crate, no server dependency
 
 ## Implementation Phases
 
@@ -102,17 +103,17 @@ Final library choice to be made during implementation after benchmarking both ca
 - `VectorIndexDefinition` and `VectorMetric` types
 - `FerridynDB::create_vector_index()` builder
 - Vector index metadata stored in catalog (alongside secondary indexes)
-- In-memory HNSW graph built from external crate
+- In-memory HNSW graph built via `hora`
 - Write-path: extract vector attribute, validate dimensions, insert into HNSW graph
 - `FerridynDB::query_vector_index()` builder with `.vector()`, `.top_k()`, `.execute()`
-- Search delegates to HNSW library, fetches full documents from B+Tree by primary key
-- Distance metric mapping: FerridynDB's `VectorMetric` enum -> library's distance function
+- Search delegates to `hora`, fetches full documents from B+Tree by primary key
+- Distance metric mapping: FerridynDB's `VectorMetric` enum -> `hora`'s distance function
 
 **Files:**
 | File | Change |
 |------|--------|
-| `ferridyn-core/Cargo.toml` | Add HNSW crate dependency |
-| `ferridyn-core/src/api/vector.rs` | New: vector index lifecycle, HNSW integration, query logic |
+| `ferridyn-core/Cargo.toml` | Add `hora` dependency |
+| `ferridyn-core/src/api/vector.rs` | New: vector index lifecycle, `hora` integration, query logic |
 | `ferridyn-core/src/types.rs` | Add `VectorIndexDefinition`, `VectorMetric`, `ScoredItem` |
 | `ferridyn-core/src/catalog/ops.rs` | Store/retrieve vector index definitions |
 | `ferridyn-core/src/api/builders.rs` | Add `CreateVectorIndexBuilder`, `VectorQueryBuilder` |
@@ -201,9 +202,9 @@ This is architecturally the most complex new feature. Key risks:
 - **Storage overhead:** Float32 vectors at 1536 dimensions = 6KB per vector, plus HNSW graph overhead (~20-50% additional). A 100k-item index = ~700-900MB total.
 - **HNSW graph persistence:** Serializing/deserializing the graph adds complexity. Cold start rebuild may be slow for large indexes.
 - **Write amplification:** Each put/update/delete modifies both the primary B+Tree and the HNSW graph.
-- **Library stability:** External crate dependency introduces maintenance risk. Mitigated by choosing a well-maintained pure Rust crate and wrapping it behind an internal trait (allows swapping implementations later).
+- **Library stability:** `hora` dependency introduces maintenance risk. Mitigated by its 2.7k-star community, cross-language bindings, and wrapping behind an internal trait (allows swapping implementations later).
 
-Recommend prototyping Phase 1 with the chosen library first to validate integration, persistence model, and performance before committing to the full implementation.
+Recommend prototyping Phase 1 with `hora` first to validate integration, persistence model, and performance before committing to the full implementation.
 
 ## Documentation
 
