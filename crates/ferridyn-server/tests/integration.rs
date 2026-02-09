@@ -2931,3 +2931,141 @@ async fn test_count_with_filter_over_wire() {
         .unwrap();
     assert_eq!(count, 5, "should count only even items over wire");
 }
+
+#[tokio::test]
+async fn test_count_index_over_wire() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    client
+        .create_table(
+            "data",
+            KeyDef {
+                name: "pk".to_string(),
+                key_type: "String".to_string(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    client
+        .create_index(
+            "data",
+            "cat-price-idx",
+            None,
+            Some("category"),
+            Some("String"),
+            Some("price"),
+            Some("Number"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    for i in 1..=10 {
+        client
+            .put_item(
+                "data",
+                json!({"pk": format!("p{i}"), "category": "electronics", "price": i * 10}),
+            )
+            .await
+            .unwrap();
+    }
+    client
+        .put_item(
+            "data",
+            json!({"pk": "other", "category": "books", "price": 15}),
+        )
+        .await
+        .unwrap();
+
+    // Count all electronics.
+    let count = client
+        .count_index("data", "cat-price-idx", json!("electronics"), None, None)
+        .await
+        .unwrap();
+    assert_eq!(count, 10);
+
+    // Count with sort key condition (price between 30 and 70).
+    let count_range = client
+        .count_index(
+            "data",
+            "cat-price-idx",
+            json!("electronics"),
+            Some(SortKeyCondition::Between {
+                low: json!(30),
+                high: json!(70),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(count_range, 5);
+
+    // Count empty result.
+    let count_empty = client
+        .count_index("data", "cat-price-idx", json!("nonexistent"), None, None)
+        .await
+        .unwrap();
+    assert_eq!(count_empty, 0);
+}
+
+#[tokio::test]
+async fn test_count_index_with_filter_over_wire() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    client
+        .create_table(
+            "data",
+            KeyDef {
+                name: "pk".to_string(),
+                key_type: "String".to_string(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    client
+        .create_index(
+            "data",
+            "status-idx",
+            None,
+            Some("status"),
+            Some("String"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    for i in 1..=10 {
+        client
+            .put_item(
+                "data",
+                json!({"pk": format!("p{i}"), "status": "active", "score": i}),
+            )
+            .await
+            .unwrap();
+    }
+
+    let filter = FilterExpr::Gt(
+        Box::new(FilterExpr::Attr("score".to_string())),
+        Box::new(FilterExpr::Literal(json!(5))),
+    );
+
+    let count = client
+        .count_index("data", "status-idx", json!("active"), None, Some(filter))
+        .await
+        .unwrap();
+    assert_eq!(count, 5, "should count only items with score > 5 over wire");
+}

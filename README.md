@@ -4,7 +4,7 @@ A local, embedded, DynamoDB-style document database written in Rust with single-
 
 ## Features
 
-- **DynamoDB-compatible API** — Builder-pattern methods for `put_item`, `get_item`, `delete_item`, `update_item`, `query`, `scan`, and `count` with server-side filter expressions, sort key range conditions (equals, between, gt, gte, lt, lte, begins_with), and atomic batch writes
+- **DynamoDB-compatible API** — Builder-pattern methods for `put_item`, `get_item`, `delete_item`, `update_item`, `query`, `scan`, `count`, and `count_index` with server-side filter expressions, sort key range conditions (equals, between, gt, gte, lt, lte, begins_with), and atomic batch writes
 - **Single-file storage** — Copy-on-write pages with atomic double-buffered header commits (no WAL)
 - **MVCC snapshot isolation** — Single writer, unlimited concurrent readers with version chains
 - **B+Tree indexing** — Efficient range scans with slotted pages and overflow support
@@ -88,6 +88,16 @@ let results = db.query("events")
 let count = db.count("events")
     .partition_key("device_123")
     .sort_key_between(100.0, 200.0)
+    .execute()
+    .unwrap();
+
+// Count on a secondary index — same efficiency, no document transfer
+let active_count = db.count_index("data", "status-idx")
+    .key_value("active")
+    .filter(FilterExpr::gt(
+        FilterExpr::attr("score"),
+        FilterExpr::Literal(json!(50)),
+    ))
     .execute()
     .unwrap();
 

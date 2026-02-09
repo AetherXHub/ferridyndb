@@ -21,10 +21,10 @@ use crate::types::{IndexDefinition, PAGE_SIZE, PageId, PartitionSchema};
 
 use super::batch::{SyncMode, WriteBatch};
 use super::builders::{
-    BatchGetItemBuilder, CountBuilder, CreateIndexBuilder, DeleteItemBuilder, GetItemBuilder,
-    GetItemVersionedBuilder, GetStreamRecordsBuilder, IndexQueryBuilder, ListPartitionKeysBuilder,
-    ListSortKeyPrefixesBuilder, PartitionSchemaBuilder, PutItemBuilder, QueryBuilder, ScanBuilder,
-    TableBuilder, UpdateItemBuilder,
+    BatchGetItemBuilder, CountBuilder, CountIndexBuilder, CreateIndexBuilder, DeleteItemBuilder,
+    GetItemBuilder, GetItemVersionedBuilder, GetStreamRecordsBuilder, IndexQueryBuilder,
+    ListPartitionKeysBuilder, ListSortKeyPrefixesBuilder, PartitionSchemaBuilder, PutItemBuilder,
+    QueryBuilder, ScanBuilder, TableBuilder, UpdateItemBuilder,
 };
 use super::page_store::{BufferedPageStore, FilePageStore};
 use super::transaction::Transaction;
@@ -320,6 +320,12 @@ impl FerridynDB {
     /// List distinct sort key prefixes (split on `#`) for a given partition key.
     pub fn list_sort_key_prefixes(&self, table: &str) -> ListSortKeyPrefixesBuilder<'_> {
         ListSortKeyPrefixesBuilder::new(self, table.to_string())
+    }
+
+    /// Count items matching a secondary index key value and optional conditions
+    /// without transferring document bodies.
+    pub fn count_index(&self, table: &str, index_name: &str) -> CountIndexBuilder<'_> {
+        CountIndexBuilder::new(self, table.to_string(), index_name.to_string())
     }
 
     /// Query items via a secondary index.
@@ -9206,7 +9212,7 @@ mod sort_key_range_tests {
 #[cfg(test)]
 mod reaper_tests {
     use super::*;
-    use crate::types::KeyType;
+    use crate::types::{IndexProjection, KeyType};
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -9521,5 +9527,293 @@ mod reaper_tests {
             .execute()
             .unwrap();
         assert_eq!(count, 0, "filter matching nothing should return 0");
+    }
+
+    // -----------------------------------------------------------------------
+    // count_index tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_count_index_basic() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("status-idx")
+            .index_key("status", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put_item("data", json!({"pk": "a", "status": "active"}))
+            .unwrap();
+        db.put_item("data", json!({"pk": "b", "status": "active"}))
+            .unwrap();
+        db.put_item("data", json!({"pk": "c", "status": "inactive"}))
+            .unwrap();
+
+        let count = db
+            .count_index("data", "status-idx")
+            .key_value("active")
+            .execute()
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_count_index_with_sort_condition() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("cat-price-idx")
+            .index_key("category", KeyType::String)
+            .index_sort_key("price", KeyType::Number)
+            .execute()
+            .unwrap();
+
+        for i in 1..=10 {
+            db.put_item(
+                "data",
+                json!({"pk": format!("p{i}"), "category": "electronics", "price": i * 10}),
+            )
+            .unwrap();
+        }
+
+        let count = db
+            .count_index("data", "cat-price-idx")
+            .key_value("electronics")
+            .sort_key_between(30, 70)
+            .execute()
+            .unwrap();
+        assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn test_count_index_empty() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("status-idx")
+            .index_key("status", KeyType::String)
+            .execute()
+            .unwrap();
+
+        let count = db
+            .count_index("data", "status-idx")
+            .key_value("nonexistent")
+            .execute()
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_count_index_excludes_expired() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .ttl_attribute("expires")
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("status-idx")
+            .index_key("status", KeyType::String)
+            .projection_type(IndexProjection::All)
+            .execute()
+            .unwrap();
+
+        // Expired item.
+        db.put_item(
+            "data",
+            json!({"pk": "a", "status": "active", "expires": 1000}),
+        )
+        .unwrap();
+        // Live item.
+        db.put_item(
+            "data",
+            json!({"pk": "b", "status": "active", "expires": 9999999999.0}),
+        )
+        .unwrap();
+        // No TTL attribute (permanent).
+        db.put_item("data", json!({"pk": "c", "status": "active"}))
+            .unwrap();
+
+        let count = db
+            .count_index("data", "status-idx")
+            .key_value("active")
+            .execute()
+            .unwrap();
+        assert_eq!(count, 2, "expired item should not be counted");
+    }
+
+    #[test]
+    fn test_count_index_skips_stale() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("status-idx")
+            .index_key("status", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.put_item("data", json!({"pk": "a", "status": "active"}))
+            .unwrap();
+        db.put_item("data", json!({"pk": "b", "status": "active"}))
+            .unwrap();
+
+        // Delete one item — index entry becomes stale.
+        db.delete_item("data").partition_key("a").execute().unwrap();
+
+        let count = db
+            .count_index("data", "status-idx")
+            .key_value("active")
+            .execute()
+            .unwrap();
+        assert_eq!(count, 1, "deleted item should not be counted");
+    }
+
+    #[test]
+    fn test_count_index_matches_query_index_len() {
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("status-idx")
+            .index_key("status", KeyType::String)
+            .execute()
+            .unwrap();
+
+        for i in 0..8 {
+            db.put_item(
+                "data",
+                json!({"pk": format!("p{i}"), "status": "active", "v": i}),
+            )
+            .unwrap();
+        }
+        db.put_item("data", json!({"pk": "other", "status": "inactive"}))
+            .unwrap();
+
+        let count = db
+            .count_index("data", "status-idx")
+            .key_value("active")
+            .execute()
+            .unwrap();
+        let query_result = db
+            .query_index("data", "status-idx")
+            .key_value("active")
+            .execute()
+            .unwrap();
+        assert_eq!(count, query_result.items.len());
+    }
+
+    #[test]
+    fn test_count_index_with_filter() {
+        use crate::api::filter::FilterExpr;
+
+        let (db, _dir) = create_test_db();
+        db.create_table("data")
+            .partition_key("pk", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_index("data")
+            .name("status-idx")
+            .index_key("status", KeyType::String)
+            .execute()
+            .unwrap();
+
+        for i in 1..=10 {
+            db.put_item(
+                "data",
+                json!({"pk": format!("p{i}"), "status": "active", "score": i}),
+            )
+            .unwrap();
+        }
+
+        // Filter: score > 5
+        let filter = FilterExpr::Gt(
+            Box::new(FilterExpr::Attr("score".to_string())),
+            Box::new(FilterExpr::Literal(json!(5))),
+        );
+
+        let count = db
+            .count_index("data", "status-idx")
+            .key_value("active")
+            .filter(filter)
+            .execute()
+            .unwrap();
+        assert_eq!(count, 5, "should count only items with score > 5");
+    }
+
+    #[test]
+    fn test_count_index_local() {
+        let (db, _dir) = create_test_db();
+        db.create_table("orders")
+            .partition_key("customer", KeyType::String)
+            .sort_key("order_id", KeyType::String)
+            .execute()
+            .unwrap();
+
+        db.create_index("orders")
+            .name("ts-idx")
+            .local()
+            .index_sort_key("timestamp", KeyType::Number)
+            .execute()
+            .unwrap();
+
+        db.put_item(
+            "orders",
+            json!({"customer": "alice", "order_id": "o1", "timestamp": 100.0}),
+        )
+        .unwrap();
+        db.put_item(
+            "orders",
+            json!({"customer": "alice", "order_id": "o2", "timestamp": 200.0}),
+        )
+        .unwrap();
+        db.put_item(
+            "orders",
+            json!({"customer": "alice", "order_id": "o3", "timestamp": 50.0}),
+        )
+        .unwrap();
+        db.put_item(
+            "orders",
+            json!({"customer": "bob", "order_id": "o4", "timestamp": 150.0}),
+        )
+        .unwrap();
+
+        // Count alice's orders via LSI.
+        let count = db
+            .count_index("orders", "ts-idx")
+            .key_value("alice")
+            .execute()
+            .unwrap();
+        assert_eq!(count, 3);
+
+        // Count alice's orders with timestamp > 100.
+        let count_gt = db
+            .count_index("orders", "ts-idx")
+            .key_value("alice")
+            .sort_key_gt(100.0)
+            .execute()
+            .unwrap();
+        assert_eq!(count_gt, 1, "only timestamp=200 should match > 100");
     }
 }

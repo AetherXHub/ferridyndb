@@ -1,7 +1,7 @@
 # PRD: Count on Index Queries
 
 **Priority:** 16
-**Status:** Approved
+**Status:** Complete
 
 ## Summary
 

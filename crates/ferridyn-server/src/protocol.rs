@@ -229,10 +229,19 @@ pub enum Request {
     SweepExpiredTtl {
         table: String,
     },
-    // -- Count operation --
+    // -- Count operations --
     Count {
         table: String,
         partition_key: Value,
+        #[serde(default)]
+        sort_key_condition: Option<SortKeyCondition>,
+        #[serde(default)]
+        filter: Option<FilterExpr>,
+    },
+    CountIndex {
+        table: String,
+        index_name: String,
+        key_value: Value,
         #[serde(default)]
         sort_key_condition: Option<SortKeyCondition>,
         #[serde(default)]

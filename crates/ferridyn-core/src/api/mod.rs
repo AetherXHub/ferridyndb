@@ -14,9 +14,10 @@ pub mod update;
 
 pub use batch::{BatchOp, SyncMode, WriteBatch};
 pub use builders::{
-    BatchGetItemBuilder, CountBuilder, CreateIndexBuilder, DeleteItemBuilder, GetItemBuilder,
-    GetStreamRecordsBuilder, IndexQueryBuilder, NoReturn, PartitionSchemaBuilder, PutItemBuilder,
-    QueryBuilder, ReturnNew, ReturnOld, ScanBuilder, TableBuilder, UpdateItemBuilder,
+    BatchGetItemBuilder, CountBuilder, CountIndexBuilder, CreateIndexBuilder, DeleteItemBuilder,
+    GetItemBuilder, GetStreamRecordsBuilder, IndexQueryBuilder, NoReturn, PartitionSchemaBuilder,
+    PutItemBuilder, QueryBuilder, ReturnNew, ReturnOld, ScanBuilder, TableBuilder,
+    UpdateItemBuilder,
 };
 pub use database::FerridynDB;
 pub use filter::FilterExpr;

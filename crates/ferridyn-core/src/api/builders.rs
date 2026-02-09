@@ -1108,6 +1108,201 @@ impl<'a> CountBuilder<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// CountIndexBuilder
+// ---------------------------------------------------------------------------
+
+/// Builder for counting items matching a secondary index key value, optional
+/// sort key condition, and optional filter expression — without transferring
+/// document bodies.
+pub struct CountIndexBuilder<'a> {
+    db: &'a FerridynDB,
+    table: String,
+    index_name: String,
+    key_value: Option<Value>,
+    sort_condition: Option<SortCondition>,
+    filter: Option<FilterExpr>,
+}
+
+impl<'a> CountIndexBuilder<'a> {
+    pub(crate) fn new(db: &'a FerridynDB, table: String, index_name: String) -> Self {
+        Self {
+            db,
+            table,
+            index_name,
+            key_value: None,
+            sort_condition: None,
+            filter: None,
+        }
+    }
+
+    /// Set the indexed attribute value to search for (index partition key).
+    pub fn key_value(mut self, val: impl Into<Value>) -> Self {
+        self.key_value = Some(val.into());
+        self
+    }
+
+    pub fn filter(mut self, expr: FilterExpr) -> Self {
+        self.filter = Some(expr);
+        self
+    }
+
+    pub fn sort_key_eq(mut self, value: impl Into<Value>) -> Self {
+        self.sort_condition = Some(SortCondition::Eq(value.into()));
+        self
+    }
+
+    pub fn sort_key_lt(mut self, value: impl Into<Value>) -> Self {
+        self.sort_condition = Some(SortCondition::Lt(value.into()));
+        self
+    }
+
+    pub fn sort_key_le(mut self, value: impl Into<Value>) -> Self {
+        self.sort_condition = Some(SortCondition::Le(value.into()));
+        self
+    }
+
+    pub fn sort_key_gt(mut self, value: impl Into<Value>) -> Self {
+        self.sort_condition = Some(SortCondition::Gt(value.into()));
+        self
+    }
+
+    pub fn sort_key_ge(mut self, value: impl Into<Value>) -> Self {
+        self.sort_condition = Some(SortCondition::Ge(value.into()));
+        self
+    }
+
+    pub fn sort_key_between(mut self, low: impl Into<Value>, high: impl Into<Value>) -> Self {
+        self.sort_condition = Some(SortCondition::Between(low.into(), high.into()));
+        self
+    }
+
+    pub fn sort_key_begins_with(mut self, prefix: &str) -> Self {
+        self.sort_condition = Some(SortCondition::BeginsWith(prefix.to_string()));
+        self
+    }
+
+    /// Execute the count query and return the number of matching items.
+    pub fn execute(self) -> Result<usize, Error> {
+        let search_value = self.key_value.ok_or(QueryError::IndexKeyRequired)?;
+
+        self.db.read_snapshot(|store, catalog_root, snapshot_txn| {
+            let entry = self.db.cached_get_table(store, catalog_root, &self.table)?;
+            let schema = &entry.schema;
+
+            // Find the index definition.
+            let index = entry
+                .indexes
+                .iter()
+                .find(|idx| idx.name == self.index_name)
+                .ok_or_else(|| SchemaError::IndexNotFound(self.index_name.clone()))?;
+
+            // Validate: sort condition requires a composite index with a sort key.
+            if self.sort_condition.is_some() && index.index_sort_key.is_none() {
+                return Err(QueryError::InvalidCondition(
+                    "sort key condition on index without a sort key".to_string(),
+                )
+                .into());
+            }
+
+            // Convert the search value to a KeyValue.
+            let indexed_kv = key_utils::json_to_key_value(
+                &search_value,
+                index.index_key.key_type,
+                &index.index_key.name,
+            )?;
+
+            // Compute scan bounds using index-specific encoding.
+            let idx_sk_type = index.index_sort_key.as_ref().map(|k| k.key_type);
+            let (start_key, end_key) =
+                compute_index_scan_bounds(&indexed_kv, self.sort_condition.as_ref(), idx_sk_type)?;
+
+            // Scan the index B+Tree (plain B+Tree, no MVCC wrapping).
+            let index_entries = btree_ops::range_scan(
+                store,
+                index.root_page,
+                start_key.as_deref(),
+                end_key.as_deref(),
+            )?;
+
+            let needs_deser = schema.ttl_attribute.is_some() || self.filter.is_some();
+
+            let mut count: usize = 0;
+            for (index_key, index_value) in &index_entries {
+                // If the index projection value is non-empty and covers what
+                // we need, we can avoid the base table fetch for non-stale
+                // entries.  For count we only need TTL + filter, so a
+                // non-empty projection value is sufficient when it contains
+                // the required attributes.
+                if !index_value.is_empty() {
+                    let val: Value = rmp_serde::from_slice(index_value).map_err(|e| {
+                        StorageError::CorruptedPage(format!(
+                            "failed to deserialize index projection value: {e}"
+                        ))
+                    })?;
+
+                    if is_ttl_expired(&val, schema) {
+                        continue;
+                    }
+
+                    if let Some(ref filter) = self.filter
+                        && !filter.eval(&val).unwrap_or(false)
+                    {
+                        continue;
+                    }
+
+                    count += 1;
+                    continue;
+                }
+
+                // Decode the primary composite key bytes from the index entry.
+                let primary_key_bytes = key_utils::decode_primary_key_from_index_entry(
+                    index_key,
+                    index.index_sort_key.as_ref().map(|k| k.key_type),
+                )?;
+
+                // Fetch the full document from the primary table (lazy GC).
+                let doc_bytes = mvcc_ops::mvcc_get(
+                    store,
+                    entry.data_root_page,
+                    &primary_key_bytes,
+                    snapshot_txn,
+                )?;
+
+                match doc_bytes {
+                    Some(bytes) => {
+                        if needs_deser {
+                            let val: Value = rmp_serde::from_slice(&bytes).map_err(|e| {
+                                StorageError::CorruptedPage(format!(
+                                    "failed to deserialize document: {e}"
+                                ))
+                            })?;
+
+                            if is_ttl_expired(&val, schema) {
+                                continue;
+                            }
+
+                            if let Some(ref filter) = self.filter
+                                && !filter.eval(&val).unwrap_or(false)
+                            {
+                                continue;
+                            }
+                        }
+
+                        count += 1;
+                    }
+                    None => {
+                        // Document deleted or invisible — lazy GC skip.
+                        continue;
+                    }
+                }
+            }
+
+            Ok(count)
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ScanBuilder
 // ---------------------------------------------------------------------------
 

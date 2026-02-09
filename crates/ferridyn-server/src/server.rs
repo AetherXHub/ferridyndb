@@ -339,6 +339,21 @@ fn dispatch(db: &FerridynDB, req: Request) -> Response {
             sort_key_condition,
             filter,
         } => handle_count(db, &table, partition_key, sort_key_condition, filter),
+
+        Request::CountIndex {
+            table,
+            index_name,
+            key_value,
+            sort_key_condition,
+            filter,
+        } => handle_count_index(
+            db,
+            &table,
+            &index_name,
+            key_value,
+            sort_key_condition,
+            filter,
+        ),
     }
 }
 
@@ -1098,6 +1113,38 @@ fn handle_count(
     filter: Option<FilterExpr>,
 ) -> Response {
     let mut builder = db.count(table).partition_key(partition_key);
+
+    if let Some(cond) = sort_key_condition {
+        builder = match cond {
+            SortKeyCondition::Eq { value } => builder.sort_key_eq(value),
+            SortKeyCondition::Lt { value } => builder.sort_key_lt(value),
+            SortKeyCondition::Le { value } => builder.sort_key_le(value),
+            SortKeyCondition::Gt { value } => builder.sort_key_gt(value),
+            SortKeyCondition::Ge { value } => builder.sort_key_ge(value),
+            SortKeyCondition::Between { low, high } => builder.sort_key_between(low, high),
+            SortKeyCondition::BeginsWith { prefix } => builder.sort_key_begins_with(&prefix),
+        };
+    }
+
+    if let Some(f) = filter {
+        builder = builder.filter(f);
+    }
+
+    match builder.execute() {
+        Ok(count) => Response::ok_count(count),
+        Err(e) => dyn_error_to_response(e),
+    }
+}
+
+fn handle_count_index(
+    db: &FerridynDB,
+    table: &str,
+    index_name: &str,
+    key_value: serde_json::Value,
+    sort_key_condition: Option<SortKeyCondition>,
+    filter: Option<FilterExpr>,
+) -> Response {
+    let mut builder = db.count_index(table, index_name).key_value(key_value);
 
     if let Some(cond) = sort_key_condition {
         builder = match cond {

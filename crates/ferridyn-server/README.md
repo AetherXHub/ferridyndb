@@ -59,6 +59,8 @@ JSON-over-newlines on Unix domain socket. Each request is one JSON line, each re
 {"op":"count","table":"users","partition_key":"alice"}
 {"op":"count","table":"events","partition_key":"device1","sort_key_condition":{"op":"between","low":100,"high":200}}
 {"op":"count","table":"users","partition_key":"alice","filter":{"Eq":[{"Attr":"status"},{"Literal":"active"}]}}
+{"op":"count_index","table":"data","index_name":"status-idx","key_value":"active"}
+{"op":"count_index","table":"data","index_name":"cat-price-idx","key_value":"electronics","sort_key_condition":{"op":"between","low":30,"high":70}}
 ```
 
 ### Response Examples
@@ -142,6 +144,9 @@ let count = client.count("users", json!("alice"), None, None).await?;
 let count = client.count("events", json!("device1"),
     Some(SortKeyCondition::Between { low: json!(100), high: json!(200) }), None).await?;
 
+// Count on a secondary index
+let count = client.count_index("data", "status-idx", json!("active"), None, None).await?;
+
 // TTL management
 client.set_ttl("cache", json!("session_123"), None, 3600).await?;      // expire in 1 hour
 let remaining = client.get_ttl("cache", json!("session_123"), None).await?; // Some(3599)
@@ -176,14 +181,14 @@ ferridyn-server [--db PATH] [--socket PATH]
 - **Secondary indexes**: Scoped (partition schema prefix), global (table-wide), and local (same partition key, alternate sort key) secondary indexes with composite keys (partition + sort), index projections (KEYS_ONLY, INCLUDE, ALL), automatic backfill, sort key range conditions, and page reclamation on drop
 - **Batch writes**: Atomic multi-table put/delete batches (up to 25 operations) with all-or-nothing semantics
 - **Change streams**: Per-table change data capture with configurable view types (KEYS_ONLY, NEW_IMAGE, OLD_IMAGE, NEW_AND_OLD_IMAGES), poll-based consumption with sequence pagination, stream info, retention pruning, and enable/disable on existing tables
-- **Count aggregation**: Count matching items without transferring document bodies; supports partition key, sort key conditions, and filter expressions
+- **Count aggregation**: Count matching items without transferring document bodies; supports partition key, sort key conditions, and filter expressions — also available on secondary indexes via `count_index`
 - **TTL management**: Set, remove, and query item TTLs over the wire protocol; sweep expired items on demand
 
 ## Concurrency Model
 
 The server inherits FerridynDB's concurrency semantics:
 
-- **Read operations** (get, batch_get, query, scan, count, list_*) execute concurrently via read lock
+- **Read operations** (get, batch_get, query, scan, count, count_index, list_*) execute concurrently via read lock
 - **Write operations** (put, delete, update, create_table) are serialized via write lock
 - **Version conflicts** are detected and reported as VersionMismatch errors
 - **Snapshot isolation** is maintained per-transaction
