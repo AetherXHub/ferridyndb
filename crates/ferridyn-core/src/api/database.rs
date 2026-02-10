@@ -49,7 +49,6 @@ struct DatabaseInner {
     read_file: std::fs::File,
     snapshot_tracker: SnapshotTracker,
     _file_lock: FileLock,
-    #[allow(dead_code)]
     path: PathBuf,
     sync_mode: AtomicU8,
     /// In-memory HNSW vector indexes: table_name → (index_name → VectorIndexState).
@@ -211,8 +210,14 @@ impl FerridynDB {
             }),
         };
 
-        // Rebuild in-memory vector indexes from catalog + documents.
-        db.rebuild_vector_indexes()?;
+        // Warm start: try loading vector indexes from sidecar file.
+        // Falls back to full rebuild from documents if sidecar is missing/stale.
+        if let Some(indexes) = db.load_vector_sidecar() {
+            *db.inner.vector_indexes.write() = indexes;
+        } else {
+            db.rebuild_vector_indexes()?;
+            db.persist_vector_indexes();
+        }
 
         Ok(db)
     }
@@ -587,6 +592,10 @@ impl FerridynDB {
             .entry(table.to_string())
             .or_default()
             .insert(definition.name.clone(), vi_state);
+        drop(indexes);
+
+        // 4. Persist sidecar with newly created index.
+        self.persist_vector_indexes();
 
         Ok(())
     }
@@ -663,6 +672,10 @@ impl FerridynDB {
         if let Some(table_indexes) = indexes.get_mut(table) {
             table_indexes.remove(index_name);
         }
+        drop(indexes);
+
+        // Persist sidecar after removal.
+        self.persist_vector_indexes();
 
         Ok(())
     }
@@ -754,6 +767,140 @@ impl FerridynDB {
 
         *self.inner.vector_indexes.write() = all_indexes;
         Ok(())
+    }
+
+    /// Path to the vector index sidecar file (`<dbpath>.vec`).
+    fn vector_sidecar_path(&self) -> PathBuf {
+        self.inner.path.with_extension("vec")
+    }
+
+    /// Persist all in-memory vector indexes to the sidecar file.
+    ///
+    /// Writes atomically via `.vec.tmp` → rename to `.vec`.
+    /// Errors are silently ignored (sidecar is best-effort; rebuild is fallback).
+    fn persist_vector_indexes(&self) {
+        let sidecar_path = self.vector_sidecar_path();
+
+        let indexes = self.inner.vector_indexes.read();
+        if indexes.is_empty() || indexes.values().all(|t| t.is_empty()) {
+            // No vector indexes — remove stale sidecar if present.
+            drop(indexes);
+            let _ = std::fs::remove_file(&sidecar_path);
+            return;
+        }
+
+        let txn_counter = self.inner.state.read().header.txn_counter;
+
+        let mut tables = Vec::new();
+        for (table_name, table_indexes) in indexes.iter() {
+            let mut idx_snapshots = Vec::new();
+            for (index_name, vi_state) in table_indexes {
+                idx_snapshots.push(vi_state.to_snapshot(index_name));
+            }
+            tables.push(super::vector::TableVectorSnapshot {
+                table_name: table_name.clone(),
+                indexes: idx_snapshots,
+            });
+        }
+        drop(indexes);
+
+        let snapshot = super::vector::VectorSnapshot {
+            magic: super::vector::VECTOR_SIDECAR_MAGIC,
+            version: super::vector::VECTOR_SIDECAR_VERSION,
+            txn_counter,
+            tables,
+        };
+
+        let bytes = match rmp_serde::to_vec(&snapshot) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+
+        let tmp_path = sidecar_path.with_extension("vec.tmp");
+        if std::fs::write(&tmp_path, &bytes).is_ok() {
+            let _ = std::fs::rename(&tmp_path, &sidecar_path);
+        }
+    }
+
+    /// Try to load vector indexes from the sidecar file.
+    ///
+    /// Returns `None` on any failure (missing, corrupt, stale, definition
+    /// mismatch), triggering the rebuild fallback.
+    fn load_vector_sidecar(
+        &self,
+    ) -> Option<HashMap<String, HashMap<String, super::vector::VectorIndexState>>> {
+        let sidecar_path = self.vector_sidecar_path();
+        let bytes = std::fs::read(&sidecar_path).ok()?;
+
+        let snapshot: super::vector::VectorSnapshot = rmp_serde::from_slice(&bytes).ok()?;
+
+        // Validate magic and version.
+        if snapshot.magic != super::vector::VECTOR_SIDECAR_MAGIC {
+            return None;
+        }
+        if snapshot.version != super::vector::VECTOR_SIDECAR_VERSION {
+            return None;
+        }
+
+        // Validate txn_counter matches current DB header.
+        let current_txn = self.inner.state.read().header.txn_counter;
+        if snapshot.txn_counter != current_txn {
+            return None;
+        }
+
+        // Build catalog snapshot for validation.
+        let (store, header) = self.read_store_snapshot().ok()?;
+
+        let mut all_indexes: HashMap<String, HashMap<String, super::vector::VectorIndexState>> =
+            HashMap::new();
+
+        for table_snap in snapshot.tables {
+            // Validate against catalog: check definitions match.
+            let catalog_defs = catalog::ops::list_vector_indexes(
+                &store,
+                header.catalog_root_page,
+                &table_snap.table_name,
+            )
+            .ok()?;
+
+            // Index count must match.
+            if catalog_defs.len() != table_snap.indexes.len() {
+                return None;
+            }
+
+            let mut table_indexes = HashMap::new();
+            for idx_snap in table_snap.indexes {
+                // Find matching catalog definition.
+                let catalog_def = catalog_defs
+                    .iter()
+                    .find(|d| d.name == idx_snap.index_name)?;
+
+                // Validate definition matches.
+                if idx_snap.definition.dimensions != catalog_def.dimensions
+                    || idx_snap.definition.metric != catalog_def.metric
+                    || idx_snap.definition.attribute != catalog_def.attribute
+                {
+                    return None;
+                }
+
+                let vi_state = super::vector::VectorIndexState::from_snapshot(idx_snap).ok()?;
+                table_indexes.insert(vi_state.definition.name.clone(), vi_state);
+            }
+            all_indexes.insert(table_snap.table_name, table_indexes);
+        }
+
+        // Also verify no tables with vector indexes are missing from the snapshot.
+        let tables = catalog::ops::list_tables(&store, header.catalog_root_page).ok()?;
+        for table_name in &tables {
+            let defs =
+                catalog::ops::list_vector_indexes(&store, header.catalog_root_page, table_name)
+                    .ok()?;
+            if !defs.is_empty() && !all_indexes.contains_key(table_name) {
+                return None;
+            }
+        }
+
+        Some(all_indexes)
     }
 
     /// Create a new write batch for batching multiple operations.
@@ -1046,13 +1193,21 @@ impl FerridynDB {
             Ok(val) => {
                 // Extract vector ops before consuming the transaction.
                 let vector_ops = std::mem::take(&mut txn.vector_ops);
+                let has_vector_ops = !vector_ops.is_empty();
 
                 // Acquire write lock briefly for the commit phase only.
-                let mut state = self.inner.state.write();
-                self.commit_txn(txn, &mut state)?;
+                {
+                    let mut state = self.inner.state.write();
+                    self.commit_txn(txn, &mut state)?;
+                }
 
                 // Apply vector ops to in-memory HNSW graphs after successful commit.
                 self.apply_vector_ops(vector_ops);
+
+                // Persist sidecar if vector state changed.
+                if has_vector_ops {
+                    self.persist_vector_indexes();
+                }
 
                 Ok(val)
             }
@@ -10437,5 +10592,201 @@ mod vector_index_tests {
             .unwrap();
         assert_eq!(results2.len(), 1);
         assert_eq!(results2[0].item["id"], "keep");
+    }
+
+    #[test]
+    fn test_vector_index_persists_across_reopen() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let sidecar_path = db_path.with_extension("vec");
+
+        // Create DB, create vector index, insert items.
+        // Use Euclidean metric with well-separated vectors for determinism.
+        {
+            let db = FerridynDB::create(&db_path).unwrap();
+            db.create_table("items")
+                .partition_key("id", KeyType::String)
+                .execute()
+                .unwrap();
+
+            db.create_vector_index("items")
+                .name("emb-idx")
+                .attribute("embedding")
+                .dimensions(2)
+                .metric(VectorMetric::Euclidean)
+                .execute()
+                .unwrap();
+
+            for i in 0..10 {
+                db.put_item(
+                    "items",
+                    json!({"id": format!("item-{i}"), "embedding": [i as f64, 0.0]}),
+                )
+                .unwrap();
+            }
+        }
+
+        // Verify sidecar file exists.
+        assert!(sidecar_path.exists(), "sidecar .vec file should exist");
+
+        // Reopen and query — should use warm start from sidecar.
+        {
+            let db = FerridynDB::open(&db_path).unwrap();
+
+            let results = db
+                .query_vector_index("items", "emb-idx")
+                .vector(vec![0.0, 0.0])
+                .top_k(3)
+                .execute()
+                .unwrap();
+
+            assert_eq!(results.len(), 3);
+            // item-0=[0,0] closest, item-1=[1,0] next, item-2=[2,0] third.
+            assert_eq!(results[0].item["id"], "item-0");
+            assert_eq!(results[1].item["id"], "item-1");
+            assert_eq!(results[2].item["id"], "item-2");
+        }
+    }
+
+    #[test]
+    fn test_vector_index_cold_start_rebuild() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let sidecar_path = db_path.with_extension("vec");
+
+        // Create DB, insert items with vector index.
+        {
+            let db = FerridynDB::create(&db_path).unwrap();
+            db.create_table("items")
+                .partition_key("id", KeyType::String)
+                .execute()
+                .unwrap();
+
+            db.create_vector_index("items")
+                .name("emb-idx")
+                .attribute("embedding")
+                .dimensions(2)
+                .metric(VectorMetric::Euclidean)
+                .execute()
+                .unwrap();
+
+            for i in 0..10 {
+                db.put_item(
+                    "items",
+                    json!({"id": format!("item-{i}"), "embedding": [i as f64 * 10.0, 0.0]}),
+                )
+                .unwrap();
+            }
+        }
+
+        assert!(sidecar_path.exists());
+
+        // Delete the sidecar to force cold start rebuild.
+        std::fs::remove_file(&sidecar_path).unwrap();
+        assert!(!sidecar_path.exists());
+
+        // Reopen — should rebuild from documents.
+        {
+            let db = FerridynDB::open(&db_path).unwrap();
+
+            let results = db
+                .query_vector_index("items", "emb-idx")
+                .vector(vec![0.0, 0.0])
+                .top_k(3)
+                .execute()
+                .unwrap();
+
+            assert_eq!(results.len(), 3);
+            assert_eq!(results[0].item["id"], "item-0");
+            assert_eq!(results[1].item["id"], "item-1");
+            assert_eq!(results[2].item["id"], "item-2");
+        }
+
+        // After rebuild, sidecar should be recreated.
+        assert!(
+            sidecar_path.exists(),
+            "sidecar should be recreated after rebuild"
+        );
+    }
+
+    #[test]
+    fn test_vector_index_persistence_after_updates() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+
+        // Phase 1: Create and populate with well-separated vectors.
+        {
+            let db = FerridynDB::create(&db_path).unwrap();
+            db.create_table("items")
+                .partition_key("id", KeyType::String)
+                .execute()
+                .unwrap();
+
+            db.create_vector_index("items")
+                .name("emb-idx")
+                .attribute("embedding")
+                .dimensions(2)
+                .metric(VectorMetric::Euclidean)
+                .execute()
+                .unwrap();
+
+            for i in 0..10 {
+                db.put_item(
+                    "items",
+                    json!({"id": format!("item-{i}"), "embedding": [i as f64 * 10.0, 0.0]}),
+                )
+                .unwrap();
+            }
+        }
+
+        // Phase 2: Reopen and make modifications.
+        {
+            let db = FerridynDB::open(&db_path).unwrap();
+
+            // Update "item-0" to a far position.
+            db.put_item("items", json!({"id": "item-0", "embedding": [200.0, 0.0]}))
+                .unwrap();
+
+            // Add a new item at origin.
+            db.put_item(
+                "items",
+                json!({"id": "new-origin", "embedding": [0.0, 0.0]}),
+            )
+            .unwrap();
+
+            // Delete "item-1".
+            db.delete_item("items")
+                .partition_key("item-1")
+                .execute()
+                .unwrap();
+        }
+
+        // Phase 3: Reopen and verify final state.
+        {
+            let db = FerridynDB::open(&db_path).unwrap();
+
+            let results = db
+                .query_vector_index("items", "emb-idx")
+                .vector(vec![0.0, 0.0])
+                .top_k(10)
+                .execute()
+                .unwrap();
+
+            // Should have 10 items: 8 originals (item-2..9) + item-0 (moved) + new-origin.
+            // item-1 was deleted.
+            assert_eq!(results.len(), 10);
+
+            let ids: Vec<&str> = results
+                .iter()
+                .map(|r| r.item["id"].as_str().unwrap())
+                .collect();
+            assert!(ids.contains(&"new-origin"), "new-origin should be present");
+            assert!(ids.contains(&"item-0"), "item-0 should be present (moved)");
+            assert!(!ids.contains(&"item-1"), "item-1 should be deleted");
+            assert!(ids.contains(&"item-2"), "item-2 should be present");
+
+            // "new-origin" at [0,0] should be closest to query [0,0].
+            assert_eq!(results[0].item["id"], "new-origin");
+        }
     }
 }
