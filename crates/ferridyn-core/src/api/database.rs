@@ -29,6 +29,7 @@ use super::builders::{
     ListPartitionKeysBuilder, ListSortKeyPrefixesBuilder, PartitionSchemaBuilder, PutItemBuilder,
     QueryBuilder, ScanBuilder, TableBuilder, UpdateItemBuilder,
 };
+use super::filter::FilterExpr;
 use super::page_store::{BufferedPageStore, FilePageStore};
 use super::transaction::Transaction;
 
@@ -616,8 +617,16 @@ impl FerridynDB {
         index_name: &str,
         query: &[f32],
         top_k: usize,
+        filter: Option<&FilterExpr>,
+        oversampling_factor: usize,
     ) -> Result<Vec<ScoredItem>, Error> {
         // 1. Search the in-memory HNSW graph.
+        // When filtering, oversample to compensate for candidates rejected by the filter.
+        let search_k = if filter.is_some() {
+            top_k * oversampling_factor
+        } else {
+            top_k
+        };
         let results = {
             let indexes = self.inner.vector_indexes.read();
             let table_indexes = indexes
@@ -626,13 +635,13 @@ impl FerridynDB {
             let vi_state = table_indexes
                 .get(index_name)
                 .ok_or_else(|| SchemaError::VectorIndexNotFound(index_name.to_string()))?;
-            vi_state.search(query, top_k)?
+            vi_state.search(query, search_k)?
         };
 
-        // 2. Fetch full documents for each result.
+        // 2. Fetch full documents for each result, applying filter if present.
         self.read_snapshot(|store, catalog_root, snapshot_txn| {
             let entry = self.cached_get_table(store, catalog_root, table)?;
-            let mut items = Vec::with_capacity(results.len());
+            let mut items = Vec::with_capacity(top_k.min(results.len()));
             for (pk_bytes, distance) in &results {
                 if let Some(doc_bytes) =
                     mvcc_ops::mvcc_get(store, entry.data_root_page, pk_bytes, snapshot_txn)?
@@ -640,10 +649,18 @@ impl FerridynDB {
                     let doc: Value = rmp_serde::from_slice(&doc_bytes).map_err(|e| {
                         StorageError::CorruptedPage(format!("failed to deserialize document: {e}"))
                     })?;
+                    if let Some(f) = filter
+                        && !f.eval(&doc).unwrap_or(false)
+                    {
+                        continue;
+                    }
                     items.push(ScoredItem {
                         item: doc,
                         score: *distance as f64,
                     });
+                    if items.len() >= top_k {
+                        break;
+                    }
                 }
             }
             Ok(items)
@@ -10228,6 +10245,7 @@ mod reaper_tests {
 #[cfg(test)]
 mod vector_index_tests {
     use super::*;
+    use crate::api::filter::FilterExpr;
     use crate::types::{KeyType, VectorMetric};
     use serde_json::json;
     use tempfile::tempdir;
@@ -10788,5 +10806,101 @@ mod vector_index_tests {
             // "new-origin" at [0,0] should be closest to query [0,0].
             assert_eq!(results[0].item["id"], "new-origin");
         }
+    }
+
+    #[test]
+    fn test_vector_query_with_filter() {
+        let (db, _tmp) = setup_db();
+
+        db.create_vector_index("items")
+            .name("emb-idx")
+            .attribute("embedding")
+            .dimensions(3)
+            .metric(VectorMetric::Euclidean)
+            .execute()
+            .unwrap();
+
+        // Insert items with a "category" attribute — mix of "A" and "B".
+        for i in 0..10 {
+            let category = if i % 2 == 0 { "A" } else { "B" };
+            db.put_item(
+                "items",
+                json!({
+                    "id": format!("item-{i}"),
+                    "embedding": [i as f64, 0.0, 0.0],
+                    "category": category,
+                }),
+            )
+            .unwrap();
+        }
+
+        // Query with filter: only category "A" items.
+        let results = db
+            .query_vector_index("items", "emb-idx")
+            .vector(vec![0.0, 0.0, 0.0])
+            .top_k(5)
+            .filter(FilterExpr::eq(
+                FilterExpr::attr("category"),
+                FilterExpr::literal("A"),
+            ))
+            .execute()
+            .unwrap();
+
+        // All results should have category "A".
+        for item in &results {
+            assert_eq!(
+                item.item["category"], "A",
+                "expected category A, got {:?}",
+                item.item
+            );
+        }
+        // Should have up to 5 results (there are 5 category-A items: 0, 2, 4, 6, 8).
+        assert_eq!(results.len(), 5);
+        // Results should be ordered by distance (ascending).
+        for w in results.windows(2) {
+            assert!(w[0].score <= w[1].score, "results not sorted by distance");
+        }
+    }
+
+    #[test]
+    fn test_vector_query_filter_rejects_all() {
+        let (db, _tmp) = setup_db();
+
+        db.create_vector_index("items")
+            .name("emb-idx")
+            .attribute("embedding")
+            .dimensions(3)
+            .metric(VectorMetric::Euclidean)
+            .execute()
+            .unwrap();
+
+        for i in 0..5 {
+            db.put_item(
+                "items",
+                json!({
+                    "id": format!("item-{i}"),
+                    "embedding": [i as f64, 0.0, 0.0],
+                    "category": "A",
+                }),
+            )
+            .unwrap();
+        }
+
+        // Filter on a category that no items have.
+        let results = db
+            .query_vector_index("items", "emb-idx")
+            .vector(vec![0.0, 0.0, 0.0])
+            .top_k(5)
+            .filter(FilterExpr::eq(
+                FilterExpr::attr("category"),
+                FilterExpr::literal("Z"),
+            ))
+            .execute()
+            .unwrap();
+
+        assert!(
+            results.is_empty(),
+            "expected empty results when filter rejects all"
+        );
     }
 }

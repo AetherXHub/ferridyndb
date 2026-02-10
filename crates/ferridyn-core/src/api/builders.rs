@@ -2576,6 +2576,8 @@ pub struct VectorQueryBuilder<'a> {
     index_name: String,
     vector: Option<Vec<f32>>,
     top_k: usize,
+    filter: Option<FilterExpr>,
+    oversampling_factor: usize,
 }
 
 impl<'a> VectorQueryBuilder<'a> {
@@ -2586,6 +2588,8 @@ impl<'a> VectorQueryBuilder<'a> {
             index_name,
             vector: None,
             top_k: 10,
+            filter: None,
+            oversampling_factor: 3,
         }
     }
 
@@ -2601,12 +2605,32 @@ impl<'a> VectorQueryBuilder<'a> {
         self
     }
 
+    /// Set a filter expression to apply to results after ANN search.
+    pub fn filter(mut self, expr: FilterExpr) -> Self {
+        self.filter = Some(expr);
+        self
+    }
+
+    /// Set the oversampling factor for filtered queries (default: 3).
+    /// When a filter is set, `top_k * oversampling_factor` candidates are
+    /// fetched from the HNSW index before filtering down to `top_k`.
+    pub fn oversampling_factor(mut self, factor: usize) -> Self {
+        self.oversampling_factor = factor;
+        self
+    }
+
     /// Execute the vector search.
     pub fn execute(self) -> Result<Vec<ScoredItem>, Error> {
         let query = self.vector.ok_or(QueryError::InvalidCondition(
             "query vector required".to_string(),
         ))?;
-        self.db
-            .query_vector_index_inner(&self.table, &self.index_name, &query, self.top_k)
+        self.db.query_vector_index_inner(
+            &self.table,
+            &self.index_name,
+            &query,
+            self.top_k,
+            self.filter.as_ref(),
+            self.oversampling_factor,
+        )
     }
 }

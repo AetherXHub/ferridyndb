@@ -15,7 +15,7 @@ DynamoDB's API is simple and effective for key-value and document workloads, but
 This is a Cargo workspace. Build/test from the repository root:
 
 - `cargo build` — compile all crates
-- `cargo test` — run all tests across the workspace (794 tests)
+- `cargo test` — run all tests across the workspace (796 tests)
 - `cargo test -p ferridyn-core` — test only the core crate
 - `cargo test -p ferridyn-core <test_name>` — run a single test by name
 - `cargo clippy --workspace -- -D warnings` — lint all crates (zero warnings required)
@@ -37,7 +37,7 @@ Six-layer stack, bottom to top:
 
 7. **Change Streams** (`stream/`) — Per-table change data capture. Dedicated B+Tree per stream keyed by `(txn_id, sub_sequence)`. Records commit atomically with data writes in the same CoW commit. Configurable view types: KeysOnly, NewImage, OldImage, NewAndOldImages. Poll-based consumption by sequence number with retention pruning (max age, max count).
 
-Public API (`api/`) sits on top: `put/get/delete/update/query/scan/count/query_index/batch_get_item/batch_write_item/transact`, plus server-side filter expressions, sort key range conditions (eq, between, gt, gte, lt, lte, begins_with), condition expressions on write operations, return values on writes (type-state builders for old/new document retrieval), atomic batch writes (up to 25 put/delete operations across tables), introspection for partition schemas and indexes, change stream management (enable/disable/query/prune), TTL management (`set_ttl`/`remove_ttl`/`get_ttl`/`start_reaper`), count aggregation (partition key + sort condition + filter without transferring document bodies), count on index queries (`count_index` — count items matching a secondary index key value with optional sort condition and filter), and vector index management (`create_vector_index`/`query_vector_index`/`drop_vector_index`/`list_vector_indexes` — in-memory HNSW approximate nearest neighbor search with cosine, euclidean, and dot product metrics).
+Public API (`api/`) sits on top: `put/get/delete/update/query/scan/count/query_index/batch_get_item/batch_write_item/transact`, plus server-side filter expressions, sort key range conditions (eq, between, gt, gte, lt, lte, begins_with), condition expressions on write operations, return values on writes (type-state builders for old/new document retrieval), atomic batch writes (up to 25 put/delete operations across tables), introspection for partition schemas and indexes, change stream management (enable/disable/query/prune), TTL management (`set_ttl`/`remove_ttl`/`get_ttl`/`start_reaper`), count aggregation (partition key + sort condition + filter without transferring document bodies), count on index queries (`count_index` — count items matching a secondary index key value with optional sort condition and filter), and vector index management (`create_vector_index`/`query_vector_index`/`drop_vector_index`/`list_vector_indexes` — in-memory HNSW approximate nearest neighbor search with cosine, euclidean, and dot product metrics, with post-ANN filter expression support and configurable oversampling).
 
 Documents are stored on disk as MessagePack (via rmp-serde) for compactness. The public API accepts and returns `serde_json::Value`.
 
@@ -91,7 +91,7 @@ PRDs live in `docs/prds/` and track feature implementation across phases.
 - **Partition schemas & scoped secondary indexes** — Prefix-based entity type metadata with attribute definitions, scoped secondary indexes backed by plain B+Tree lookups with lazy GC
 - **Global and local secondary indexes** — GSI indexes alternate attributes across the table; LSI shares the table's partition key with an alternate sort key. Both support composite keys, range queries, and projections (KeysOnly, Include, All)
 - **Change streams** — Per-table CDC with dedicated B+Tree per stream, keyed by `(txn_id, sub_sequence)`. Atomic capture in same CoW commit. Configurable view types (KeysOnly, NewImage, OldImage, NewAndOldImages). Retention pruning by age or count
-- **Vector indexes** — In-memory HNSW graphs via `hnsw_rs` for approximate nearest neighbor search. Supports cosine, euclidean, and dot product metrics. No native delete — uses deleted-IDs `HashSet` with oversampling during search. Brute-force fallback for datasets under 100 items. Sidecar file persistence (`<dbpath>.vec`) for warm start on reopen; cold start fallback rebuilds from documents if sidecar is missing or stale
+- **Vector indexes** — In-memory HNSW graphs via `hnsw_rs` for approximate nearest neighbor search. Supports cosine, euclidean, and dot product metrics. No native delete — uses deleted-IDs `HashSet` with oversampling during search. Brute-force fallback for datasets under 100 items. Post-ANN filtering via `FilterExpr` with configurable oversampling factor (default 3x). Sidecar file persistence (`<dbpath>.vec`) for warm start on reopen; cold start fallback rebuilds from documents if sidecar is missing or stale
 - **No B+Tree rebalancing in v1** — Mark-as-dead delete, reclaim fully empty pages
 
 ## Dependencies
