@@ -1,7 +1,7 @@
 # PRD: Vector / Embedding Index
 
 **Priority:** 15
-**Status:** Approved
+**Status:** In Progress (Phase 1 complete)
 **Proposal:** [docs/proposals/accepted/vector-index.md](../proposals/accepted/vector-index.md)
 
 ## Summary
@@ -41,7 +41,7 @@ This is the largest-scope feature in the roadmap and can be deferred. For small 
 | Question | Decision | Rationale |
 |----------|----------|-----------|
 | ANN algorithm? | HNSW via external pure Rust crate | O(log n) query time; mature implementations available; no C/C++ build dependency |
-| Library? | `hora` (hora-search) | Pure Rust, 2.7k stars, actively maintained, supports HNSW + multiple metrics (cosine, euclidean, dot product), Python/JS/Java bindings demonstrate maturity |
+| Library? | `hnsw_rs` (v0.3) | Pure Rust, actively maintained, HNSW with multiple metrics (cosine, euclidean, dot product), built-in serialization. `hora` was originally selected but is unmaintained (4+ years, v0.1.1). |
 | Vector storage format? | Float32 array in MessagePack (documents) + serialized HNSW graph (index) | Documents in B+Tree as usual; HNSW graph persisted separately |
 | Index persistence? | Serialize HNSW graph to dedicated pages or sidecar file | Must survive restart; rebuilt from documents on first open if missing (cold start fallback) |
 | Dimension limit? | 4096 | Covers all common embedding models (OpenAI: 1536/3072, Cohere: 1024, etc.) |
@@ -77,23 +77,27 @@ pub struct ScoredItem {
 
 ## External Dependency Evaluation
 
-### Selected: `hora` (hora-search)
+### Selected: `hnsw_rs` (v0.3)
 
 | Crate | Algorithm | Pure Rust | Metrics | Stars | Notes |
 |-------|-----------|-----------|---------|-------|-------|
-| **`hora`** | HNSW, SSG, PQIVF, BruteForce | Yes | Cosine, Euclidean, Dot Product, Manhattan | 2,700 | Selected — actively maintained, multiple algorithm backends, embeddable |
-| `hnsw_rs` | HNSW | Yes | 7+ types | 230 | Runner-up — excellent serialization, but less active |
+| **`hnsw_rs`** | HNSW | Yes | 7+ types (via `anndists`) | 230 | **Selected** — actively maintained, excellent serialization, thread-safe, pure Rust |
+| `hora` | HNSW, SSG, PQIVF, BruteForce | Yes | Cosine, Euclidean, Dot Product, Manhattan | 2,700 | Originally selected but unmaintained (4+ years, stuck at v0.1.1) |
 | `instant-distance` | HNSW | Yes | Euclidean (trait-extensible) | 343 | Simpler but limited metric support and unclear serialization |
 | `arroy` | Random projections | Yes | 4 types | 299 | LMDB-based persistence, but not HNSW (lower recall for high-dim) |
 
-### Why Hora
+### Why hnsw_rs (changed from hora)
 
-1. **Pure Rust** — "ALL IN RUST", no C/C++ FFI
-2. **Multiple algorithms** — HNSW default, with SSG and brute-force fallbacks
-3. **All required metrics** — Cosine, Euclidean, Dot Product built-in
-4. **Incremental insert** — supports adding vectors to built indexes
-5. **Active maintenance** — 2.7k stars, updated Feb 2025, cross-language bindings demonstrate maturity
+`hora` was originally selected but found to be unmaintained (4+ years, v0.1.1). `hnsw_rs` was chosen instead:
+
+1. **Pure Rust** — no C/C++ FFI
+2. **Actively maintained** — v0.3.x, regular updates
+3. **All required metrics** — Cosine (`DistCosine`), Euclidean (`DistL2`), Dot Product (`DistDot`) via `anndists` crate
+4. **Thread-safe** — `insert()` takes `&self` with internal synchronization
+5. **Built-in serialization** — for future Phase 2 persistence
 6. **Embeddable** — library crate, no server dependency
+
+**Key difference:** `hnsw_rs` has no native delete. Handled with a deleted-IDs `HashSet` and 3x oversampling during search.
 
 ## Implementation Phases
 

@@ -10,6 +10,7 @@ use crate::encoding::string::encode_string;
 use crate::error::{Error, SchemaError, StorageError};
 use crate::types::{
     IndexDefinition, IndexProjection, KeyDefinition, PageId, PartitionSchema, TableSchema, TxnId,
+    VectorIndexDefinition,
 };
 
 use super::CatalogEntry;
@@ -42,6 +43,7 @@ pub fn create_table(
         data_root_page,
         partition_schemas: Vec::new(),
         indexes: Vec::new(),
+        vector_indexes: Vec::new(),
         stream_config: None,
         stream_root_page: None,
     };
@@ -401,6 +403,74 @@ pub fn list_indexes(
 ) -> Result<Vec<IndexDefinition>, Error> {
     let entry = get_table(store, catalog_root, table_name)?;
     Ok(entry.indexes)
+}
+
+/// Create a vector index on a table.
+///
+/// Validates that the index name is unique, then stores the definition in the
+/// catalog entry. The caller is responsible for building the in-memory HNSW
+/// graph and performing backfill.
+pub fn create_vector_index(
+    store: &mut impl PageStore,
+    catalog_root: PageId,
+    table_name: &str,
+    definition: VectorIndexDefinition,
+) -> Result<PageId, Error> {
+    let mut entry = get_table(store, catalog_root, table_name)?;
+
+    // Check for duplicate name.
+    if entry
+        .vector_indexes
+        .iter()
+        .any(|vi| vi.name == definition.name)
+    {
+        return Err(SchemaError::VectorIndexAlreadyExists(definition.name).into());
+    }
+
+    entry.vector_indexes.push(definition);
+
+    let json_bytes = serde_json::to_vec(&entry).map_err(|e| {
+        StorageError::CorruptedPage(format!("failed to serialize catalog entry: {e}"))
+    })?;
+    let encoded_name = encode_string(table_name);
+    let new_catalog_root = ops::insert(store, catalog_root, &encoded_name, &json_bytes)?;
+
+    Ok(new_catalog_root)
+}
+
+/// Remove a vector index from a table's catalog entry.
+pub fn drop_vector_index(
+    store: &mut impl PageStore,
+    catalog_root: PageId,
+    table_name: &str,
+    index_name: &str,
+) -> Result<PageId, Error> {
+    let mut entry = get_table(store, catalog_root, table_name)?;
+
+    let original_len = entry.vector_indexes.len();
+    entry.vector_indexes.retain(|vi| vi.name != index_name);
+
+    if entry.vector_indexes.len() == original_len {
+        return Err(SchemaError::VectorIndexNotFound(index_name.to_string()).into());
+    }
+
+    let json_bytes = serde_json::to_vec(&entry).map_err(|e| {
+        StorageError::CorruptedPage(format!("failed to serialize catalog entry: {e}"))
+    })?;
+    let encoded_name = encode_string(table_name);
+    let new_catalog_root = ops::insert(store, catalog_root, &encoded_name, &json_bytes)?;
+
+    Ok(new_catalog_root)
+}
+
+/// List all vector indexes for a table.
+pub fn list_vector_indexes(
+    store: &impl PageStore,
+    catalog_root: PageId,
+    table_name: &str,
+) -> Result<Vec<VectorIndexDefinition>, Error> {
+    let entry = get_table(store, catalog_root, table_name)?;
+    Ok(entry.vector_indexes)
 }
 
 #[cfg(test)]

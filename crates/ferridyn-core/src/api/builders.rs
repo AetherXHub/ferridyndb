@@ -9,8 +9,8 @@ use crate::encoding::composite;
 use crate::error::{Error, QueryError, SchemaError, StorageError};
 use crate::mvcc::ops as mvcc_ops;
 use crate::types::{
-    AttrType, AttributeDef, IndexProjection, KeyDefinition, KeyType, ReturnValues, TableSchema,
-    VersionedItem,
+    AttrType, AttributeDef, IndexProjection, KeyDefinition, KeyType, ReturnValues, ScoredItem,
+    TableSchema, VectorIndexDefinition, VectorMetric, VersionedItem,
 };
 
 use super::database::FerridynDB;
@@ -2487,5 +2487,126 @@ impl<'a> GetStreamRecordsBuilder<'a> {
                 self.limit,
             )
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vector index builders
+// ---------------------------------------------------------------------------
+
+/// Builder for creating a vector index on a table.
+pub struct CreateVectorIndexBuilder<'a> {
+    db: &'a FerridynDB,
+    table: String,
+    name: Option<String>,
+    attribute: Option<String>,
+    dimensions: Option<u32>,
+    metric: VectorMetric,
+}
+
+impl<'a> CreateVectorIndexBuilder<'a> {
+    pub(crate) fn new(db: &'a FerridynDB, table: String) -> Self {
+        Self {
+            db,
+            table,
+            name: None,
+            attribute: None,
+            dimensions: None,
+            metric: VectorMetric::Cosine,
+        }
+    }
+
+    /// Set the index name.
+    pub fn name(mut self, n: &str) -> Self {
+        self.name = Some(n.to_string());
+        self
+    }
+
+    /// Set the document attribute containing vectors.
+    pub fn attribute(mut self, attr: &str) -> Self {
+        self.attribute = Some(attr.to_string());
+        self
+    }
+
+    /// Set the expected vector dimensionality (1..=4096).
+    pub fn dimensions(mut self, d: u32) -> Self {
+        self.dimensions = Some(d);
+        self
+    }
+
+    /// Set the distance metric (default: Cosine).
+    pub fn metric(mut self, m: VectorMetric) -> Self {
+        self.metric = m;
+        self
+    }
+
+    /// Execute the vector index creation with backfill.
+    pub fn execute(self) -> Result<(), Error> {
+        let name = self.name.ok_or(QueryError::InvalidCondition(
+            "vector index name required".to_string(),
+        ))?;
+        let attribute = self.attribute.ok_or(QueryError::InvalidCondition(
+            "vector index attribute required".to_string(),
+        ))?;
+        let dimensions = self.dimensions.ok_or(QueryError::InvalidCondition(
+            "vector index dimensions required".to_string(),
+        ))?;
+        if dimensions == 0 || dimensions > 4096 {
+            return Err(QueryError::InvalidCondition(
+                "vector index dimensions must be between 1 and 4096".to_string(),
+            )
+            .into());
+        }
+
+        let definition = VectorIndexDefinition {
+            name,
+            attribute,
+            dimensions,
+            metric: self.metric,
+        };
+
+        self.db.create_vector_index_inner(&self.table, definition)
+    }
+}
+
+/// Builder for querying a vector index (ANN search).
+pub struct VectorQueryBuilder<'a> {
+    db: &'a FerridynDB,
+    table: String,
+    index_name: String,
+    vector: Option<Vec<f32>>,
+    top_k: usize,
+}
+
+impl<'a> VectorQueryBuilder<'a> {
+    pub(crate) fn new(db: &'a FerridynDB, table: String, index_name: String) -> Self {
+        Self {
+            db,
+            table,
+            index_name,
+            vector: None,
+            top_k: 10,
+        }
+    }
+
+    /// Set the query vector.
+    pub fn vector(mut self, v: Vec<f32>) -> Self {
+        self.vector = Some(v);
+        self
+    }
+
+    /// Set the number of results to return (default: 10).
+    pub fn top_k(mut self, k: usize) -> Self {
+        self.top_k = k;
+        self
+    }
+
+    /// Execute the vector search.
+    pub fn execute(self) -> Result<Vec<ScoredItem>, Error> {
+        let query = self.vector.ok_or(QueryError::InvalidCondition(
+            "query vector required".to_string(),
+        ))?;
+        self.db
+            .query_vector_index_inner(&self.table, &self.index_name, &query, self.top_k)
     }
 }

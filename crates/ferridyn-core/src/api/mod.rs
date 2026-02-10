@@ -11,13 +11,14 @@ pub mod query;
 pub mod reaper;
 pub mod transaction;
 pub mod update;
+pub(crate) mod vector;
 
 pub use batch::{BatchOp, SyncMode, WriteBatch};
 pub use builders::{
-    BatchGetItemBuilder, CountBuilder, CountIndexBuilder, CreateIndexBuilder, DeleteItemBuilder,
-    GetItemBuilder, GetStreamRecordsBuilder, IndexQueryBuilder, NoReturn, PartitionSchemaBuilder,
-    PutItemBuilder, QueryBuilder, ReturnNew, ReturnOld, ScanBuilder, TableBuilder,
-    UpdateItemBuilder,
+    BatchGetItemBuilder, CountBuilder, CountIndexBuilder, CreateIndexBuilder,
+    CreateVectorIndexBuilder, DeleteItemBuilder, GetItemBuilder, GetStreamRecordsBuilder,
+    IndexQueryBuilder, NoReturn, PartitionSchemaBuilder, PutItemBuilder, QueryBuilder, ReturnNew,
+    ReturnOld, ScanBuilder, TableBuilder, UpdateItemBuilder, VectorQueryBuilder,
 };
 pub use database::FerridynDB;
 pub use filter::FilterExpr;

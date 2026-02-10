@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -17,7 +18,9 @@ use crate::storage::page::{compute_checksum_buf, write_checksum_buf};
 use crate::storage::pending_free::PendingFreeList;
 use crate::storage::snapshot::SnapshotTracker;
 use crate::storage::tombstone::TombstoneQueue;
-use crate::types::{IndexDefinition, PAGE_SIZE, PageId, PartitionSchema};
+use crate::types::{
+    IndexDefinition, PAGE_SIZE, PageId, PartitionSchema, ScoredItem, VectorIndexDefinition,
+};
 
 use super::batch::{SyncMode, WriteBatch};
 use super::builders::{
@@ -49,6 +52,9 @@ struct DatabaseInner {
     #[allow(dead_code)]
     path: PathBuf,
     sync_mode: AtomicU8,
+    /// In-memory HNSW vector indexes: table_name → (index_name → VectorIndexState).
+    /// Separate lock from `state` to avoid contention with regular read/write ops.
+    vector_indexes: RwLock<HashMap<String, HashMap<String, super::vector::VectorIndexState>>>,
 }
 
 /// The main database handle.
@@ -134,6 +140,7 @@ impl FerridynDB {
                 _file_lock: file_lock,
                 path: path.to_path_buf(),
                 sync_mode: AtomicU8::new(SyncMode::Full as u8),
+                vector_indexes: RwLock::new(HashMap::new()),
             }),
         })
     }
@@ -185,7 +192,7 @@ impl FerridynDB {
             .try_clone()
             .map_err(StorageError::from)?;
 
-        Ok(Self {
+        let db = Self {
             inner: Arc::new(DatabaseInner {
                 state: RwLock::new(DatabaseState {
                     file_manager,
@@ -200,8 +207,14 @@ impl FerridynDB {
                 _file_lock: file_lock,
                 path: path.to_path_buf(),
                 sync_mode: AtomicU8::new(SyncMode::Full as u8),
+                vector_indexes: RwLock::new(HashMap::new()),
             }),
-        })
+        };
+
+        // Rebuild in-memory vector indexes from catalog + documents.
+        db.rebuild_vector_indexes()?;
+
+        Ok(db)
     }
 
     /// Create a table.
@@ -513,6 +526,236 @@ impl FerridynDB {
         })
     }
 
+    // -----------------------------------------------------------------------
+    // Vector index management
+    // -----------------------------------------------------------------------
+
+    /// Create a vector index on a table.
+    pub fn create_vector_index(
+        &self,
+        table: &str,
+    ) -> super::builders::CreateVectorIndexBuilder<'_> {
+        super::builders::CreateVectorIndexBuilder::new(self, table.to_string())
+    }
+
+    /// Internal: create vector index with definition (called by builder).
+    pub(crate) fn create_vector_index_inner(
+        &self,
+        table: &str,
+        definition: VectorIndexDefinition,
+    ) -> Result<(), Error> {
+        let def = definition.clone();
+        let table_name = table.to_string();
+
+        // 1. Store definition in catalog.
+        self.transact(|txn| {
+            let new_root = catalog::ops::create_vector_index(
+                &mut txn.store,
+                txn.catalog_root,
+                &table_name,
+                def.clone(),
+            )?;
+            txn.catalog_root = new_root;
+            Ok(())
+        })?;
+
+        // 2. Build in-memory HNSW graph with backfill.
+        let mut vi_state = super::vector::VectorIndexState::new(definition.clone());
+
+        // Scan all documents and extract vectors for backfill.
+        self.read_snapshot(|store, catalog_root, snapshot_txn| {
+            let entry = self.cached_get_table(store, catalog_root, table)?;
+            let all_docs =
+                mvcc_ops::mvcc_range_scan(store, entry.data_root_page, None, None, snapshot_txn)?;
+
+            for (key_bytes, value_bytes) in &all_docs {
+                let doc: Value = rmp_serde::from_slice(value_bytes).map_err(|e| {
+                    StorageError::CorruptedPage(format!("failed to deserialize document: {e}"))
+                })?;
+                if let Some(vector) = super::vector::extract_vector(&doc, &definition.attribute)?
+                    && vector.len() == definition.dimensions as usize
+                {
+                    let _ = vi_state.insert(key_bytes, &vector);
+                }
+            }
+            Ok(())
+        })?;
+
+        // 3. Register in-memory graph.
+        let mut indexes = self.inner.vector_indexes.write();
+        indexes
+            .entry(table.to_string())
+            .or_default()
+            .insert(definition.name.clone(), vi_state);
+
+        Ok(())
+    }
+
+    /// Query a vector index for approximate nearest neighbors.
+    pub fn query_vector_index(
+        &self,
+        table: &str,
+        index_name: &str,
+    ) -> super::builders::VectorQueryBuilder<'_> {
+        super::builders::VectorQueryBuilder::new(self, table.to_string(), index_name.to_string())
+    }
+
+    /// Internal: execute vector query (called by builder).
+    pub(crate) fn query_vector_index_inner(
+        &self,
+        table: &str,
+        index_name: &str,
+        query: &[f32],
+        top_k: usize,
+    ) -> Result<Vec<ScoredItem>, Error> {
+        // 1. Search the in-memory HNSW graph.
+        let results = {
+            let indexes = self.inner.vector_indexes.read();
+            let table_indexes = indexes
+                .get(table)
+                .ok_or_else(|| SchemaError::VectorIndexNotFound(index_name.to_string()))?;
+            let vi_state = table_indexes
+                .get(index_name)
+                .ok_or_else(|| SchemaError::VectorIndexNotFound(index_name.to_string()))?;
+            vi_state.search(query, top_k)?
+        };
+
+        // 2. Fetch full documents for each result.
+        self.read_snapshot(|store, catalog_root, snapshot_txn| {
+            let entry = self.cached_get_table(store, catalog_root, table)?;
+            let mut items = Vec::with_capacity(results.len());
+            for (pk_bytes, distance) in &results {
+                if let Some(doc_bytes) =
+                    mvcc_ops::mvcc_get(store, entry.data_root_page, pk_bytes, snapshot_txn)?
+                {
+                    let doc: Value = rmp_serde::from_slice(&doc_bytes).map_err(|e| {
+                        StorageError::CorruptedPage(format!("failed to deserialize document: {e}"))
+                    })?;
+                    items.push(ScoredItem {
+                        item: doc,
+                        score: *distance as f64,
+                    });
+                }
+            }
+            Ok(items)
+        })
+    }
+
+    /// Drop a vector index from a table.
+    pub fn drop_vector_index(&self, table: &str, index_name: &str) -> Result<(), Error> {
+        let table_name = table.to_string();
+        let idx_name = index_name.to_string();
+
+        // Remove from catalog.
+        self.transact(move |txn| {
+            let new_root = catalog::ops::drop_vector_index(
+                &mut txn.store,
+                txn.catalog_root,
+                &table_name,
+                &idx_name,
+            )?;
+            txn.catalog_root = new_root;
+            Ok(())
+        })?;
+
+        // Remove in-memory graph.
+        let mut indexes = self.inner.vector_indexes.write();
+        if let Some(table_indexes) = indexes.get_mut(table) {
+            table_indexes.remove(index_name);
+        }
+
+        Ok(())
+    }
+
+    /// List all vector indexes for a table.
+    pub fn list_vector_indexes(&self, table: &str) -> Result<Vec<VectorIndexDefinition>, Error> {
+        let (store, header) = self.read_store_snapshot()?;
+        catalog::ops::list_vector_indexes(&store, header.catalog_root_page, table)
+    }
+
+    /// Apply pending vector operations to in-memory graphs after commit.
+    pub(crate) fn apply_vector_ops(&self, ops: Vec<super::vector::VectorOp>) {
+        if ops.is_empty() {
+            return;
+        }
+        let mut indexes = self.inner.vector_indexes.write();
+        for op in ops {
+            match op {
+                super::vector::VectorOp::Insert {
+                    table,
+                    index_name,
+                    primary_key,
+                    vector,
+                } => {
+                    if let Some(table_indexes) = indexes.get_mut(&table)
+                        && let Some(vi_state) = table_indexes.get_mut(&index_name)
+                    {
+                        let _ = vi_state.insert(&primary_key, &vector);
+                    }
+                }
+                super::vector::VectorOp::Remove {
+                    table,
+                    index_name,
+                    primary_key,
+                } => {
+                    if let Some(table_indexes) = indexes.get_mut(&table)
+                        && let Some(vi_state) = table_indexes.get_mut(&index_name)
+                    {
+                        vi_state.remove(&primary_key);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Rebuild all in-memory vector indexes from catalog and documents.
+    ///
+    /// Called on `open()` since Phase 1 has no persistence for the HNSW graph.
+    fn rebuild_vector_indexes(&self) -> Result<(), Error> {
+        let (store, header) = self.read_store_snapshot()?;
+        let tables = catalog::ops::list_tables(&store, header.catalog_root_page)?;
+
+        let mut all_indexes = HashMap::new();
+
+        for table_name in &tables {
+            let entry = catalog::ops::get_table(&store, header.catalog_root_page, table_name)?;
+            if entry.vector_indexes.is_empty() {
+                continue;
+            }
+
+            let mut table_indexes = HashMap::new();
+            let all_docs = mvcc_ops::mvcc_range_scan(
+                &store,
+                entry.data_root_page,
+                None,
+                None,
+                header.txn_counter,
+            )?;
+
+            for vi_def in &entry.vector_indexes {
+                let mut vi_state = super::vector::VectorIndexState::new(vi_def.clone());
+
+                for (key_bytes, value_bytes) in &all_docs {
+                    let doc: Value = rmp_serde::from_slice(value_bytes).map_err(|e| {
+                        StorageError::CorruptedPage(format!("failed to deserialize document: {e}"))
+                    })?;
+                    if let Some(vector) = super::vector::extract_vector(&doc, &vi_def.attribute)?
+                        && vector.len() == vi_def.dimensions as usize
+                    {
+                        let _ = vi_state.insert(key_bytes, &vector);
+                    }
+                }
+
+                table_indexes.insert(vi_def.name.clone(), vi_state);
+            }
+
+            all_indexes.insert(table_name.clone(), table_indexes);
+        }
+
+        *self.inner.vector_indexes.write() = all_indexes;
+        Ok(())
+    }
+
     /// Create a new write batch for batching multiple operations.
     ///
     /// All queued operations are committed in a single transaction
@@ -794,15 +1037,23 @@ impl FerridynDB {
             txn_id: new_txn_id,
             tombstones: Vec::new(),
             stream_sub_seq: 0,
+            vector_ops: Vec::new(),
         };
 
         let result = f(&mut txn);
 
         match result {
             Ok(val) => {
+                // Extract vector ops before consuming the transaction.
+                let vector_ops = std::mem::take(&mut txn.vector_ops);
+
                 // Acquire write lock briefly for the commit phase only.
                 let mut state = self.inner.state.write();
                 self.commit_txn(txn, &mut state)?;
+
+                // Apply vector ops to in-memory HNSW graphs after successful commit.
+                self.apply_vector_ops(vector_ops);
+
                 Ok(val)
             }
             Err(e) => Err(e),
@@ -841,6 +1092,7 @@ impl FerridynDB {
             txn_id,
             tombstones,
             stream_sub_seq: _,
+            vector_ops: _,
         } = txn;
 
         // Record COW-replaced original pages in the pending free list so they
@@ -9815,5 +10067,375 @@ mod reaper_tests {
             .execute()
             .unwrap();
         assert_eq!(count_gt, 1, "only timestamp=200 should match > 100");
+    }
+}
+
+#[cfg(test)]
+mod vector_index_tests {
+    use super::*;
+    use crate::types::{KeyType, VectorMetric};
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    fn setup_db() -> (FerridynDB, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = FerridynDB::create(&db_path).unwrap();
+        db.create_table("items")
+            .partition_key("id", KeyType::String)
+            .execute()
+            .unwrap();
+        (db, dir)
+    }
+
+    #[test]
+    fn test_create_vector_index() {
+        let (db, _tmp) = setup_db();
+
+        db.create_vector_index("items")
+            .name("embedding-idx")
+            .attribute("embedding")
+            .dimensions(3)
+            .metric(VectorMetric::Cosine)
+            .execute()
+            .unwrap();
+
+        let indexes = db.list_vector_indexes("items").unwrap();
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes[0].name, "embedding-idx");
+        assert_eq!(indexes[0].attribute, "embedding");
+        assert_eq!(indexes[0].dimensions, 3);
+        assert_eq!(indexes[0].metric, VectorMetric::Cosine);
+    }
+
+    #[test]
+    fn test_vector_put_and_query_cosine() {
+        let (db, _tmp) = setup_db();
+
+        db.create_vector_index("items")
+            .name("emb-idx")
+            .attribute("embedding")
+            .dimensions(3)
+            .metric(VectorMetric::Cosine)
+            .execute()
+            .unwrap();
+
+        // Insert items with vectors.
+        db.put_item("items", json!({"id": "a", "embedding": [1.0, 0.0, 0.0]}))
+            .unwrap();
+        db.put_item("items", json!({"id": "b", "embedding": [0.0, 1.0, 0.0]}))
+            .unwrap();
+        db.put_item("items", json!({"id": "c", "embedding": [0.9, 0.1, 0.0]}))
+            .unwrap();
+
+        // Query with vector close to "a" and "c".
+        let results = db
+            .query_vector_index("items", "emb-idx")
+            .vector(vec![1.0, 0.0, 0.0])
+            .top_k(3)
+            .execute()
+            .unwrap();
+
+        assert_eq!(results.len(), 3);
+        // "a" should be closest (exact match), then "c" (close), then "b" (orthogonal).
+        assert_eq!(results[0].item["id"], "a");
+        assert_eq!(results[1].item["id"], "c");
+        assert_eq!(results[2].item["id"], "b");
+        // Cosine distance: exact match = 0.
+        assert!(results[0].score < results[1].score);
+        assert!(results[1].score < results[2].score);
+    }
+
+    #[test]
+    fn test_vector_put_and_query_euclidean() {
+        let (db, _tmp) = setup_db();
+
+        db.create_vector_index("items")
+            .name("emb-idx")
+            .attribute("embedding")
+            .dimensions(2)
+            .metric(VectorMetric::Euclidean)
+            .execute()
+            .unwrap();
+
+        db.put_item("items", json!({"id": "origin", "embedding": [0.0, 0.0]}))
+            .unwrap();
+        db.put_item("items", json!({"id": "near", "embedding": [1.0, 0.0]}))
+            .unwrap();
+        db.put_item("items", json!({"id": "far", "embedding": [10.0, 10.0]}))
+            .unwrap();
+
+        let results = db
+            .query_vector_index("items", "emb-idx")
+            .vector(vec![0.0, 0.0])
+            .top_k(3)
+            .execute()
+            .unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].item["id"], "origin");
+        assert_eq!(results[1].item["id"], "near");
+        assert_eq!(results[2].item["id"], "far");
+        assert!(results[0].score < results[1].score);
+        assert!(results[1].score < results[2].score);
+    }
+
+    #[test]
+    fn test_vector_put_and_query_dot_product() {
+        let (db, _tmp) = setup_db();
+
+        db.create_vector_index("items")
+            .name("emb-idx")
+            .attribute("embedding")
+            .dimensions(3)
+            .metric(VectorMetric::DotProduct)
+            .execute()
+            .unwrap();
+
+        // Use normalized vectors (unit length) since anndists DistDot
+        // computes distance as 1 - dot_product and asserts dot >= 0.
+        // [1,0,0] is unit length; [0.577,0.577,0.577] ≈ unit length.
+        let inv_sqrt3: f64 = 1.0 / 3.0_f64.sqrt();
+        db.put_item(
+            "items",
+            json!({"id": "aligned", "embedding": [1.0, 0.0, 0.0]}),
+        )
+        .unwrap();
+        db.put_item(
+            "items",
+            json!({"id": "diagonal", "embedding": [inv_sqrt3, inv_sqrt3, inv_sqrt3]}),
+        )
+        .unwrap();
+
+        let results = db
+            .query_vector_index("items", "emb-idx")
+            .vector(vec![1.0, 0.0, 0.0])
+            .top_k(2)
+            .execute()
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        // Dot product distance = 1 - dot(a, b).
+        // "aligned" dot [1,0,0] = 1.0 → distance 0.0 (closest).
+        // "diagonal" dot [1,0,0] = 0.577 → distance 0.423 (farther).
+        assert_eq!(results[0].item["id"], "aligned");
+        assert_eq!(results[1].item["id"], "diagonal");
+        assert!(results[0].score < results[1].score);
+    }
+
+    #[test]
+    fn test_vector_dimension_mismatch() {
+        let (db, _tmp) = setup_db();
+
+        db.create_vector_index("items")
+            .name("emb-idx")
+            .attribute("embedding")
+            .dimensions(3)
+            .metric(VectorMetric::Cosine)
+            .execute()
+            .unwrap();
+
+        // Insert with correct dimensions — should succeed.
+        db.put_item("items", json!({"id": "ok", "embedding": [1.0, 0.0, 0.0]}))
+            .unwrap();
+
+        // Query with wrong dimensions — should fail.
+        let result = db
+            .query_vector_index("items", "emb-idx")
+            .vector(vec![1.0, 0.0])
+            .top_k(1)
+            .execute();
+
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("dimension mismatch"),
+            "expected dimension mismatch error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_vector_sparse_index() {
+        let (db, _tmp) = setup_db();
+
+        db.create_vector_index("items")
+            .name("emb-idx")
+            .attribute("embedding")
+            .dimensions(2)
+            .metric(VectorMetric::Cosine)
+            .execute()
+            .unwrap();
+
+        // Insert some items WITH and WITHOUT the embedding attribute.
+        db.put_item("items", json!({"id": "with_vec", "embedding": [1.0, 0.0]}))
+            .unwrap();
+        db.put_item("items", json!({"id": "no_vec", "name": "Bob"}))
+            .unwrap();
+        db.put_item("items", json!({"id": "also_vec", "embedding": [0.0, 1.0]}))
+            .unwrap();
+
+        let results = db
+            .query_vector_index("items", "emb-idx")
+            .vector(vec![1.0, 0.0])
+            .top_k(10)
+            .execute()
+            .unwrap();
+
+        // Only items with embedding should appear.
+        assert_eq!(results.len(), 2);
+        let ids: Vec<&str> = results
+            .iter()
+            .map(|r| r.item["id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&"with_vec"));
+        assert!(ids.contains(&"also_vec"));
+        assert!(!ids.contains(&"no_vec"));
+    }
+
+    #[test]
+    fn test_vector_top_k() {
+        let (db, _tmp) = setup_db();
+
+        db.create_vector_index("items")
+            .name("emb-idx")
+            .attribute("embedding")
+            .dimensions(2)
+            .metric(VectorMetric::Euclidean)
+            .execute()
+            .unwrap();
+
+        for i in 0..10 {
+            db.put_item(
+                "items",
+                json!({"id": format!("item-{i}"), "embedding": [i as f64, 0.0]}),
+            )
+            .unwrap();
+        }
+
+        let results = db
+            .query_vector_index("items", "emb-idx")
+            .vector(vec![0.0, 0.0])
+            .top_k(3)
+            .execute()
+            .unwrap();
+
+        assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn test_vector_top_k_fewer_items() {
+        let (db, _tmp) = setup_db();
+
+        db.create_vector_index("items")
+            .name("emb-idx")
+            .attribute("embedding")
+            .dimensions(2)
+            .metric(VectorMetric::Euclidean)
+            .execute()
+            .unwrap();
+
+        db.put_item("items", json!({"id": "only", "embedding": [1.0, 1.0]}))
+            .unwrap();
+
+        let results = db
+            .query_vector_index("items", "emb-idx")
+            .vector(vec![0.0, 0.0])
+            .top_k(10)
+            .execute()
+            .unwrap();
+
+        // Only 1 item exists, so should return 1 even though top_k=10.
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].item["id"], "only");
+    }
+
+    #[test]
+    fn test_vector_index_update() {
+        let (db, _tmp) = setup_db();
+
+        db.create_vector_index("items")
+            .name("emb-idx")
+            .attribute("embedding")
+            .dimensions(2)
+            .metric(VectorMetric::Euclidean)
+            .execute()
+            .unwrap();
+
+        // Insert "movable" far away at [10, 0], "fixed" near query at [1, 0].
+        db.put_item("items", json!({"id": "movable", "embedding": [10.0, 0.0]}))
+            .unwrap();
+        db.put_item("items", json!({"id": "fixed", "embedding": [1.0, 0.0]}))
+            .unwrap();
+
+        // Query from origin — "fixed" should be closest.
+        let results1 = db
+            .query_vector_index("items", "emb-idx")
+            .vector(vec![0.0, 0.0])
+            .top_k(2)
+            .execute()
+            .unwrap();
+        assert_eq!(results1[0].item["id"], "fixed");
+        assert_eq!(results1[1].item["id"], "movable");
+
+        // Update "movable" to be closer to origin than "fixed".
+        db.put_item("items", json!({"id": "movable", "embedding": [0.1, 0.0]}))
+            .unwrap();
+
+        // Now "movable" at [0.1, 0] should be closer to origin than "fixed" at [1, 0].
+        let results2 = db
+            .query_vector_index("items", "emb-idx")
+            .vector(vec![0.0, 0.0])
+            .top_k(2)
+            .execute()
+            .unwrap();
+        assert_eq!(results2.len(), 2);
+        assert_eq!(results2[0].item["id"], "movable");
+        assert_eq!(results2[1].item["id"], "fixed");
+        // Verify distances: movable should be ~0.1, fixed should be ~1.0.
+        assert!(results2[0].score < 0.5);
+        assert!(results2[1].score > 0.5);
+    }
+
+    #[test]
+    fn test_vector_index_delete() {
+        let (db, _tmp) = setup_db();
+
+        db.create_vector_index("items")
+            .name("emb-idx")
+            .attribute("embedding")
+            .dimensions(2)
+            .metric(VectorMetric::Euclidean)
+            .execute()
+            .unwrap();
+
+        db.put_item("items", json!({"id": "keep", "embedding": [1.0, 0.0]}))
+            .unwrap();
+        db.put_item("items", json!({"id": "delete_me", "embedding": [0.0, 1.0]}))
+            .unwrap();
+
+        // Both should appear initially.
+        let results1 = db
+            .query_vector_index("items", "emb-idx")
+            .vector(vec![0.0, 0.0])
+            .top_k(10)
+            .execute()
+            .unwrap();
+        assert_eq!(results1.len(), 2);
+
+        // Delete one item.
+        db.delete_item("items")
+            .partition_key("delete_me")
+            .execute()
+            .unwrap();
+
+        // Only "keep" should remain.
+        let results2 = db
+            .query_vector_index("items", "emb-idx")
+            .vector(vec![0.0, 0.0])
+            .top_k(10)
+            .execute()
+            .unwrap();
+        assert_eq!(results2.len(), 1);
+        assert_eq!(results2[0].item["id"], "keep");
     }
 }

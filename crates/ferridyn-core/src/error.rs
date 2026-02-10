@@ -138,6 +138,18 @@ pub enum SchemaError {
 
     #[error("table has no ttl_attribute configured: {0}")]
     TtlNotConfigured(String),
+
+    #[error("vector index not found: {0}")]
+    VectorIndexNotFound(String),
+
+    #[error("vector dimension mismatch: expected {expected}, got {actual}")]
+    VectorDimensionMismatch { expected: u32, actual: u32 },
+
+    #[error("vector attribute is not an array of numbers: {0}")]
+    VectorAttributeNotArray(String),
+
+    #[error("vector index already exists: {0}")]
+    VectorIndexAlreadyExists(String),
 }
 
 #[derive(Debug, Error)]

@@ -12,6 +12,8 @@ thiserror = "2"
 bytes = "1"
 xxhash-rust = { version = "0.8", features = ["xxh64", "xxh3"] }
 rmp-serde = "1"
+hnsw_rs = "0.3"
+anndists = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

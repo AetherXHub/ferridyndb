@@ -138,6 +138,34 @@ pub enum IndexProjection {
     All,
 }
 
+/// Distance metric for vector similarity search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VectorMetric {
+    Cosine,
+    Euclidean,
+    DotProduct,
+}
+
+/// A vector index definition for approximate nearest neighbor search.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VectorIndexDefinition {
+    /// Unique index name.
+    pub name: String,
+    /// The document attribute containing the vector (an array of numbers).
+    pub attribute: String,
+    /// Expected dimensionality of vectors.
+    pub dimensions: u32,
+    /// Distance metric for similarity computation.
+    pub metric: VectorMetric,
+}
+
+/// An item returned from a vector similarity search, with its distance score.
+#[derive(Debug, Clone)]
+pub struct ScoredItem {
+    pub item: serde_json::Value,
+    pub score: f64,
+}
+
 /// A secondary index definition, optionally scoped to a partition schema.
 ///
 /// Each index maintains a separate B+Tree keyed by

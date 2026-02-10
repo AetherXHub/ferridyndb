@@ -196,6 +196,45 @@ fn maintain_stream(
     Ok(updated)
 }
 
+/// Collect vector index operations for a document write.
+///
+/// For each vector index on the table, checks whether old_doc/new_doc have
+/// the indexed vector attribute and generates appropriate Insert/Remove ops.
+fn collect_vector_ops(
+    table: &str,
+    entry: &catalog::CatalogEntry,
+    pk_bytes: &[u8],
+    old_doc: Option<&Value>,
+    new_doc: Option<&Value>,
+) -> Vec<super::vector::VectorOp> {
+    let mut ops = Vec::new();
+    for vi in &entry.vector_indexes {
+        // Remove old vector if present.
+        if let Some(old) = old_doc
+            && let Ok(Some(_)) = super::vector::extract_vector(old, &vi.attribute)
+        {
+            ops.push(super::vector::VectorOp::Remove {
+                table: table.to_string(),
+                index_name: vi.name.clone(),
+                primary_key: pk_bytes.to_vec(),
+            });
+        }
+        // Insert new vector if present and correct dimensions.
+        if let Some(new) = new_doc
+            && let Ok(Some(vec)) = super::vector::extract_vector(new, &vi.attribute)
+            && vec.len() == vi.dimensions as usize
+        {
+            ops.push(super::vector::VectorOp::Insert {
+                table: table.to_string(),
+                index_name: vi.name.clone(),
+                primary_key: pk_bytes.to_vec(),
+                vector: vec,
+            });
+        }
+    }
+    ops
+}
+
 /// A write transaction that buffers all changes until commit.
 ///
 /// All mutations go through the `BufferedPageStore`; on commit the overlay
@@ -209,6 +248,8 @@ pub struct Transaction {
     pub(crate) tombstones: Vec<TombstoneEntry>,
     /// Sub-sequence counter for stream records within this transaction.
     pub(crate) stream_sub_seq: u32,
+    /// Pending vector index operations applied after commit.
+    pub(crate) vector_ops: Vec<super::vector::VectorOp>,
 }
 
 /// Evaluate a condition expression against an existing document.
@@ -276,24 +317,29 @@ impl Transaction {
         // 5. Encode composite key.
         let composite_key = composite::encode_composite(&pk, sk.as_ref())?;
 
-        // 5a. Read old document for condition evaluation, index maintenance, stream, or return.
+        // 5a. Read old document for condition evaluation, index maintenance, stream, vector indexes, or return.
         let stream_enabled = entry.stream_config.as_ref().is_some_and(|c| c.enabled);
-        let old_doc: Option<Value> =
-            if condition.is_some() || !entry.indexes.is_empty() || need_old || stream_enabled {
-                mvcc_ops::mvcc_get(
-                    &self.store,
-                    entry.data_root_page,
-                    &composite_key,
-                    self.txn_id,
-                )?
-                .map(|bytes| rmp_serde::from_slice(&bytes))
-                .transpose()
-                .map_err(|e| {
-                    StorageError::CorruptedPage(format!("failed to deserialize document: {e}"))
-                })?
-            } else {
-                None
-            };
+        let has_vector_indexes = !entry.vector_indexes.is_empty();
+        let old_doc: Option<Value> = if condition.is_some()
+            || !entry.indexes.is_empty()
+            || need_old
+            || stream_enabled
+            || has_vector_indexes
+        {
+            mvcc_ops::mvcc_get(
+                &self.store,
+                entry.data_root_page,
+                &composite_key,
+                self.txn_id,
+            )?
+            .map(|bytes| rmp_serde::from_slice(&bytes))
+            .transpose()
+            .map_err(|e| {
+                StorageError::CorruptedPage(format!("failed to deserialize document: {e}"))
+            })?
+        } else {
+            None
+        };
 
         // 5b. Evaluate condition expression against existing document.
         if let Some(cond) = condition {
@@ -334,6 +380,15 @@ impl Transaction {
             sub_seq,
             None,
         )?;
+
+        // 7b. Collect vector index ops.
+        self.vector_ops.extend(collect_vector_ops(
+            table,
+            &entry,
+            &composite_key,
+            old_doc.as_ref(),
+            Some(&document),
+        ));
 
         // 8. Write catalog if anything changed.
         if updated.data_root_page != entry.data_root_page
@@ -410,22 +465,23 @@ impl Transaction {
 
         let composite_key = composite::encode_composite(&pk, sk.as_ref())?;
 
-        // Read old document for index maintenance.
-        let old_doc: Option<Value> = if !entry.indexes.is_empty() {
-            mvcc_ops::mvcc_get(
-                &self.store,
-                entry.data_root_page,
-                &composite_key,
-                self.txn_id,
-            )?
-            .map(|bytes| rmp_serde::from_slice(&bytes))
-            .transpose()
-            .map_err(|e| {
-                StorageError::CorruptedPage(format!("failed to deserialize document: {e}"))
-            })?
-        } else {
-            None
-        };
+        // Read old document for index maintenance and vector indexes.
+        let old_doc: Option<Value> =
+            if !entry.indexes.is_empty() || !entry.vector_indexes.is_empty() {
+                mvcc_ops::mvcc_get(
+                    &self.store,
+                    entry.data_root_page,
+                    &composite_key,
+                    self.txn_id,
+                )?
+                .map(|bytes| rmp_serde::from_slice(&bytes))
+                .transpose()
+                .map_err(|e| {
+                    StorageError::CorruptedPage(format!("failed to deserialize document: {e}"))
+                })?
+            } else {
+                None
+            };
 
         let new_data_root = mvcc_ops::mvcc_put_conditional(
             &mut self.store,
@@ -445,6 +501,15 @@ impl Transaction {
             old_doc.as_ref(),
             Some(&document),
         )?;
+
+        // Collect vector index ops.
+        self.vector_ops.extend(collect_vector_ops(
+            table,
+            &entry,
+            &composite_key,
+            old_doc.as_ref(),
+            Some(&document),
+        ));
 
         if updated.data_root_page != entry.data_root_page || updated.indexes != entry.indexes {
             self.update_catalog_entry(table, &updated)?;
@@ -583,24 +648,29 @@ impl Transaction {
 
         let composite_key = composite::encode_composite(&pk, sk.as_ref())?;
 
-        // Read document before delete for condition evaluation, index maintenance, stream, or return.
+        // Read document before delete for condition evaluation, index maintenance, stream, vector indexes, or return.
         let stream_enabled = entry.stream_config.as_ref().is_some_and(|c| c.enabled);
-        let old_doc: Option<Value> =
-            if condition.is_some() || !entry.indexes.is_empty() || need_old || stream_enabled {
-                mvcc_ops::mvcc_get(
-                    &self.store,
-                    entry.data_root_page,
-                    &composite_key,
-                    self.txn_id,
-                )?
-                .map(|bytes| rmp_serde::from_slice(&bytes))
-                .transpose()
-                .map_err(|e| {
-                    StorageError::CorruptedPage(format!("failed to deserialize document: {e}"))
-                })?
-            } else {
-                None
-            };
+        let has_vector_indexes = !entry.vector_indexes.is_empty();
+        let old_doc: Option<Value> = if condition.is_some()
+            || !entry.indexes.is_empty()
+            || need_old
+            || stream_enabled
+            || has_vector_indexes
+        {
+            mvcc_ops::mvcc_get(
+                &self.store,
+                entry.data_root_page,
+                &composite_key,
+                self.txn_id,
+            )?
+            .map(|bytes| rmp_serde::from_slice(&bytes))
+            .transpose()
+            .map_err(|e| {
+                StorageError::CorruptedPage(format!("failed to deserialize document: {e}"))
+            })?
+        } else {
+            None
+        };
 
         // Evaluate condition expression against existing document.
         if let Some(cond) = condition {
@@ -644,6 +714,15 @@ impl Transaction {
             sub_seq,
             None,
         )?;
+
+        // Collect vector index ops (remove only for delete).
+        self.vector_ops.extend(collect_vector_ops(
+            table,
+            &entry,
+            &composite_key,
+            old_doc.as_ref(),
+            None,
+        ));
 
         if updated.data_root_page != entry.data_root_page
             || updated.indexes != entry.indexes
@@ -801,6 +880,15 @@ impl Transaction {
             sub_seq,
             None,
         )?;
+
+        // 10b. Collect vector index ops.
+        self.vector_ops.extend(collect_vector_ops(
+            table,
+            &entry,
+            &composite_key,
+            old_doc.as_ref(),
+            Some(&document),
+        ));
 
         // 11. Write catalog if anything changed.
         if updated.data_root_page != entry.data_root_page
