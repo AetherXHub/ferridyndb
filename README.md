@@ -4,7 +4,7 @@ A local, embedded, DynamoDB-style document database written in Rust with single-
 
 ## Features
 
-- **DynamoDB-compatible API** — Builder-pattern methods for `put_item`, `get_item`, `delete_item`, `update_item`, `query`, `scan`, `count`, and `count_index` with server-side filter expressions, sort key range conditions (equals, between, gt, gte, lt, lte, begins_with), and atomic batch writes
+- **DynamoDB-compatible API** — Builder-pattern methods for `put_item`, `get_item`, `delete_item`, `update_item`, `query`, `scan`, `count`, `count_index`, and `query_vector_index` with server-side filter expressions, sort key range conditions (equals, between, gt, gte, lt, lte, begins_with), and atomic batch writes
 - **Single-file storage** — Copy-on-write pages with atomic double-buffered header commits (no WAL)
 - **MVCC snapshot isolation** — Single writer, unlimited concurrent readers with version chains
 - **B+Tree indexing** — Efficient range scans with slotted pages and overflow support
@@ -15,6 +15,7 @@ A local, embedded, DynamoDB-style document database written in Rust with single-
 - **ReturnValues** — Write operations optionally return the old or new document via type-state builders (`.return_old()`, `.return_new()`) with compile-time return type safety
 - **Change streams** — Per-table change data capture (CDC) with configurable view types (KeysOnly, NewImage, OldImage, NewAndOldImages), poll-based consumption by sequence number, retention pruning, and atomic capture (stream records commit with data writes)
 - **Batch write operations** — Atomic multi-table put/delete batches over the wire protocol (up to 25 operations, all-or-nothing semantics)
+- **Vector indexes** — In-memory HNSW approximate nearest neighbor search with cosine, euclidean, and dot product distance metrics. Post-ANN filter expressions with configurable oversampling. Sidecar file persistence for warm start on reopen. Full wire protocol support for create, query, drop, and list operations
 - **Version-aware API** — Optimistic concurrency control with versioned reads and conditional writes
 - **Unix socket server** — Multi-process access with async client library
 
@@ -348,13 +349,75 @@ db2.enable_stream("users", StreamViewType::KeysOnly).unwrap();
 db2.disable_stream("users").unwrap(); // preserves existing records
 ```
 
+### Vector Indexes
+
+```rust
+use ferridyn_core::api::FerridynDB;
+use ferridyn_core::types::{KeyType, VectorMetric};
+use serde_json::json;
+
+let db = FerridynDB::create("vectors.db").unwrap();
+
+db.create_table("articles")
+    .partition_key("id", KeyType::String)
+    .execute()
+    .unwrap();
+
+// Create a vector index on an embedding attribute
+db.create_vector_index("articles")
+    .name("embedding-idx")
+    .attribute("embedding")
+    .dimensions(3)
+    .metric(VectorMetric::Cosine)
+    .execute()
+    .unwrap();
+
+// Insert documents with vector embeddings
+db.put_item("articles", json!({
+    "id": "a1", "title": "Rust concurrency", "embedding": [0.1, 0.8, 0.3]
+})).unwrap();
+db.put_item("articles", json!({
+    "id": "a2", "title": "Database internals", "embedding": [0.9, 0.1, 0.2]
+})).unwrap();
+db.put_item("articles", json!({
+    "id": "a3", "title": "Async Rust", "embedding": [0.2, 0.7, 0.4]
+})).unwrap();
+
+// Approximate nearest neighbor search
+let results = db.query_vector_index("articles", "embedding-idx")
+    .vector(vec![0.15, 0.75, 0.35])
+    .top_k(2)
+    .execute()
+    .unwrap();
+assert_eq!(results.len(), 2);
+// Results are sorted by similarity score (highest first for cosine)
+
+// Post-ANN filtering — filter results after vector search
+use ferridyn_core::api::FilterExpr;
+let results = db.query_vector_index("articles", "embedding-idx")
+    .vector(vec![0.15, 0.75, 0.35])
+    .top_k(5)
+    .filter(FilterExpr::eq(
+        FilterExpr::attr("title"),
+        FilterExpr::Literal(json!("Async Rust")),
+    ))
+    .oversampling_factor(5) // fetch 5x candidates before filtering
+    .execute()
+    .unwrap();
+
+// List and drop indexes
+let indexes = db.list_vector_indexes("articles").unwrap();
+assert_eq!(indexes.len(), 1);
+db.drop_vector_index("articles", "embedding-idx").unwrap();
+```
+
 ### Build and Test
 
 ```bash
 # Compile all crates
 cargo build
 
-# Run all tests (769 tests across workspace)
+# Run all tests (799 tests across workspace)
 cargo test
 
 # Run tests for a specific crate
@@ -422,6 +485,18 @@ client.put_item_versioned("users", json!({
     "name": "Bob Updated"
 }), Some(5)).await?;
 // Returns error if version != 5 (someone else modified the item)
+
+// Vector index operations
+client.create_vector_index("articles", "emb-idx", "embedding", 3, "cosine").await?;
+
+use ferridyn_server::client::ScoredItemInfo;
+let results: Vec<ScoredItemInfo> = client.query_vector_index(
+    "articles", "emb-idx", &[0.1, 0.8, 0.3], 5, None, None
+).await?;
+// results[0].item, results[0].score
+
+let indexes = client.list_vector_indexes("articles").await?;
+client.drop_vector_index("articles", "emb-idx").await?;
 ```
 
 ### Handling Version Conflicts
@@ -583,6 +658,10 @@ Secondary indexes can be **scoped** (limited to a partition schema prefix) or **
 
 Per-table change data capture uses a dedicated B+Tree per stream, keyed by `(txn_id, sub_sequence)`. Stream records commit atomically with data writes in the same CoW page commit, guaranteeing no phantom records. View types control what data is captured: KeysOnly avoids storing full documents; NewAndOldImages stores both the before and after states. Retention pruning removes records by age or count. The design matches DynamoDB Streams semantics: one record per item per write, sequence numbers derived from transaction IDs.
 
+### Vector Indexes
+
+In-memory HNSW graphs via `hnsw_rs` for approximate nearest neighbor search. Supports cosine, euclidean, and dot product metrics. Documents with vector attributes are automatically indexed on write. The search pipeline uses oversampling (default 3x) combined with post-ANN filter expressions for filtered similarity queries. A brute-force fallback handles datasets under 100 items (HNSW is non-deterministic at small scales). Persistence uses a sidecar file (`<dbpath>.vec`) with atomic writes for warm start on reopen; if the sidecar is missing or stale, a cold start rebuilds from documents.
+
 ### No B+Tree Rebalancing (v1)
 
 Deleted items are marked as dead but not immediately removed. Fully empty pages are reclaimed, but partial pages are not rebalanced. Future versions may add background compaction.
@@ -595,6 +674,8 @@ Deleted items are marked as dead but not immediately removed. Fully empty pages 
 - **bytes** — Efficient byte buffer manipulation
 - **xxhash-rust** — Fast page checksums
 - **rmp-serde** — MessagePack serialization for on-disk storage
+- **hnsw_rs** — HNSW approximate nearest neighbor search for vector indexes
+- **anndists** — Distance metrics (cosine, euclidean, dot product) for vector indexes
 - **tokio** (server/client) — Async runtime for Unix socket server
 - **tempfile** (dev) — Test isolation
 - **criterion** (dev) — Statistical benchmarking

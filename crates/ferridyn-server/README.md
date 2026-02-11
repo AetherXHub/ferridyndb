@@ -61,6 +61,15 @@ JSON-over-newlines on Unix domain socket. Each request is one JSON line, each re
 {"op":"count","table":"users","partition_key":"alice","filter":{"Eq":[{"Attr":"status"},{"Literal":"active"}]}}
 {"op":"count_index","table":"data","index_name":"status-idx","key_value":"active"}
 {"op":"count_index","table":"data","index_name":"cat-price-idx","key_value":"electronics","sort_key_condition":{"op":"between","low":30,"high":70}}
+{"op":"drop_table","table":"old_table"}
+{"op":"describe_table","table":"users"}
+{"op":"list_indexes","table":"data"}
+{"op":"describe_index","table":"data","name":"email-idx"}
+{"op":"create_vector_index","table":"articles","name":"emb-idx","attribute":"embedding","dimensions":384,"metric":"cosine"}
+{"op":"query_vector_index","table":"articles","index_name":"emb-idx","vector":[0.1,0.8,0.3],"top_k":10}
+{"op":"query_vector_index","table":"articles","index_name":"emb-idx","vector":[0.1,0.8,0.3],"top_k":10,"filter":{"Eq":[{"Attr":"category"},{"Literal":"science"}]},"oversampling_factor":5}
+{"op":"drop_vector_index","table":"articles","index_name":"emb-idx"}
+{"op":"list_vector_indexes","table":"articles"}
 ```
 
 ### Response Examples
@@ -79,6 +88,9 @@ JSON-over-newlines on Unix domain socket. Each request is one JSON line, each re
 {"ok":true,"remaining_seconds":3595}
 {"ok":true,"remaining_seconds":null}
 {"ok":true,"count":42}
+{"ok":true,"schema":{"name":"users","partition_key":{"name":"user_id","type":"String"},"sort_key":null,"ttl_attribute":null}}
+{"ok":true,"items":[{"item":{"id":"a1","title":"Rust concurrency","embedding":[0.1,0.8,0.3]},"score":0.99},{"item":{"id":"a3","title":"Async Rust","embedding":[0.2,0.7,0.4]},"score":0.95}]}
+{"ok":true,"indexes":[{"name":"emb-idx","attribute":"embedding","dimensions":384,"metric":"cosine"}]}
 ```
 
 ## Client Library
@@ -152,6 +164,32 @@ client.set_ttl("cache", json!("session_123"), None, 3600).await?;      // expire
 let remaining = client.get_ttl("cache", json!("session_123"), None).await?; // Some(3599)
 client.remove_ttl("cache", json!("session_123"), None).await?;           // make permanent
 let swept = client.sweep_expired_ttl("cache").await?;                    // delete expired items
+
+// Vector index operations
+client.create_vector_index("articles", "emb-idx", "embedding", 384, "cosine").await?;
+
+use ferridyn_server::client::ScoredItemInfo;
+let results: Vec<ScoredItemInfo> = client.query_vector_index(
+    "articles", "emb-idx", &[0.1, 0.8, 0.3], 10, None, None
+).await?;
+// results[0].item — the matching document
+// results[0].score — similarity score
+
+// With post-ANN filter and oversampling
+use ferridyn_core::api::FilterExpr;
+let results = client.query_vector_index(
+    "articles", "emb-idx", &[0.1, 0.8, 0.3], 5,
+    Some(FilterExpr::eq(FilterExpr::attr("category"), FilterExpr::Literal(json!("science")))),
+    Some(5), // oversampling factor
+).await?;
+
+let indexes = client.list_vector_indexes("articles").await?;
+client.drop_vector_index("articles", "emb-idx").await?;
+
+// Table management
+client.drop_table("old_table").await?;
+let schema = client.describe_table("users").await?;
+// schema.name, schema.partition_key_name, schema.partition_key_type
 ```
 
 ## Server Binary
@@ -183,12 +221,14 @@ ferridyn-server [--db PATH] [--socket PATH]
 - **Change streams**: Per-table change data capture with configurable view types (KEYS_ONLY, NEW_IMAGE, OLD_IMAGE, NEW_AND_OLD_IMAGES), poll-based consumption with sequence pagination, stream info, retention pruning, and enable/disable on existing tables
 - **Count aggregation**: Count matching items without transferring document bodies; supports partition key, sort key conditions, and filter expressions — also available on secondary indexes via `count_index`
 - **TTL management**: Set, remove, and query item TTLs over the wire protocol; sweep expired items on demand
+- **Vector indexes**: Create, query, drop, and list in-memory HNSW vector indexes over the wire protocol; supports cosine, euclidean, and dot product metrics with post-ANN filter expressions and configurable oversampling
+- **Table management**: Create, drop, describe, and list tables; describe includes partition/sort key schema and TTL attribute configuration
 
 ## Concurrency Model
 
 The server inherits FerridynDB's concurrency semantics:
 
-- **Read operations** (get, batch_get, query, scan, count, count_index, list_*) execute concurrently via read lock
-- **Write operations** (put, delete, update, create_table) are serialized via write lock
+- **Read operations** (get, batch_get, query, scan, count, count_index, query_vector_index, list_*) execute concurrently via read lock
+- **Write operations** (put, delete, update, create_table, drop_table, create_index, create_vector_index) are serialized via write lock
 - **Version conflicts** are detected and reported as VersionMismatch errors
 - **Snapshot isolation** is maintained per-transaction
