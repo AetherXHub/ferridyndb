@@ -247,6 +247,41 @@ pub enum Request {
         #[serde(default)]
         filter: Option<FilterExpr>,
     },
+    // -- Vector index operations --
+    CreateVectorIndex {
+        table: String,
+        name: String,
+        attribute: String,
+        dimensions: u32,
+        #[serde(default = "default_vector_metric")]
+        metric: String,
+    },
+    QueryVectorIndex {
+        table: String,
+        index_name: String,
+        vector: Vec<f32>,
+        #[serde(default = "default_top_k")]
+        top_k: usize,
+        #[serde(default)]
+        filter: Option<FilterExpr>,
+        #[serde(default)]
+        oversampling_factor: Option<usize>,
+    },
+    DropVectorIndex {
+        table: String,
+        index_name: String,
+    },
+    ListVectorIndexes {
+        table: String,
+    },
+}
+
+fn default_vector_metric() -> String {
+    "cosine".to_string()
+}
+
+fn default_top_k() -> usize {
+    10
 }
 
 /// Sort key condition for query requests.
@@ -364,6 +399,22 @@ pub struct IndexDefWire {
     pub is_local: bool,
 }
 
+/// Vector index definition in wire format.
+#[derive(Debug, Serialize)]
+pub struct VectorIndexDefWire {
+    pub name: String,
+    pub attribute: String,
+    pub dimensions: u32,
+    pub metric: String,
+}
+
+/// Scored item from vector search in wire format.
+#[derive(Debug, Serialize)]
+pub struct ScoredItemWire {
+    pub item: Value,
+    pub score: f64,
+}
+
 /// A response sent back to the client.
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
@@ -448,6 +499,14 @@ pub enum OkResponse {
     Count {
         ok: bool,
         count: usize,
+    },
+    VectorIndexes {
+        ok: bool,
+        indexes: Vec<VectorIndexDefWire>,
+    },
+    VectorSearchResults {
+        ok: bool,
+        items: Vec<ScoredItemWire>,
     },
 }
 
@@ -583,5 +642,13 @@ impl Response {
 
     pub fn ok_count(count: usize) -> Self {
         Response::Ok(OkResponse::Count { ok: true, count })
+    }
+
+    pub fn ok_vector_indexes(indexes: Vec<VectorIndexDefWire>) -> Self {
+        Response::Ok(OkResponse::VectorIndexes { ok: true, indexes })
+    }
+
+    pub fn ok_vector_search_results(items: Vec<ScoredItemWire>) -> Self {
+        Response::Ok(OkResponse::VectorSearchResults { ok: true, items })
     }
 }

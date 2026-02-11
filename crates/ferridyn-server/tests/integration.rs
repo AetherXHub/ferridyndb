@@ -3069,3 +3069,206 @@ async fn test_count_index_with_filter_over_wire() {
         .unwrap();
     assert_eq!(count, 5, "should count only items with score > 5 over wire");
 }
+
+// ---------------------------------------------------------------------------
+// Vector index tests (PRD-15 Phase 4)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_vector_create_index_over_wire() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    client
+        .create_table(
+            "items",
+            KeyDef {
+                name: "id".to_string(),
+                key_type: "String".to_string(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Create vector index.
+    client
+        .create_vector_index("items", "emb-idx", "embedding", 3, "cosine")
+        .await
+        .unwrap();
+
+    // List vector indexes.
+    let indexes = client.list_vector_indexes("items").await.unwrap();
+    assert_eq!(indexes.len(), 1);
+    assert_eq!(indexes[0].name, "emb-idx");
+    assert_eq!(indexes[0].attribute, "embedding");
+    assert_eq!(indexes[0].dimensions, 3);
+    assert_eq!(indexes[0].metric, "cosine");
+
+    // Drop vector index.
+    client.drop_vector_index("items", "emb-idx").await.unwrap();
+
+    // List should be empty now.
+    let indexes = client.list_vector_indexes("items").await.unwrap();
+    assert_eq!(indexes.len(), 0);
+}
+
+#[tokio::test]
+async fn test_vector_query_over_wire() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    client
+        .create_table(
+            "items",
+            KeyDef {
+                name: "id".to_string(),
+                key_type: "String".to_string(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Create vector index with euclidean metric.
+    client
+        .create_vector_index("items", "emb-idx", "embedding", 3, "euclidean")
+        .await
+        .unwrap();
+
+    // Insert items with embeddings.
+    client
+        .put_item(
+            "items",
+            json!({"id": "a", "embedding": [1.0, 0.0, 0.0], "label": "x-axis"}),
+        )
+        .await
+        .unwrap();
+    client
+        .put_item(
+            "items",
+            json!({"id": "b", "embedding": [0.0, 1.0, 0.0], "label": "y-axis"}),
+        )
+        .await
+        .unwrap();
+    client
+        .put_item(
+            "items",
+            json!({"id": "c", "embedding": [0.9, 0.1, 0.0], "label": "near-x"}),
+        )
+        .await
+        .unwrap();
+    client
+        .put_item(
+            "items",
+            json!({"id": "d", "embedding": [0.0, 0.0, 1.0], "label": "z-axis"}),
+        )
+        .await
+        .unwrap();
+    client
+        .put_item(
+            "items",
+            json!({"id": "e", "embedding": [0.5, 0.5, 0.0], "label": "xy-mid"}),
+        )
+        .await
+        .unwrap();
+
+    // Query nearest to [1.0, 0.0, 0.0], top 3.
+    let results = client
+        .query_vector_index("items", "emb-idx", &[1.0, 0.0, 0.0], 3, None, None)
+        .await
+        .unwrap();
+
+    assert_eq!(results.len(), 3);
+
+    // First result should be exact match "a" with distance ~0.
+    assert_eq!(results[0].item["id"], "a");
+    assert!(
+        results[0].score < 0.01,
+        "exact match should have ~0 distance"
+    );
+
+    // Results should be sorted by distance (ascending).
+    for i in 1..results.len() {
+        assert!(
+            results[i].score >= results[i - 1].score,
+            "results should be sorted by distance"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_vector_query_with_filter_over_wire() {
+    let (_dir, sock) = start_test_server().await;
+    let mut client = FerridynClient::connect(&sock).await.unwrap();
+
+    client
+        .create_table(
+            "items",
+            KeyDef {
+                name: "id".to_string(),
+                key_type: "String".to_string(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    client
+        .create_vector_index("items", "emb-idx", "embedding", 3, "euclidean")
+        .await
+        .unwrap();
+
+    // Insert items in two categories.
+    client
+        .put_item(
+            "items",
+            json!({"id": "a1", "embedding": [1.0, 0.0, 0.0], "category": "A"}),
+        )
+        .await
+        .unwrap();
+    client
+        .put_item(
+            "items",
+            json!({"id": "a2", "embedding": [0.9, 0.1, 0.0], "category": "A"}),
+        )
+        .await
+        .unwrap();
+    client
+        .put_item(
+            "items",
+            json!({"id": "b1", "embedding": [0.95, 0.05, 0.0], "category": "B"}),
+        )
+        .await
+        .unwrap();
+    client
+        .put_item(
+            "items",
+            json!({"id": "b2", "embedding": [0.0, 1.0, 0.0], "category": "B"}),
+        )
+        .await
+        .unwrap();
+
+    // Query with filter: category == "A".
+    let filter = FilterExpr::Eq(
+        Box::new(FilterExpr::Attr("category".to_string())),
+        Box::new(FilterExpr::Literal(json!("A"))),
+    );
+    let results = client
+        .query_vector_index("items", "emb-idx", &[1.0, 0.0, 0.0], 10, Some(filter), None)
+        .await
+        .unwrap();
+
+    // All results should have category "A".
+    assert!(!results.is_empty(), "should return results");
+    for r in &results {
+        assert_eq!(
+            r.item["category"], "A",
+            "all results should have category A"
+        );
+    }
+    assert_eq!(results.len(), 2, "should return exactly 2 category A items");
+}

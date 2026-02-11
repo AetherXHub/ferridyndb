@@ -15,7 +15,7 @@ DynamoDB's API is simple and effective for key-value and document workloads, but
 This is a Cargo workspace. Build/test from the repository root:
 
 - `cargo build` — compile all crates
-- `cargo test` — run all tests across the workspace (796 tests)
+- `cargo test` — run all tests across the workspace (799 tests)
 - `cargo test -p ferridyn-core` — test only the core crate
 - `cargo test -p ferridyn-core <test_name>` — run a single test by name
 - `cargo clippy --workspace -- -D warnings` — lint all crates (zero warnings required)
@@ -61,7 +61,7 @@ crates/
       client.rs        # FerridynClient — async client for multi-process access
       protocol.rs      # Wire protocol (JSON over length-prefixed frames)
     tests/
-      integration.rs   # Server integration tests (35 tests)
+      integration.rs   # Server integration tests (53 tests)
   ferridyn-console/    # Interactive CLI client (connects to server via Unix socket)
     src/
       parser.rs        # SQL-like command parser
@@ -91,7 +91,7 @@ PRDs live in `docs/prds/` and track feature implementation across phases.
 - **Partition schemas & scoped secondary indexes** — Prefix-based entity type metadata with attribute definitions, scoped secondary indexes backed by plain B+Tree lookups with lazy GC
 - **Global and local secondary indexes** — GSI indexes alternate attributes across the table; LSI shares the table's partition key with an alternate sort key. Both support composite keys, range queries, and projections (KeysOnly, Include, All)
 - **Change streams** — Per-table CDC with dedicated B+Tree per stream, keyed by `(txn_id, sub_sequence)`. Atomic capture in same CoW commit. Configurable view types (KeysOnly, NewImage, OldImage, NewAndOldImages). Retention pruning by age or count
-- **Vector indexes** — In-memory HNSW graphs via `hnsw_rs` for approximate nearest neighbor search. Supports cosine, euclidean, and dot product metrics. No native delete — uses deleted-IDs `HashSet` with oversampling during search. Brute-force fallback for datasets under 100 items. Post-ANN filtering via `FilterExpr` with configurable oversampling factor (default 3x). Sidecar file persistence (`<dbpath>.vec`) for warm start on reopen; cold start fallback rebuilds from documents if sidecar is missing or stale
+- **Vector indexes** — In-memory HNSW graphs via `hnsw_rs` for approximate nearest neighbor search. Supports cosine, euclidean, and dot product metrics. No native delete — uses deleted-IDs `HashSet` with oversampling during search. Brute-force fallback for datasets under 100 items. Post-ANN filtering via `FilterExpr` with configurable oversampling factor (default 3x). Sidecar file persistence (`<dbpath>.vec`) for warm start on reopen; cold start fallback rebuilds from documents if sidecar is missing or stale. Full server protocol support: create/query/drop/list vector indexes over Unix socket wire protocol
 - **No B+Tree rebalancing in v1** — Mark-as-dead delete, reclaim fully empty pages
 
 ## Dependencies

@@ -1,7 +1,7 @@
 # PRD: Vector / Embedding Index
 
 **Priority:** 15
-**Status:** In Progress (Phase 3 complete)
+**Status:** Complete
 **Proposal:** [docs/proposals/accepted/vector-index.md](../proposals/accepted/vector-index.md)
 
 ## Summary

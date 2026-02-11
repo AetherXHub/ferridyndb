@@ -12,12 +12,14 @@ use tracing::{error, info, warn};
 
 use ferridyn_core::api::{FerridynDB, FilterExpr};
 use ferridyn_core::error::{Error as DynError, QueryError, SchemaError, TxnError};
-use ferridyn_core::types::{AttrType, IndexDefinition, KeyType, PartitionSchema, TableSchema};
+use ferridyn_core::types::{
+    AttrType, IndexDefinition, KeyType, PartitionSchema, TableSchema, VectorMetric,
+};
 
 use crate::protocol::{
     AttributeDefWire, BatchGetItemKey, BatchWriteOp, IndexDefWire, KeyDef, KeyDefWire,
-    PartitionSchemaWire, Request, Response, SortKeyCondition, StreamInfoWire, StreamRecordWire,
-    TableSchemaWire, UpdateActionWire,
+    PartitionSchemaWire, Request, Response, ScoredItemWire, SortKeyCondition, StreamInfoWire,
+    StreamRecordWire, TableSchemaWire, UpdateActionWire, VectorIndexDefWire,
 };
 
 /// A FerridynDB server listening on a Unix socket.
@@ -354,6 +356,37 @@ fn dispatch(db: &FerridynDB, req: Request) -> Response {
             sort_key_condition,
             filter,
         ),
+
+        Request::CreateVectorIndex {
+            table,
+            name,
+            attribute,
+            dimensions,
+            metric,
+        } => handle_create_vector_index(db, &table, &name, &attribute, dimensions, &metric),
+
+        Request::QueryVectorIndex {
+            table,
+            index_name,
+            vector,
+            top_k,
+            filter,
+            oversampling_factor,
+        } => handle_query_vector_index(
+            db,
+            &table,
+            &index_name,
+            vector,
+            top_k,
+            filter,
+            oversampling_factor,
+        ),
+
+        Request::DropVectorIndex { table, index_name } => {
+            handle_drop_vector_index(db, &table, &index_name)
+        }
+
+        Request::ListVectorIndexes { table } => handle_list_vector_indexes(db, &table),
     }
 }
 
@@ -1168,9 +1201,116 @@ fn handle_count_index(
     }
 }
 
+fn handle_create_vector_index(
+    db: &FerridynDB,
+    table: &str,
+    name: &str,
+    attribute: &str,
+    dimensions: u32,
+    metric: &str,
+) -> Response {
+    let m = match parse_vector_metric(metric) {
+        Some(m) => m,
+        None => {
+            return Response::error(
+                "InvalidVectorMetric",
+                format!("unknown metric: {metric}. Expected cosine, euclidean, or dot_product"),
+            );
+        }
+    };
+    match db
+        .create_vector_index(table)
+        .name(name)
+        .attribute(attribute)
+        .dimensions(dimensions)
+        .metric(m)
+        .execute()
+    {
+        Ok(()) => Response::ok_empty(),
+        Err(e) => dyn_error_to_response(e),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_query_vector_index(
+    db: &FerridynDB,
+    table: &str,
+    index_name: &str,
+    vector: Vec<f32>,
+    top_k: usize,
+    filter: Option<FilterExpr>,
+    oversampling_factor: Option<usize>,
+) -> Response {
+    let mut builder = db
+        .query_vector_index(table, index_name)
+        .vector(vector)
+        .top_k(top_k);
+    if let Some(f) = filter {
+        builder = builder.filter(f);
+    }
+    if let Some(factor) = oversampling_factor {
+        builder = builder.oversampling_factor(factor);
+    }
+    match builder.execute() {
+        Ok(results) => {
+            let items: Vec<ScoredItemWire> = results
+                .into_iter()
+                .map(|si| ScoredItemWire {
+                    item: si.item,
+                    score: si.score,
+                })
+                .collect();
+            Response::ok_vector_search_results(items)
+        }
+        Err(e) => dyn_error_to_response(e),
+    }
+}
+
+fn handle_drop_vector_index(db: &FerridynDB, table: &str, index_name: &str) -> Response {
+    match db.drop_vector_index(table, index_name) {
+        Ok(()) => Response::ok_empty(),
+        Err(e) => dyn_error_to_response(e),
+    }
+}
+
+fn handle_list_vector_indexes(db: &FerridynDB, table: &str) -> Response {
+    match db.list_vector_indexes(table) {
+        Ok(indexes) => {
+            let wire: Vec<VectorIndexDefWire> = indexes
+                .into_iter()
+                .map(|def| VectorIndexDefWire {
+                    name: def.name,
+                    attribute: def.attribute,
+                    dimensions: def.dimensions,
+                    metric: vector_metric_str(def.metric).to_string(),
+                })
+                .collect();
+            Response::ok_vector_indexes(wire)
+        }
+        Err(e) => dyn_error_to_response(e),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn parse_vector_metric(s: &str) -> Option<VectorMetric> {
+    match s.to_lowercase().as_str() {
+        "cosine" => Some(VectorMetric::Cosine),
+        "euclidean" | "l2" => Some(VectorMetric::Euclidean),
+        "dot_product" | "dotproduct" | "dot" => Some(VectorMetric::DotProduct),
+        _ => None,
+    }
+}
+
+fn vector_metric_str(m: VectorMetric) -> &'static str {
+    match m {
+        VectorMetric::Cosine => "cosine",
+        VectorMetric::Euclidean => "euclidean",
+        VectorMetric::DotProduct => "dot_product",
+    }
+}
 
 fn parse_stream_view_type(s: &str) -> Option<ferridyn_core::stream::StreamViewType> {
     use ferridyn_core::stream::StreamViewType;

@@ -125,6 +125,22 @@ pub struct StreamInfo {
     pub record_count: usize,
 }
 
+/// Vector index definition returned from server.
+#[derive(Debug, Clone)]
+pub struct VectorIndexInfo {
+    pub name: String,
+    pub attribute: String,
+    pub dimensions: u32,
+    pub metric: String,
+}
+
+/// Scored item returned from a vector search.
+#[derive(Debug, Clone)]
+pub struct ScoredItemInfo {
+    pub item: Value,
+    pub score: f64,
+}
+
 /// Client for a FerridynDB server.
 pub struct FerridynClient {
     reader: BufReader<OwnedReadHalf>,
@@ -1059,6 +1075,78 @@ impl FerridynClient {
         check_ok(&resp)
     }
 
+    // -- Vector index operations --
+
+    /// Create a vector index on a table.
+    pub async fn create_vector_index(
+        &mut self,
+        table: &str,
+        name: &str,
+        attribute: &str,
+        dimensions: u32,
+        metric: &str,
+    ) -> Result<()> {
+        let req = serde_json::json!({
+            "op": "create_vector_index",
+            "table": table,
+            "name": name,
+            "attribute": attribute,
+            "dimensions": dimensions,
+            "metric": metric,
+        });
+        let resp = self.send_request(&req).await?;
+        check_ok(&resp)
+    }
+
+    /// Query a vector index for approximate nearest neighbors.
+    pub async fn query_vector_index(
+        &mut self,
+        table: &str,
+        index_name: &str,
+        vector: &[f32],
+        top_k: usize,
+        filter: Option<FilterExpr>,
+        oversampling_factor: Option<usize>,
+    ) -> Result<Vec<ScoredItemInfo>> {
+        let mut req = serde_json::json!({
+            "op": "query_vector_index",
+            "table": table,
+            "index_name": index_name,
+            "vector": vector,
+            "top_k": top_k,
+        });
+        let obj = req.as_object_mut().unwrap();
+        if let Some(f) = filter {
+            obj.insert("filter".to_string(), serde_json::to_value(f).unwrap());
+        }
+        if let Some(factor) = oversampling_factor {
+            obj.insert("oversampling_factor".to_string(), serde_json::json!(factor));
+        }
+        let resp = self.send_request(&req).await?;
+        vector_search_from_response(&resp)
+    }
+
+    /// Drop a vector index from a table.
+    pub async fn drop_vector_index(&mut self, table: &str, index_name: &str) -> Result<()> {
+        let req = serde_json::json!({
+            "op": "drop_vector_index",
+            "table": table,
+            "index_name": index_name,
+        });
+        let resp = self.send_request(&req).await?;
+        check_ok(&resp)
+    }
+
+    /// List vector indexes for a table.
+    pub async fn list_vector_indexes(&mut self, table: &str) -> Result<Vec<VectorIndexInfo>> {
+        let req = serde_json::json!({
+            "op": "list_vector_indexes",
+            "table": table,
+        });
+        let resp = self.send_request(&req).await?;
+        vector_indexes_from_response(&resp)
+    }
+
     // -----------------------------------------------------------------------
     // Internal
     // -----------------------------------------------------------------------
@@ -1444,4 +1532,52 @@ fn parse_stream_record(v: &Value) -> StreamRecordInfo {
             .get("old_image")
             .and_then(|v| if v.is_null() { None } else { Some(v.clone()) }),
     }
+}
+
+fn vector_search_from_response(resp: &Value) -> Result<Vec<ScoredItemInfo>> {
+    check_error(resp)?;
+    let items = resp
+        .get("items")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|v| ScoredItemInfo {
+                    item: v.get("item").cloned().unwrap_or(Value::Null),
+                    score: v.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(items)
+}
+
+fn vector_indexes_from_response(resp: &Value) -> Result<Vec<VectorIndexInfo>> {
+    check_error(resp)?;
+    let indexes = resp
+        .get("indexes")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|v| VectorIndexInfo {
+                    name: v
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    attribute: v
+                        .get("attribute")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    dimensions: v.get("dimensions").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                    metric: v
+                        .get("metric")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(indexes)
 }
